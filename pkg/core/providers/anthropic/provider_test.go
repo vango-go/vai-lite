@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 func requireTCPListen(t testing.TB) {

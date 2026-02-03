@@ -25,13 +25,6 @@ func TestImageURL(t *testing.T) {
 	}
 }
 
-func TestAudio(t *testing.T) {
-	block := Audio([]byte("audio data"), "audio/wav")
-	if block.BlockType() != "audio" {
-		t.Errorf("BlockType() = %q, want %q", block.BlockType(), "audio")
-	}
-}
-
 func TestVideo(t *testing.T) {
 	block := Video([]byte("video data"), "video/mp4")
 	if block.BlockType() != "video" {

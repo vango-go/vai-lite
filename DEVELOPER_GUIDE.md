@@ -1,0 +1,709 @@
+# Developer Guide (vai-lite)
+
+`vai-lite` is a trimmed-down, **direct-mode only** Go SDK for running tool-using LLM agents.
+
+The only “high-level” primitives are:
+
+- `Messages.Run()` — blocking tool-loop execution
+- `Messages.RunStream()` — streaming tool-loop execution with interrupts/cancel and deterministic history deltas
+
+Everything else is in service of those primitives:
+
+- Multi-provider routing via model strings like `anthropic/claude-sonnet-4`
+- A canonical request/response format based on **Anthropic Messages API** (messages + typed content blocks)
+- A tools system with:
+  - “native tools” normalization (e.g. `web_search`, `code_execution`) that providers execute
+  - “function tools” that **your process executes** (via `MakeTool`, `FuncAsTool`, `ToolSet`, handlers)
+
+This repo intentionally **does not** include:
+
+- Proxy/HTTP server mode
+- Live/WebSocket mode
+- Voice/STT/TTS pipeline orchestration
+- Extra endpoints (`/v1/messages`, `/v1/audio`, `/v1/models`, etc.)
+
+---
+
+## Table of Contents
+
+- [1. Repository Layout](#1-repository-layout)
+- [2. Installation and Requirements](#2-installation-and-requirements)
+- [3. Provider Authentication](#3-provider-authentication)
+- [4. Mental Model: Request → Provider → Tool Loop](#4-mental-model-request--provider--tool-loop)
+- [5. Core Types](#5-core-types)
+  - [5.1 Model strings](#51-model-strings)
+  - [5.2 Messages + content blocks](#52-messages--content-blocks)
+  - [5.3 Tools and tool choice](#53-tools-and-tool-choice)
+  - [5.4 OutputFormat (structured output)](#54-outputformat-structured-output)
+- [6. The Tool Loop](#6-the-tool-loop)
+  - [6.1 Run](#61-run)
+  - [6.2 RunStream](#62-runstream)
+  - [6.3 Stop conditions](#63-stop-conditions)
+  - [6.4 Tool execution details](#64-tool-execution-details)
+  - [6.5 Timeouts, cancellation, and interrupts](#65-timeouts-cancellation-and-interrupts)
+  - [6.6 Deterministic history](#66-deterministic-history)
+- [7. Defining Tools (Function Tools)](#7-defining-tools-function-tools)
+  - [7.1 `MakeTool` (recommended)](#71-maketool-recommended)
+  - [7.2 `FuncAsTool` (returns tool + handler)](#72-funcastool-returns-tool--handler)
+  - [7.3 `ToolSet` (group tools + handlers)](#73-toolset-group-tools--handlers)
+  - [7.4 Manual `WithToolHandler`](#74-manual-withtoolhandler)
+  - [7.5 Output shaping: returning content blocks](#75-output-shaping-returning-content-blocks)
+- [8. Native Tools (Provider-Executed)](#8-native-tools-provider-executed)
+- [9. Streaming Events (RunStream)](#9-streaming-events-runstream)
+  - [9.1 Event model](#91-event-model)
+  - [9.2 Helper extractors](#92-helper-extractors)
+  - [9.3 `RunStream.Process` convenience](#93-runstreamprocess-convenience)
+- [10. Errors and Observability](#10-errors-and-observability)
+- [11. Testing and Local Dev](#11-testing-and-local-dev)
+- [12. Gotchas and Design Notes](#12-gotchas-and-design-notes)
+
+---
+
+## 1. Repository Layout
+
+Key directories you’ll touch:
+
+- `sdk/` — The public SDK you import (`github.com/vango-go/vai-lite/sdk`)
+  - `sdk/client.go` — direct-mode client + provider registration
+  - `sdk/messages.go` — `Run` / `RunStream`
+  - `sdk/run.go` — the tool loop implementation
+  - `sdk/tools.go` — tool builders (`MakeTool`, `ToolSet`, native tool constructors)
+  - `sdk/stream.go` — stream wrapper that accumulates final responses
+  - `sdk/stream_helpers.go` — helper callbacks + extractor utilities for RunStream events
+  - `sdk/content.go` — content-block constructors (text/image/video/document/tool_result)
+  - `sdk/schema.go` — schema generation helpers for function tools / structured output
+- `pkg/core/` — shared core types + providers (SDK uses these directly)
+  - `pkg/core/engine.go` — provider registry + `provider/model` routing
+  - `pkg/core/types/*` — canonical API types (requests, responses, blocks, tools, streaming events)
+  - `pkg/core/providers/*` — provider implementations (anthropic/openai/gemini/groq/etc.)
+
+---
+
+## 2. Installation and Requirements
+
+### Go version
+
+`go.mod` currently targets `go 1.24.7`.
+
+### Add to your project
+
+```bash
+go get github.com/vango-go/vai-lite/sdk
+```
+
+### Import path
+
+```go
+import vai "github.com/vango-go/vai-lite/sdk"
+```
+
+---
+
+## 3. Provider Authentication
+
+`vai-lite` is direct-mode only. It calls providers directly, so **your process** must have the provider keys available.
+
+### Environment variables
+
+The core engine loads keys from environment variables in the form:
+
+- `ANTHROPIC_API_KEY`
+- `OPENAI_API_KEY`
+- `GROQ_API_KEY`
+- `CEREBRAS_API_KEY`
+- `GEMINI_API_KEY` (also accepts `GOOGLE_API_KEY` as a fallback)
+
+Example:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+```
+
+### Overriding keys programmatically
+
+You can override environment keys by passing `WithProviderKey`:
+
+```go
+client := vai.NewClient(
+	vai.WithProviderKey("anthropic", "sk-ant-..."),
+)
+```
+
+### Gemini OAuth (optional)
+
+The SDK will attempt to initialize the `gemini_oauth` provider if credentials exist at:
+
+- `~/.config/vango/gemini-oauth-credentials.json`
+
+Optional env var:
+
+- `GEMINI_OAUTH_PROJECT_ID`
+
+If OAuth credentials aren’t present or initialization fails, the SDK just logs a debug message and continues.
+
+---
+
+## 4. Mental Model: Request → Provider → Tool Loop
+
+At a high level:
+
+1. You create a `Client`.
+2. You build a `MessageRequest` (model + messages + tools + options).
+3. You run an agent loop using:
+   - `Messages.Run()` (blocking) or
+   - `Messages.RunStream()` (streaming)
+4. The model responds with:
+   - text/thinking, and possibly
+   - tool calls (`tool_use` blocks)
+5. `vai-lite` executes tool calls *that have registered handlers* (client-side “function tools”).
+6. Tool results are injected back into the conversation as `tool_result` blocks and the loop continues until a stop condition is met.
+
+Native tools (like `web_search`) are **executed by the provider**. You still see tool-ish blocks/events, but there is no local handler to register.
+
+---
+
+## 5. Core Types
+
+Most public types are re-exported aliases around `pkg/core/types`.
+
+### 5.1 Model strings
+
+All model IDs are of the form:
+
+```
+provider/model-name
+```
+
+Examples:
+
+- `anthropic/claude-sonnet-4`
+- `openai/gpt-4o`
+- `oai-resp/gpt-4o` (OpenAI Responses API provider in this repo; name is provider-specific)
+- `groq/llama-3.3-70b`
+- `gemini/gemini-2.0-flash`
+- `gemini-oauth/gemini-2.0-flash`
+- `cerebras/llama-3.1-8b`
+
+Routing happens in `pkg/core/engine.go` by splitting on the first `/`.
+
+### 5.2 Messages + content blocks
+
+The canonical request format is Anthropic-style:
+
+```go
+req := &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{
+			Role: "user",
+			Content: []vai.ContentBlock{
+				vai.Text("What's in this image?"),
+				vai.ImageURL("https://example.com/cat.jpg"),
+			},
+		},
+	},
+}
+```
+
+Notes:
+
+- `Message.Content` can be:
+  - a `string`, or
+  - a `[]ContentBlock`
+- `vai.Text(...)` returns a `ContentBlock` (a typed block).
+- `vai-lite` does **not** run a voice pipeline. If you include raw audio blocks (via core types), they are just passed through to providers that support audio input.
+
+### 5.3 Tools and tool choice
+
+Tools live on `MessageRequest.Tools`:
+
+```go
+req.Tools = []vai.Tool{
+	vai.WebSearch(),
+	vai.CodeExecution(),
+	tool.Tool, // function tool created via MakeTool
+}
+```
+
+Tool selection policy:
+
+```go
+req.ToolChoice = vai.ToolChoiceAuto() // model decides
+// req.ToolChoice = vai.ToolChoiceAny()
+// req.ToolChoice = vai.ToolChoiceNone()
+// req.ToolChoice = vai.ToolChoiceTool("some_tool_name")
+```
+
+### 5.4 OutputFormat (structured output)
+
+You can request JSON schema structured output by setting:
+
+```go
+schema := vai.SchemaFromStruct[struct {
+	Person  string `json:"person" desc:"Person name"`
+	Role    string `json:"role"`
+	Company string `json:"company"`
+}]()
+
+req.OutputFormat = &vai.OutputFormat{
+	Type:       "json_schema",
+	JSONSchema: schema,
+}
+```
+
+Important:
+
+- `vai-lite` does not include a dedicated `Extract()` helper; you parse the response text yourself.
+- Structured-output behavior is provider/model-specific.
+
+---
+
+## 6. The Tool Loop
+
+### 6.1 Run
+
+`Run` is a blocking loop that keeps calling the model and executing tools until it reaches a terminal condition.
+
+```go
+client := vai.NewClient()
+
+tool := vai.MakeTool("increment", "Increment a counter",
+	func(ctx context.Context, in struct{}) (string, error) {
+		return "ok", nil
+	},
+)
+
+result, err := client.Messages.Run(ctx, &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Call increment once and then summarize.")},
+	},
+	Tools: []vai.Tool{tool.Tool},
+}, vai.WithTools(tool), vai.WithMaxToolCalls(5))
+if err != nil {
+	// err can be provider errors, context cancellation, etc.
+	panic(err)
+}
+
+fmt.Println(result.Response.TextContent())
+fmt.Println("Tool calls:", result.ToolCallCount)
+fmt.Println("Turns:", result.TurnCount)
+```
+
+What you get back (`RunResult`):
+
+- `Response`: final assistant response (the terminal response)
+- `Steps`: per-turn steps (responses + tool calls + tool results)
+- `ToolCallCount`: total tool calls across the loop
+- `TurnCount`: total model turns
+- `Usage`: aggregated usage across turns (provider-reported)
+- `StopReason`: why the loop ended
+- `Messages` (optional): snapshot of final message history
+
+### 6.2 RunStream
+
+`RunStream` runs the same loop but emits events while it happens.
+
+```go
+stream, err := client.Messages.RunStream(ctx, req,
+	vai.WithTools(tool),
+	vai.WithMaxToolCalls(5),
+)
+if err != nil {
+	panic(err)
+}
+defer stream.Close()
+
+for event := range stream.Events() {
+	if text, ok := vai.TextDeltaFrom(event); ok {
+		fmt.Print(text)
+	}
+}
+
+if err := stream.Err(); err != nil {
+	panic(err)
+}
+
+final := stream.Result()
+fmt.Println("\nStopReason:", final.StopReason)
+```
+
+### 6.3 Stop conditions
+
+`RunOption`s:
+
+- Safety limits:
+  - `WithMaxToolCalls(n)`
+  - `WithMaxTurns(n)`
+  - `WithMaxTokensRun(n)` (uses aggregated `Usage.TotalTokens`)
+  - `WithRunTimeout(d)`
+- Tool execution:
+  - `WithParallelTools(true|false)` (default: `true`)
+  - `WithToolTimeout(d)` (default: `30s`)
+- Custom stop:
+  - `WithStopWhen(func(*Response) bool { ... })`
+
+Examples:
+
+```go
+result, err := client.Messages.Run(ctx, req,
+	vai.WithMaxTurns(8),
+	vai.WithMaxToolCalls(20),
+	vai.WithRunTimeout(60*time.Second),
+	vai.WithStopWhen(func(r *vai.Response) bool {
+		return strings.Contains(r.TextContent(), "DONE")
+	}),
+)
+```
+
+### 6.4 Tool execution details
+
+When the model requests tools (via `tool_use` blocks), the SDK:
+
+1. Looks up a registered handler by tool name.
+2. Marshals the tool `input` object to JSON.
+3. Calls your handler with `context.Context` + `json.RawMessage`.
+4. Converts the returned value into `[]ContentBlock`:
+   - `string` → `[{type:"text", text:"..."}]`
+   - `ContentBlock` → wrapped into a slice
+   - `[]ContentBlock` → used as-is
+   - other types → JSON-marshaled into a `text` block
+5. Injects a `tool_result` block back into the conversation.
+
+If no handler exists for a tool name, the SDK returns a tool result like:
+
+> Tool 'X' was called but no handler is registered.
+
+This is intentional: it lets the model see that the tool is unavailable and continue.
+
+### 6.5 Timeouts, cancellation, and interrupts
+
+There are three layers:
+
+1. **Whole-run timeout** (`WithRunTimeout`)
+2. **Per-tool timeout** (`WithToolTimeout`)
+3. **Context cancellation** (your `ctx`)
+
+Additionally, `RunStream` supports:
+
+- `stream.Cancel()` — abort the current stream and terminate the run loop (StopReason becomes `cancelled`)
+- `stream.Interrupt(msg, behavior)` — stop the current stream, optionally save partial output, inject a new user message, and continue
+
+Interrupt behavior controls what happens to partial assistant output:
+
+- `InterruptDiscard` — do not save partial output to history
+- `InterruptSavePartial` — save partial output as-is
+- `InterruptSaveMarked` — save partial output with a marker (`[interrupted]`)
+
+### 6.6 Deterministic history
+
+`RunStream` emits `HistoryDeltaEvent` events that describe exactly which messages should be appended to a caller-owned history.
+
+This is useful when:
+
+- you want to keep the SDK stateless and own your own history slice
+- you want deterministic history updates even across interrupts
+
+`HistoryDeltaEvent` also includes an `ExpectedLen` field. If you want mismatch detection (e.g. when you rewrite history between turns),
+use `DefaultHistoryHandlerStrict` instead of `DefaultHistoryHandler`.
+
+In general, `HistoryDeltaEvent` is emitted once per completed step (after tools run, if any) with the assistant message and (if applicable)
+the `tool_result` message. If you interrupt a stream with a “save partial” behavior, the saved partial assistant message is emitted as a delta too.
+
+Basic pattern:
+
+```go
+history := append([]vai.Message(nil), req.Messages...)
+
+apply := vai.DefaultHistoryHandler(&history)
+
+for ev := range stream.Events() {
+	apply(ev)
+}
+```
+
+For advanced context management (pinned memory, trimming, reordering), build per-turn messages at turn boundaries:
+
+```go
+stream, err := client.Messages.RunStream(ctx, req,
+	vai.WithBuildTurnMessages(func(info vai.TurnInfo) []vai.Message {
+		return info.History
+	}),
+)
+_ = stream
+_ = err
+```
+
+`WithBuildTurnMessages` affects only the messages sent to the model on the next turn. It does not change the append-only history represented by `HistoryDeltaEvent`.
+
+---
+
+## 7. Defining Tools (Function Tools)
+
+Function tools are executed by **your process** during the tool loop.
+
+### 7.1 `MakeTool` (recommended)
+
+`MakeTool` gives you:
+
+- a `Tool` definition (`tool.Tool`) to attach to the request
+- a handler embedded in the returned value, which you register via `WithTools(tool)`
+- automatic JSON schema generation from the input struct type
+
+Example:
+
+```go
+type SearchInput struct {
+	Query string `json:"query" desc:"Search query"`
+}
+
+search := vai.MakeTool("search_internal", "Search an internal index.",
+	func(ctx context.Context, in SearchInput) (string, error) {
+		return "results for: " + in.Query, nil
+	},
+)
+
+req := &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Search internal for 'incident 123'")},
+	},
+	Tools: []vai.Tool{search.Tool},
+}
+
+result, err := client.Messages.Run(ctx, req, vai.WithTools(search))
+```
+
+### 7.2 `FuncAsTool` (returns tool + handler)
+
+`FuncAsTool` is a lightweight helper returning `(Tool, ToolHandler)`:
+
+```go
+tool, handler := vai.FuncAsTool("get_weather", "Get weather.",
+	func(ctx context.Context, in struct {
+		Location string `json:"location"`
+	}) (string, error) {
+		return "sunny in " + in.Location, nil
+	},
+)
+
+result, err := client.Messages.Run(ctx, req,
+	vai.WithToolHandler(tool.Name, handler),
+)
+```
+
+### 7.3 `ToolSet` (group tools + handlers)
+
+`ToolSet` is useful for bundling many tools:
+
+```go
+ts := vai.NewToolSet()
+
+ts.AddNative(vai.WebSearch())
+
+echoTool, echoHandler := vai.FuncAsTool("echo", "Echo input.",
+	func(ctx context.Context, in struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		return in.Text, nil
+	},
+)
+ts.Add(echoTool, echoHandler)
+
+req.Tools = ts.Tools()
+
+stream, err := client.Messages.RunStream(ctx, req,
+	vai.WithToolSet(ts),
+)
+```
+
+### 7.4 Manual `WithToolHandler`
+
+If you want full control:
+
+```go
+client.Messages.Run(ctx, req,
+	vai.WithToolHandler("tool_name", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		// parse raw, do work, return value
+		return map[string]any{"ok": true}, nil
+	}),
+)
+```
+
+### 7.5 Output shaping: returning content blocks
+
+Your handler can return:
+
+- `string` (becomes a single text block)
+- `vai.ContentBlock`
+- `[]vai.ContentBlock`
+- any other JSON-marshalable object (encoded into a text block)
+
+Example returning rich blocks:
+
+```go
+return []vai.ContentBlock{
+	vai.Text("Found 3 results."),
+	vai.Text("1) ..."),
+}, nil
+```
+
+---
+
+## 8. Native Tools (Provider-Executed)
+
+Native tools are represented as `Tool{Type: "...", Config: ...}` and are executed by the provider if the provider/model supports them.
+
+SDK constructors:
+
+- `vai.WebSearch(...)`
+- `vai.CodeExecution(...)`
+- `vai.ComputerUse(width, height)`
+- `vai.TextEditor()`
+- `vai.FileSearch(...)` (provider-specific)
+
+Important:
+
+- Native tool support is **provider/model dependent**.
+- The providers in `pkg/core/providers/*` map these normalized tool types to provider-specific tool names and request formats.
+- Since providers execute these tools, you generally do **not** register handlers for them.
+
+---
+
+## 9. Streaming Events (RunStream)
+
+### 9.1 Event model
+
+`RunStream.Events()` yields a mix of:
+
+1. **Wrapped provider stream events** (`StreamEventWrapper`)
+   - these are `pkg/core/types.StreamEvent` (e.g. `content_block_delta`, `message_delta`, `error`)
+2. **Tool-loop lifecycle events**
+   - `StepStartEvent`
+   - `ToolCallStartEvent`
+   - `ToolResultEvent`
+   - `StepCompleteEvent`
+   - `HistoryDeltaEvent`
+   - `InterruptedEvent`
+   - `RunCompleteEvent`
+
+### 9.2 Helper extractors
+
+Helpers in `sdk/stream_helpers.go`:
+
+- `TextDeltaFrom(event)` — extracts text chunks from wrapped stream deltas
+- `ThinkingDeltaFrom(event)` — extracts thinking chunks if present
+
+Example:
+
+```go
+for ev := range stream.Events() {
+	if t, ok := vai.TextDeltaFrom(ev); ok {
+		fmt.Print(t)
+	}
+}
+```
+
+### 9.3 `RunStream.Process` convenience
+
+`Process` consumes events and calls your callbacks:
+
+```go
+text, err := stream.Process(vai.StreamCallbacks{
+	OnTextDelta: func(t string) { fmt.Print(t) },
+	OnToolCallStart: func(id, name string, input map[string]any) {
+		log.Printf("tool %s(%v)", name, input)
+	},
+	OnToolResult: func(id, name string, content []vai.ContentBlock, err error) {
+		log.Printf("tool %s done (err=%v)", name, err)
+	},
+})
+```
+
+It returns the accumulated output text and any final error.
+
+---
+
+## 10. Errors and Observability
+
+### Provider errors
+
+Provider errors are returned from underlying provider calls. The core also defines canonical error wrappers in `pkg/core/errors.go`.
+
+Common cases:
+
+- auth errors (missing/invalid API key)
+- provider overloads / rate limits
+- invalid request shapes (bad model string, invalid tool schema, etc.)
+
+### Tool handler errors
+
+If a tool handler returns an error, the SDK:
+
+- emits a `ToolResultEvent` with `Error != nil` (RunStream)
+- injects a `tool_result` block with `is_error: true`
+- continues the loop (the model can respond to the tool failure)
+
+### Logging
+
+The SDK itself is intentionally minimal about logging. You can provide a logger with:
+
+```go
+client := vai.NewClient(vai.WithLogger(myLogger))
+```
+
+Providers may log debug messages in some cases (e.g. gemini oauth init failure).
+
+---
+
+## 11. Testing and Local Dev
+
+### Running tests in restricted environments
+
+Some environments restrict Go’s default cache dir. If `go test ./...` fails with a cache permission error, run with repo-local caches:
+
+```bash
+GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./...
+```
+
+### Formatting
+
+```bash
+gofmt -w $(find pkg sdk -name '*.go')
+```
+
+---
+
+## 12. Gotchas and Design Notes
+
+### 12.1 “Only Run / RunStream” does not mean “no streaming”
+
+`RunStream` still relies on provider streaming internally, because it’s how it:
+
+- prints tokens as they arrive
+- detects tool calls early
+- supports interruption while a turn is in progress
+
+### 12.2 Tool handler registration is separate from tool definitions
+
+Attaching a function tool to `req.Tools` is not enough. You must also register its handler:
+
+- `WithTools(tool)` for `MakeTool(...)`
+- or `WithToolHandler(name, handler)` / `WithToolSet(...)`
+
+If you don’t, the model will call the tool and receive the “no handler registered” result.
+
+### 12.3 Structured output requires you to parse
+
+`OutputFormat` is supported at the request type level, but `vai-lite` does not include an “Extract into struct” helper. Parse `result.Response.TextContent()` yourself.
+
+### 12.4 Native tool behavior depends on the provider
+
+Even though `vai-lite` normalizes tool *types*, providers still differ in:
+
+- whether the model can call that tool
+- whether tool execution happens on the provider side
+- what events/blocks appear in the stream
+
+Plan for graceful degradation.

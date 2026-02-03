@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // Engine is the core translation and routing engine.

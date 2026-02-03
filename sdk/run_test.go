@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 func TestDefaultRunConfig(t *testing.T) {
@@ -184,6 +184,19 @@ func TestWithHooks(t *testing.T) {
 	}
 }
 
+func TestWithBuildTurnMessages(t *testing.T) {
+	cfg := defaultRunConfig()
+	if cfg.buildTurnMsgs != nil {
+		t.Fatalf("buildTurnMsgs should be nil by default")
+	}
+	WithBuildTurnMessages(func(info TurnInfo) []types.Message {
+		return info.History
+	})(&cfg)
+	if cfg.buildTurnMsgs == nil {
+		t.Fatalf("buildTurnMsgs should be set")
+	}
+}
+
 func TestOutputToContentBlocks(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -313,7 +326,7 @@ func TestRunStreamEvents(t *testing.T) {
 		ToolCallStartEvent{ID: "call_1", Name: "test", Input: nil},
 		ToolResultEvent{ID: "call_1", Name: "test", Content: nil},
 		StepCompleteEvent{Index: 0, Response: nil},
-		HistoryDeltaEvent{Append: nil},
+		HistoryDeltaEvent{ExpectedLen: 0, Append: nil},
 		RunCompleteEvent{Result: nil},
 	}
 
@@ -563,118 +576,5 @@ func TestInterruptedEvent_Structure(t *testing.T) {
 	}
 	if event.runStreamEventType() != "interrupted" {
 		t.Errorf("runStreamEventType() = %q, want %q", event.runStreamEventType(), "interrupted")
-	}
-}
-
-// TestWithInterruptConfig verifies the WithInterruptConfig RunOption.
-func TestWithInterruptConfig(t *testing.T) {
-	cfg := defaultRunConfig()
-
-	semanticCheck := true
-	interruptCfg := LiveInterrupt{
-		Mode:            "semantic",
-		EnergyThreshold: 0.5,
-		DebounceMs:      200,
-		SemanticCheck:   &semanticCheck,
-		SemanticModel:   "claude-3-haiku",
-		SavePartial:     "marked",
-	}
-
-	// WithInterruptConfig configures interrupt handling but doesn't enable live mode
-	// Use with WithLive() or WithLiveConfig()
-	WithInterruptConfig(interruptCfg)(&cfg)
-
-	if cfg.interruptConfig == nil {
-		t.Fatal("interruptConfig should be set")
-	}
-	if cfg.interruptConfig.Mode != "semantic" {
-		t.Errorf("Mode = %q, want %q", cfg.interruptConfig.Mode, "semantic")
-	}
-	if cfg.interruptConfig.EnergyThreshold != 0.5 {
-		t.Errorf("EnergyThreshold = %v, want 0.5", cfg.interruptConfig.EnergyThreshold)
-	}
-	if cfg.interruptConfig.DebounceMs != 200 {
-		t.Errorf("DebounceMs = %d, want 200", cfg.interruptConfig.DebounceMs)
-	}
-	if cfg.interruptConfig.SemanticCheck == nil || !*cfg.interruptConfig.SemanticCheck {
-		t.Error("SemanticCheck should be true")
-	}
-	if cfg.interruptConfig.SemanticModel != "claude-3-haiku" {
-		t.Errorf("SemanticModel = %q, want %q", cfg.interruptConfig.SemanticModel, "claude-3-haiku")
-	}
-	if cfg.interruptConfig.SavePartial != "marked" {
-		t.Errorf("SavePartial = %q, want %q", cfg.interruptConfig.SavePartial, "marked")
-	}
-
-	// Verify it works with WithLive()
-	cfg2 := defaultRunConfig()
-	WithInterruptConfig(interruptCfg)(&cfg2)
-
-	if cfg2.interruptConfig == nil {
-		t.Fatal("interruptConfig should be set")
-	}
-}
-
-// TestLiveVoiceOutput_Struct verifies the LiveVoiceOutput struct.
-func TestLiveVoiceOutput_Struct(t *testing.T) {
-	vo := LiveVoiceOutput{
-		Provider: "cartesia",
-		Voice:    "echo",
-		Speed:    1.0,
-		Format:   "wav",
-	}
-
-	if vo.Provider != "cartesia" {
-		t.Errorf("Provider = %q, want %q", vo.Provider, "cartesia")
-	}
-	if vo.Voice != "echo" {
-		t.Errorf("Voice = %q, want %q", vo.Voice, "echo")
-	}
-	if vo.Speed != 1.0 {
-		t.Errorf("Speed = %v, want 1.0", vo.Speed)
-	}
-	if vo.Format != "wav" {
-		t.Errorf("Format = %q, want %q", vo.Format, "wav")
-	}
-}
-
-// TestLiveInterrupt_Struct verifies the LiveInterrupt struct.
-func TestLiveInterrupt_Struct(t *testing.T) {
-	semanticCheck := false
-	li := LiveInterrupt{
-		Mode:            "energy",
-		EnergyThreshold: 0.3,
-		DebounceMs:      100,
-		SemanticCheck:   &semanticCheck,
-		SemanticModel:   "",
-		SavePartial:     "discard",
-	}
-
-	if li.Mode != "energy" {
-		t.Errorf("Mode = %q, want %q", li.Mode, "energy")
-	}
-	if li.EnergyThreshold != 0.3 {
-		t.Errorf("EnergyThreshold = %v, want 0.3", li.EnergyThreshold)
-	}
-	if li.DebounceMs != 100 {
-		t.Errorf("DebounceMs = %d, want 100", li.DebounceMs)
-	}
-	if li.SemanticCheck == nil || *li.SemanticCheck {
-		t.Error("SemanticCheck should be false")
-	}
-	if li.SavePartial != "discard" {
-		t.Errorf("SavePartial = %q, want %q", li.SavePartial, "discard")
-	}
-}
-
-// TestInterruptConfigAlias verifies the InterruptConfig type alias.
-func TestInterruptConfigAlias(t *testing.T) {
-	// Verify InterruptConfig is an alias for LiveInterrupt
-	var ic InterruptConfig = LiveInterrupt{
-		Mode: "semantic",
-	}
-
-	if ic.Mode != "semantic" {
-		t.Errorf("Mode = %q, want %q", ic.Mode, "semantic")
 	}
 }

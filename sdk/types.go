@@ -1,6 +1,6 @@
 package vai
 
-import "github.com/vango-go/vai/pkg/core/types"
+import "github.com/vango-go/vai-lite/pkg/core/types"
 
 // Type aliases for streaming events.
 // These re-export the core types for SDK users.
@@ -33,12 +33,6 @@ type (
 
 	// PingEvent is sent periodically to keep the connection alive.
 	PingEvent = types.PingEvent
-
-	// AudioDeltaEvent contains incremental audio data.
-	AudioDeltaEvent = types.AudioDeltaEvent
-
-	// TranscriptDeltaEvent contains incremental transcript text.
-	TranscriptDeltaEvent = types.TranscriptDeltaEvent
 
 	// ErrorEvent signals an error during streaming.
 	ErrorEvent = types.ErrorEvent
@@ -96,15 +90,6 @@ type (
 
 	// JSONSchema represents a JSON Schema for structured output.
 	JSONSchema = types.JSONSchema
-
-	// VoiceConfig configures the voice pipeline.
-	VoiceConfig = types.VoiceConfig
-
-	// VoiceInputConfig configures speech-to-text.
-	VoiceInputConfig = types.VoiceInputConfig
-
-	// VoiceOutputConfig configures text-to-speech.
-	VoiceOutputConfig = types.VoiceOutputConfig
 
 	// OutputFormat specifies structured output requirements.
 	OutputFormat = types.OutputFormat

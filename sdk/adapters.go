@@ -3,15 +3,15 @@ package vai
 import (
 	"context"
 
-	"github.com/vango-go/vai/pkg/core"
-	"github.com/vango-go/vai/pkg/core/providers/anthropic"
-	"github.com/vango-go/vai/pkg/core/providers/cerebras"
-	"github.com/vango-go/vai/pkg/core/providers/gemini"
-	"github.com/vango-go/vai/pkg/core/providers/gemini_oauth"
-	"github.com/vango-go/vai/pkg/core/providers/groq"
-	"github.com/vango-go/vai/pkg/core/providers/oai_resp"
-	"github.com/vango-go/vai/pkg/core/providers/openai"
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core"
+	"github.com/vango-go/vai-lite/pkg/core/providers/anthropic"
+	"github.com/vango-go/vai-lite/pkg/core/providers/cerebras"
+	"github.com/vango-go/vai-lite/pkg/core/providers/gemini"
+	"github.com/vango-go/vai-lite/pkg/core/providers/gemini_oauth"
+	"github.com/vango-go/vai-lite/pkg/core/providers/groq"
+	"github.com/vango-go/vai-lite/pkg/core/providers/oai_resp"
+	"github.com/vango-go/vai-lite/pkg/core/providers/openai"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // anthropicAdapter wraps the anthropic.Provider to implement core.Provider.

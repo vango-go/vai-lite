@@ -102,30 +102,6 @@ type ThinkingDelta struct {
 
 func (d ThinkingDelta) DeltaType() string { return "thinking_delta" }
 
-// --- Voice-specific streaming events ---
-
-// AudioDeltaEvent contains incremental audio data.
-type AudioDeltaEvent struct {
-	Type  string `json:"type"` // "audio_delta"
-	Delta struct {
-		Data   string `json:"data"`   // base64
-		Format string `json:"format"` // "mp3", "wav"
-	} `json:"delta"`
-}
-
-func (e AudioDeltaEvent) EventType() string { return "audio_delta" }
-
-// TranscriptDeltaEvent contains incremental transcript text.
-type TranscriptDeltaEvent struct {
-	Type  string `json:"type"` // "transcript_delta"
-	Role  string `json:"role"` // "user" or "assistant"
-	Delta struct {
-		Text string `json:"text"`
-	} `json:"delta"`
-}
-
-func (e TranscriptDeltaEvent) EventType() string { return "transcript_delta" }
-
 // ErrorEvent signals an error during streaming.
 type ErrorEvent struct {
 	Type  string `json:"type"` // "error"
@@ -220,20 +196,6 @@ func UnmarshalStreamEvent(data []byte) (StreamEvent, error) {
 
 	case "ping":
 		var event PingEvent
-		if err := json.Unmarshal(data, &event); err != nil {
-			return nil, err
-		}
-		return event, nil
-
-	case "audio_delta":
-		var event AudioDeltaEvent
-		if err := json.Unmarshal(data, &event); err != nil {
-			return nil, err
-		}
-		return event, nil
-
-	case "transcript_delta":
-		var event TranscriptDeltaEvent
 		if err := json.Unmarshal(data, &event); err != nil {
 			return nil, err
 		}

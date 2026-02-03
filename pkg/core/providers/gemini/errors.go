@@ -55,9 +55,9 @@ type geminiError struct {
 		Message string `json:"message"`
 		Status  string `json:"status"`
 		Details []struct {
-			Type     string `json:"@type"`
-			Reason   string `json:"reason,omitempty"`
-			Domain   string `json:"domain,omitempty"`
+			Type     string            `json:"@type"`
+			Reason   string            `json:"reason,omitempty"`
+			Domain   string            `json:"domain,omitempty"`
 			Metadata map[string]string `json:"metadata,omitempty"`
 		} `json:"details,omitempty"`
 	} `json:"error"`

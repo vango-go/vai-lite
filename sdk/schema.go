@@ -4,8 +4,20 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
+
+// GenerateJSONSchema generates a JSON Schema from a Go type.
+// It supports struct tags:
+//   - json:"name"        - field name in JSON
+//   - desc:"description" - field description
+//   - enum:"a,b,c"       - enum values
+func GenerateJSONSchema(t reflect.Type) *types.JSONSchema {
+	if t == nil {
+		return &types.JSONSchema{}
+	}
+	return generateSchemaFromType(t)
+}
 
 // generateSchema generates a JSON schema from a Go value.
 // Supports struct tags:

@@ -168,11 +168,11 @@ func (t WebSearchToolResultBlock) BlockType() string { return "web_search_tool_r
 
 // WebSearchResultEntry is a single search result.
 type WebSearchResultEntry struct {
-	Type          string `json:"type"` // "web_search_result"
-	URL           string `json:"url"`
-	Title         string `json:"title"`
+	Type             string `json:"type"` // "web_search_result"
+	URL              string `json:"url"`
+	Title            string `json:"title"`
 	EncryptedContent string `json:"encrypted_content,omitempty"`
-	PageAge       string `json:"page_age,omitempty"`
+	PageAge          string `json:"page_age,omitempty"`
 }
 
 // UnmarshalContentBlock deserializes a content block from JSON.

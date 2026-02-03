@@ -5,22 +5,22 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // chatRequest is the OpenAI Chat Completions API request format.
 type chatRequest struct {
-	Model            string          `json:"model"`
-	Messages         []chatMessage   `json:"messages"`
-	MaxTokens        *int            `json:"max_completion_tokens,omitempty"`
-	Temperature      *float64        `json:"temperature,omitempty"`
-	TopP             *float64        `json:"top_p,omitempty"`
-	Stop             []string        `json:"stop,omitempty"`
-	Tools            []chatTool      `json:"tools,omitempty"`
-	ToolChoice       any             `json:"tool_choice,omitempty"`
-	ResponseFormat   *responseFormat `json:"response_format,omitempty"`
-	Stream           bool            `json:"stream,omitempty"`
-	StreamOptions    *streamOptions  `json:"stream_options,omitempty"`
+	Model          string          `json:"model"`
+	Messages       []chatMessage   `json:"messages"`
+	MaxTokens      *int            `json:"max_completion_tokens,omitempty"`
+	Temperature    *float64        `json:"temperature,omitempty"`
+	TopP           *float64        `json:"top_p,omitempty"`
+	Stop           []string        `json:"stop,omitempty"`
+	Tools          []chatTool      `json:"tools,omitempty"`
+	ToolChoice     any             `json:"tool_choice,omitempty"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Stream         bool            `json:"stream,omitempty"`
+	StreamOptions  *streamOptions  `json:"stream_options,omitempty"`
 }
 
 // chatMessage is a single message in OpenAI format.

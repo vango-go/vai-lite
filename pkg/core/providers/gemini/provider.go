@@ -6,7 +6,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 const (
@@ -71,7 +71,7 @@ func (p *Provider) Capabilities() ProviderCapabilities {
 		Video:            true,  // Gemini supports video!
 		Tools:            true,
 		ToolStreaming:    true,
-		Thinking:         true,  // Gemini 2.5+ supports thinking
+		Thinking:         true, // Gemini 2.5+ supports thinking
 		StructuredOutput: true,
 		NativeTools:      []string{"web_search", "code_execution"},
 	}

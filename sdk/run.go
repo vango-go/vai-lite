@@ -10,9 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vango-go/vai/pkg/core/live"
-	"github.com/vango-go/vai/pkg/core/types"
-	"github.com/vango-go/vai/pkg/core/voice/tts"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // RunStopReason indicates why the run loop terminated.
@@ -81,11 +79,7 @@ type runConfig struct {
 	onStop        func(*RunResult)
 	parallelTools bool
 	toolTimeout   time.Duration
-
-	// Live mode configuration
-	voiceOutput     *LiveVoiceOutput
-	interruptConfig *LiveInterrupt
-	liveConfig      *LiveConfig // Non-nil enables live mode
+	buildTurnMsgs func(info TurnInfo) []types.Message
 }
 
 // defaultRunConfig returns the default run configuration.
@@ -99,6 +93,13 @@ func defaultRunConfig() runConfig {
 
 // RunOption configures the Run loop.
 type RunOption func(*runConfig)
+
+// TurnInfo describes the state at a turn boundary.
+// History is a snapshot of the SDK's internal append-only history and should be treated as read-only.
+type TurnInfo struct {
+	TurnIndex int
+	History   []types.Message
+}
 
 // WithMaxToolCalls sets the maximum number of tool calls before stopping.
 func WithMaxToolCalls(n int) RunOption {
@@ -185,6 +186,15 @@ func WithAfterResponse(fn func(*Response)) RunOption {
 	return func(c *runConfig) { c.afterResponse = fn }
 }
 
+// WithBuildTurnMessages sets a hook called at each turn boundary to build the message list
+// that will be sent to the model for that turn.
+//
+// This enables advanced context management (pinned memory blocks, trimming, reordering, etc.)
+// without mutating the underlying append-only history.
+func WithBuildTurnMessages(fn func(info TurnInfo) []types.Message) RunOption {
+	return func(c *runConfig) { c.buildTurnMsgs = fn }
+}
+
 // WithOnToolCall sets a hook called after each tool execution.
 func WithOnToolCall(fn func(name string, input map[string]any, output any, err error)) RunOption {
 	return func(c *runConfig) { c.onToolCall = fn }
@@ -207,103 +217,6 @@ func WithToolTimeout(d time.Duration) RunOption {
 	return func(c *runConfig) { c.toolTimeout = d }
 }
 
-// --- Live Mode Options ---
-
-// LiveVoiceOutput configures text-to-speech output for live mode.
-type LiveVoiceOutput struct {
-	Provider   string  `json:"provider,omitempty"` // e.g., "cartesia", "elevenlabs"
-	Voice      string  `json:"voice"`
-	Speed      float64 `json:"speed,omitempty"`
-	Format     string  `json:"format,omitempty"`
-	SampleRate int     `json:"sample_rate,omitempty"`
-}
-
-// LiveInterrupt configures barge-in detection for live mode.
-type LiveInterrupt struct {
-	// Mode is the interrupt detection mode: "auto", "manual", or "disabled".
-	Mode string `json:"mode,omitempty"`
-
-	// EnergyThreshold for detecting potential interrupt (default: 0.05).
-	EnergyThreshold float64 `json:"energy_threshold,omitempty"`
-
-	// DebounceMs is the minimum sustained speech before check (default: 100).
-	DebounceMs int `json:"debounce_ms,omitempty"`
-
-	// SemanticCheck enables distinguishing interrupts from backchannels (default: true).
-	SemanticCheck *bool `json:"semantic_check,omitempty"`
-
-	// SemanticModel is the fast LLM for interrupt detection.
-	SemanticModel string `json:"semantic_model,omitempty"`
-
-	// SavePartial specifies how to handle partial response: "discard", "save", or "marked".
-	SavePartial string `json:"save_partial,omitempty"`
-}
-
-// InterruptConfig is an alias for LiveInterrupt for backwards compatibility.
-type InterruptConfig = LiveInterrupt
-
-// WithVoiceOutput configures text-to-speech output.
-// This enables audio output from the model's responses.
-//
-// Example:
-//
-//	stream, err := client.Messages.RunStream(ctx, req,
-//	    vai.WithLive(),
-//	    vai.WithVoiceOutput(vai.LiveVoiceOutput{
-//	        Provider: "cartesia",
-//	        Voice:    "a0e99841-438c-4a64-b679-ae501e7d6091",
-//	    }),
-//	)
-func WithVoiceOutput(cfg LiveVoiceOutput) RunOption {
-	return func(c *runConfig) {
-		c.voiceOutput = &cfg
-	}
-}
-
-// WithInterruptConfig configures interrupt (barge-in) detection.
-//
-// Example:
-//
-//	stream, err := client.Messages.RunStream(ctx, req,
-//	    vai.WithLive(),
-//	    vai.WithInterruptConfig(vai.LiveInterrupt{
-//	        Mode:          "auto",
-//	        SemanticCheck: ptrBool(true),
-//	    }),
-//	)
-func WithInterruptConfig(cfg LiveInterrupt) RunOption {
-	return func(c *runConfig) {
-		c.interruptConfig = &cfg
-	}
-}
-
-// WithLive enables real-time bidirectional voice mode.
-// When enabled, RunStream gains SendAudio(), ForceCommit(), and AudioOutput() methods.
-//
-// The same MessageRequest works in all modes - live mode just changes how you interact
-// with the stream (sending audio input, receiving audio output in real-time).
-//
-// Example:
-//
-//	stream, err := client.Messages.RunStream(ctx, &vai.MessageRequest{
-//	    Model:  "anthropic/claude-haiku-4-5-20251001",
-//	    System: "You are a helpful assistant.",
-//	}, vai.WithLive(&vai.LiveConfig{SampleRate: 24000}))
-//
-//	// Send audio from microphone
-//	stream.SendAudio(pcmData)
-//
-//	// Play audio output
-//	stream.AudioOutput().HandleAudio(playFunc, flushFunc)
-func WithLive(cfg *LiveConfig) RunOption {
-	return func(c *runConfig) {
-		if cfg == nil {
-			cfg = &LiveConfig{SampleRate: 24000}
-		}
-		c.liveConfig = cfg
-	}
-}
-
 // --- Run Loop Implementation ---
 
 // runLoop executes the main tool execution loop.
@@ -312,39 +225,12 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 		Steps: make([]RunStep, 0),
 	}
 
-	// Create a working copy of messages
-	messages := make([]types.Message, len(req.Messages))
-	copy(messages, req.Messages)
-
-	appendAssistantMessage := func(resp *Response) {
-		messages = append(messages, types.Message{
-			Role:    "assistant",
-			Content: resp.Content,
-		})
-	}
-
-	appendToolResults := func(toolResults []ToolExecutionResult) {
-		if len(toolResults) == 0 {
-			return
-		}
-		toolResultBlocks := make([]types.ContentBlock, len(toolResults))
-		for i, tr := range toolResults {
-			toolResultBlocks[i] = types.ToolResultBlock{
-				Type:      "tool_result",
-				ToolUseID: tr.ToolUseID,
-				Content:   tr.Content,
-				IsError:   tr.Error != nil,
-			}
-		}
-		messages = append(messages, types.Message{
-			Role:    "user",
-			Content: toolResultBlocks,
-		})
-	}
+	history := make([]types.Message, len(req.Messages))
+	copy(history, req.Messages)
 
 	snapshotMessages := func() []types.Message {
-		out := make([]types.Message, len(messages))
-		copy(out, messages)
+		out := make([]types.Message, len(history))
+		copy(out, history)
 		return out
 	}
 
@@ -389,10 +275,20 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 			return result, nil
 		}
 
+		messagesForTurn := history
+		if cfg.buildTurnMsgs != nil {
+			historySnapshot := make([]types.Message, len(history))
+			copy(historySnapshot, history)
+			messagesForTurn = cfg.buildTurnMsgs(TurnInfo{
+				TurnIndex: result.TurnCount,
+				History:   historySnapshot,
+			})
+		}
+
 		// Build request for this turn
 		turnReq := &types.MessageRequest{
 			Model:         req.Model,
-			Messages:      messages,
+			Messages:      messagesForTurn,
 			MaxTokens:     req.MaxTokens,
 			System:        req.System,
 			Temperature:   req.Temperature,
@@ -403,7 +299,6 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 			ToolChoice:    req.ToolChoice,
 			OutputFormat:  req.OutputFormat,
 			Output:        req.Output,
-			Voice:         req.Voice,
 			Extensions:    req.Extensions,
 			Metadata:      req.Metadata,
 		}
@@ -415,7 +310,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Make the API call
 		stepStart := time.Now()
-		resp, err := s.Create(ctx, turnReq)
+		resp, err := s.createTurn(ctx, turnReq)
 		stepDuration := time.Since(stepStart).Milliseconds()
 
 		if err != nil {
@@ -445,7 +340,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Check custom stop condition
 		if cfg.stopWhen != nil && cfg.stopWhen(resp) {
-			appendAssistantMessage(resp)
+			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopCustom
@@ -458,7 +353,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Check if model finished without tool calls
 		if resp.StopReason != types.StopReasonToolUse {
-			appendAssistantMessage(resp)
+			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopEndTurn
@@ -472,7 +367,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 		// Process tool calls
 		toolUses := resp.ToolUses()
 		if len(toolUses) == 0 {
-			appendAssistantMessage(resp)
+			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopEndTurn
@@ -485,7 +380,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Check tool call limit
 		if cfg.maxToolCalls > 0 && result.ToolCallCount+len(toolUses) > cfg.maxToolCalls {
-			appendAssistantMessage(resp)
+			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopMaxToolCalls
@@ -512,8 +407,8 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 		result.ToolCallCount += len(toolUses)
 
 		// Append assistant message with tool calls
-		appendAssistantMessage(resp)
-		appendToolResults(toolResults)
+		history = AppendAssistantMessage(history, resp.Content)
+		history = AppendToolResultsMessage(history, toolResults)
 	}
 }
 
@@ -687,7 +582,6 @@ type interruptRequest struct {
 }
 
 // RunStream wraps a streaming tool execution loop with interrupt support.
-// When created with WithLive(), it provides real-time bidirectional voice capabilities.
 type RunStream struct {
 	// State protected by mutex
 	mu             sync.RWMutex
@@ -705,12 +599,6 @@ type RunStream struct {
 	err       error
 	closed    atomic.Bool
 	closeOnce sync.Once
-
-	// Live mode state (only populated when WithLive is used)
-	isLive      bool
-	liveSession *live.Session
-	audioOutput *AudioOutput
-	liveConfig  *LiveConfig
 }
 
 // RunStreamEvent is an event from the RunStream.
@@ -760,9 +648,10 @@ type StepCompleteEvent struct {
 func (e StepCompleteEvent) runStreamEventType() string { return "step_complete" }
 
 // HistoryDeltaEvent signals messages to append to history.
-// For non-live RunStream, this is emitted after StepCompleteEvent.
+// This is emitted after StepCompleteEvent.
 type HistoryDeltaEvent struct {
-	Append []types.Message `json:"append"`
+	ExpectedLen int            `json:"expected_len"`
+	Append      []types.Message `json:"append"`
 }
 
 func (e HistoryDeltaEvent) runStreamEventType() string { return "history_delta" }
@@ -773,14 +662,6 @@ type RunCompleteEvent struct {
 }
 
 func (e RunCompleteEvent) runStreamEventType() string { return "run_complete" }
-
-// AudioChunkEvent contains streaming audio data from TTS.
-type AudioChunkEvent struct {
-	Data   []byte `json:"data"`
-	Format string `json:"format"`
-}
-
-func (e AudioChunkEvent) runStreamEventType() string { return "audio_chunk" }
 
 // InterruptedEvent signals that the stream was interrupted.
 type InterruptedEvent struct {
@@ -817,7 +698,6 @@ func (rs *RunStream) Cancel() error {
 
 // Interrupt stops the current stream, saves the partial response according to behavior,
 // injects a new message, and continues the conversation.
-// This is the primary mechanism for barge-in handling in Live mode.
 // This method is safe to call from any goroutine.
 func (rs *RunStream) Interrupt(msg types.Message, behavior InterruptBehavior) error {
 	// Check if already done first to avoid blocking
@@ -852,144 +732,6 @@ func (rs *RunStream) InterruptWithText(text string) error {
 	}, InterruptSaveMarked)
 }
 
-// voiceStreamer manages text batching and TTS streaming.
-type voiceStreamer struct {
-	ttsCtx     *tts.StreamingContext
-	sendEvents func(RunStreamEvent)
-	format     string
-
-	// Text batching
-	buffer     strings.Builder
-	bufferMu   sync.Mutex
-	flushTimer *time.Timer
-	done       chan struct{}
-	wg         sync.WaitGroup
-
-	// Config
-	maxChars     int           // Send after this many chars
-	maxDelay     time.Duration // Max time before sending buffered text
-	sentenceEnds string        // Characters that trigger immediate send
-}
-
-func newVoiceStreamer(ttsCtx *tts.StreamingContext, format string, sendEvents func(RunStreamEvent)) *voiceStreamer {
-	vs := &voiceStreamer{
-		ttsCtx:       ttsCtx,
-		sendEvents:   sendEvents,
-		format:       format,
-		done:         make(chan struct{}),
-		maxChars:     80,                     // Send every ~80 chars
-		maxDelay:     150 * time.Millisecond, // Or after 150ms
-		sentenceEnds: ".!?",
-	}
-
-	// Start audio forwarding goroutine
-	vs.wg.Add(1)
-	go vs.forwardAudio()
-
-	return vs
-}
-
-// AddText adds text to the buffer and may trigger a send.
-func (vs *voiceStreamer) AddText(text string) {
-	vs.bufferMu.Lock()
-	defer vs.bufferMu.Unlock()
-
-	vs.buffer.WriteString(text)
-	content := vs.buffer.String()
-
-	// Check if we should send now
-	shouldSend := false
-
-	// Send if buffer is large enough
-	if len(content) >= vs.maxChars {
-		shouldSend = true
-	}
-
-	// Send on sentence boundaries
-	if len(text) > 0 && strings.ContainsAny(text, vs.sentenceEnds) {
-		shouldSend = true
-	}
-
-	if shouldSend {
-		vs.sendBufferLocked()
-	} else {
-		// Reset/start the flush timer
-		vs.resetTimerLocked()
-	}
-}
-
-func (vs *voiceStreamer) sendBufferLocked() {
-	content := strings.TrimSpace(vs.buffer.String())
-	if content == "" {
-		return
-	}
-
-	vs.buffer.Reset()
-	if vs.flushTimer != nil {
-		vs.flushTimer.Stop()
-		vs.flushTimer = nil
-	}
-
-	// Send to TTS (continue=true, more text coming)
-	vs.ttsCtx.SendText(content, false)
-}
-
-func (vs *voiceStreamer) resetTimerLocked() {
-	if vs.flushTimer != nil {
-		vs.flushTimer.Stop()
-	}
-	vs.flushTimer = time.AfterFunc(vs.maxDelay, func() {
-		vs.bufferMu.Lock()
-		defer vs.bufferMu.Unlock()
-		vs.sendBufferLocked()
-	})
-}
-
-// Flush sends any remaining text and signals completion.
-func (vs *voiceStreamer) Flush() {
-	vs.bufferMu.Lock()
-	content := strings.TrimSpace(vs.buffer.String())
-	vs.buffer.Reset()
-	if vs.flushTimer != nil {
-		vs.flushTimer.Stop()
-		vs.flushTimer = nil
-	}
-	vs.bufferMu.Unlock()
-
-	if content != "" {
-		// Send final text chunk
-		vs.ttsCtx.SendText(content, true)
-	} else {
-		// Just flush
-		vs.ttsCtx.Flush()
-	}
-}
-
-// Close waits for all audio to be forwarded, then cleans up.
-func (vs *voiceStreamer) Close() {
-	// Wait for audio channel to be closed (all audio received)
-	// Don't close vs.done yet - let forwardAudio drain naturally
-	vs.wg.Wait()
-
-	// Now safe to close
-	close(vs.done)
-	vs.ttsCtx.Close()
-}
-
-// forwardAudio forwards audio chunks as events.
-func (vs *voiceStreamer) forwardAudio() {
-	defer vs.wg.Done()
-
-	// Simply drain the audio channel until it's closed
-	// The channel is closed when TTS context receives "done" from Cartesia
-	for chunk := range vs.ttsCtx.Audio() {
-		vs.sendEvents(AudioChunkEvent{
-			Data:   chunk,
-			Format: vs.format,
-		})
-	}
-}
-
 // runStreamLoop executes the streaming tool loop.
 func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest, cfg *runConfig) *RunStream {
 	// Copy messages to avoid mutating the original
@@ -1003,14 +745,7 @@ func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest
 		done:      make(chan struct{}),
 	}
 
-	// Check if live mode is enabled
-	if cfg.liveConfig != nil {
-		rs.isLive = true
-		rs.liveConfig = cfg.liveConfig
-		go rs.runLive(ctx, s, req, cfg)
-	} else {
-		go rs.run(ctx, s, req, cfg)
-	}
+	go rs.run(ctx, s, req, cfg)
 	return rs
 }
 
@@ -1031,40 +766,16 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		defer cancel()
 	}
 
-	// Set up voice streaming if configured
-	var voiceStream *voiceStreamer
-	if req.Voice != nil && req.Voice.Output != nil && svc.client.voicePipeline != nil {
-		format := req.Voice.Output.Format
-		if format == "" {
-			format = "wav"
-		}
-
-		ttsCtx, err := svc.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice)
-		if err == nil {
-			voiceStream = newVoiceStreamer(ttsCtx, format, rs.send)
-		}
-		// If TTS setup fails, continue without voice
-	}
-
-	// Helper to flush voice and wait for all audio before completing
-	voiceFinished := false
-	finishVoice := func() {
-		if voiceStream != nil && !voiceFinished {
-			voiceFinished = true
-			voiceStream.Flush()
-			voiceStream.Close()
-		}
-	}
-	defer finishVoice() // Ensure cleanup on any exit
-
 	appendHistoryDelta := func(delta []types.Message) {
 		if len(delta) == 0 {
 			return
 		}
+		expectedLen := 0
 		rs.mu.Lock()
+		expectedLen = len(rs.messages)
 		rs.messages = append(rs.messages, delta...)
 		rs.mu.Unlock()
-		rs.send(HistoryDeltaEvent{Append: delta})
+		rs.send(HistoryDeltaEvent{ExpectedLen: expectedLen, Append: delta})
 	}
 
 	snapshotHistory := func() []types.Message {
@@ -1101,7 +812,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			result.StopReason = RunStopMaxTurns
 			result.Messages = snapshotHistory()
 			rs.result = result
-			finishVoice()
 			rs.send(RunCompleteEvent{Result: result})
 			return
 		}
@@ -1110,7 +820,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			result.StopReason = RunStopMaxTokens
 			result.Messages = snapshotHistory()
 			rs.result = result
-			finishVoice()
 			rs.send(RunCompleteEvent{Result: result})
 			return
 		}
@@ -1118,11 +827,13 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		// Signal step start
 		rs.send(StepStartEvent{Index: stepIndex})
 
-		// Build request using rs.messages (can be modified by interrupt)
+		// Snapshot internal history for this turn boundary.
 		rs.mu.RLock()
+		historySnapshot := make([]types.Message, len(rs.messages))
+		copy(historySnapshot, rs.messages)
 		turnReq := &types.MessageRequest{
 			Model:         req.Model,
-			Messages:      rs.messages,
+			Messages:      historySnapshot,
 			MaxTokens:     req.MaxTokens,
 			System:        req.System,
 			Temperature:   req.Temperature,
@@ -1134,11 +845,17 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			Stream:        true, // Always stream in RunStream
 			OutputFormat:  req.OutputFormat,
 			Output:        req.Output,
-			Voice:         req.Voice,
 			Extensions:    req.Extensions,
 			Metadata:      req.Metadata,
 		}
 		rs.mu.RUnlock()
+
+		if cfg.buildTurnMsgs != nil {
+			turnReq.Messages = cfg.buildTurnMsgs(TurnInfo{
+				TurnIndex: result.TurnCount,
+				History:   historySnapshot,
+			})
+		}
 
 		if cfg.beforeCall != nil {
 			cfg.beforeCall(turnReq)
@@ -1147,7 +864,7 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		stepStart := time.Now()
 
 		// Stream this turn
-		stream, err := svc.Stream(ctx, turnReq)
+		stream, err := svc.streamTurn(ctx, turnReq)
 		if err != nil {
 			result.StopReason = RunStopError
 			result.Messages = snapshotHistory()
@@ -1230,14 +947,12 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 					result.StopReason = RunStopCancelled
 					result.Messages = snapshotHistory()
 					rs.result = result
-					finishVoice()
 					rs.send(RunCompleteEvent{Result: result})
 					return
 				}
 
 				// Interrupt: Continue to next turn
 				rs.send(InterruptedEvent{PartialText: partialText, Behavior: intReq.behavior})
-				finishVoice()
 				break streamLoop
 
 			case event, ok := <-stream.Events():
@@ -1254,11 +969,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 						rs.mu.Lock()
 						rs.partialContent.WriteString(textDelta.Text)
 						rs.mu.Unlock()
-
-						// Feed text deltas to voice streamer
-						if voiceStream != nil {
-							voiceStream.AddText(textDelta.Text)
-						}
 					}
 					// Accumulate tool input from input_json_delta events
 					if inputDelta, ok := deltaEvent.Delta.(types.InputJSONDelta); ok {
@@ -1364,7 +1074,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 				{Role: "assistant", Content: resp.Content},
 			})
 			result.Messages = snapshotHistory()
-			finishVoice()
 			rs.result = result
 			rs.send(RunCompleteEvent{Result: result})
 			return
@@ -1380,7 +1089,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 				{Role: "assistant", Content: resp.Content},
 			})
 			result.Messages = snapshotHistory()
-			finishVoice()
 			rs.result = result
 			rs.send(RunCompleteEvent{Result: result})
 			return
@@ -1397,7 +1105,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 				{Role: "assistant", Content: resp.Content},
 			})
 			result.Messages = snapshotHistory()
-			finishVoice()
 			rs.result = result
 			rs.send(RunCompleteEvent{Result: result})
 			return
@@ -1413,7 +1120,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 				{Role: "assistant", Content: resp.Content},
 			})
 			result.Messages = snapshotHistory()
-			finishVoice()
 			rs.result = result
 			rs.send(RunCompleteEvent{Result: result})
 			return
@@ -1491,414 +1197,10 @@ func (rs *RunStream) Close() error {
 		return nil
 	}
 
-	// Close live session if in live mode
-	if rs.isLive && rs.liveSession != nil {
-		rs.liveSession.Close()
-	}
-
-	// Close audio output if present
-	if rs.audioOutput != nil {
-		rs.audioOutput.Close()
-	}
-
 	// Only close done channel once; the closeOnce ensures this
 	// Note: done might already be closed by run() goroutine via closeOnce
 	rs.closeOnce.Do(func() {
 		close(rs.done)
 	})
 	return nil
-}
-
-// --- Live Mode Methods ---
-// These methods are only available when RunStream is created with WithLive().
-// They will return errors if called on a non-live stream.
-
-// IsLive returns true if this stream is in live voice mode.
-func (rs *RunStream) IsLive() bool {
-	return rs.isLive
-}
-
-// SessionID returns the live session identifier.
-// Returns empty string if not in live mode.
-func (rs *RunStream) SessionID() string {
-	if !rs.isLive || rs.liveSession == nil {
-		return ""
-	}
-	return rs.liveSession.SessionID()
-}
-
-// SendAudio sends audio data to the live session for processing.
-// Audio should be 16-bit PCM, mono, at the configured sample rate.
-// Returns error if not in live mode.
-func (rs *RunStream) SendAudio(data []byte) error {
-	if !rs.isLive {
-		return fmt.Errorf("SendAudio: not in live mode (use WithLive option)")
-	}
-	if rs.liveSession == nil {
-		return fmt.Errorf("SendAudio: live session not initialized")
-	}
-	return rs.liveSession.SendAudio(data)
-}
-
-// ForceCommit forces the VAD to commit the current turn immediately.
-// Useful for push-to-talk style interaction.
-// Returns error if not in live mode.
-func (rs *RunStream) ForceCommit() error {
-	if !rs.isLive {
-		return fmt.Errorf("ForceCommit: not in live mode (use WithLive option)")
-	}
-	if rs.liveSession == nil {
-		return fmt.Errorf("ForceCommit: live session not initialized")
-	}
-	return rs.liveSession.Commit()
-}
-
-// ForceInterrupt forces an interrupt of the current response.
-// Returns error if not in live mode.
-func (rs *RunStream) ForceInterrupt(transcript string) error {
-	if !rs.isLive {
-		return fmt.Errorf("ForceInterrupt: not in live mode (use WithLive option)")
-	}
-	if rs.liveSession == nil {
-		return fmt.Errorf("ForceInterrupt: live session not initialized")
-	}
-	return rs.liveSession.Interrupt(transcript)
-}
-
-// AudioOutput returns the audio output manager for playing TTS audio.
-// Returns nil if not in live mode.
-// Provides buffered audio chunks and flush signals for smooth playback.
-//
-// Example:
-//
-//	stream.AudioOutput().HandleAudio(
-//	    func(data []byte) { speaker.Write(data) },
-//	    func() { speaker.Flush() },
-//	)
-func (rs *RunStream) AudioOutput() *AudioOutput {
-	if !rs.isLive {
-		return nil
-	}
-	return rs.audioOutput
-}
-
-// State returns the current live session state as a string.
-// Returns empty string if not in live mode.
-func (rs *RunStream) State() string {
-	if !rs.isLive || rs.liveSession == nil {
-		return ""
-	}
-	return rs.liveSession.State().String()
-}
-
-// SendText sends a discrete text message to the live session.
-// This bypasses VAD and grace period - the text is processed as a complete user turn.
-// If the session is speaking or processing, it waits for the response to complete.
-// Returns error if not in live mode.
-func (rs *RunStream) SendText(text string) error {
-	if !rs.isLive {
-		return fmt.Errorf("SendText: not in live mode (use WithLive option)")
-	}
-	if rs.liveSession == nil {
-		return fmt.Errorf("SendText: live session not initialized")
-	}
-	return rs.liveSession.SendText(text)
-}
-
-// SendContent sends discrete content blocks (text, image, video) to the live session.
-// This bypasses VAD and grace period - the content is processed as a complete user turn.
-// If the session is speaking or processing, it waits for the response to complete.
-// Returns error if not in live mode.
-//
-// Example:
-//
-//	// Send an image
-//	stream.SendContent([]types.ContentBlock{
-//	    vai.Image(imageData, "image/png"),
-//	})
-//
-//	// Send text with an image
-//	stream.SendContent([]types.ContentBlock{
-//	    vai.Text("What's in this image?"),
-//	    vai.Image(imageData, "image/jpeg"),
-//	})
-func (rs *RunStream) SendContent(content []types.ContentBlock) error {
-	if !rs.isLive {
-		return fmt.Errorf("SendContent: not in live mode (use WithLive option)")
-	}
-	if rs.liveSession == nil {
-		return fmt.Errorf("SendContent: live session not initialized")
-	}
-	return rs.liveSession.SendContent(content)
-}
-
-// --- Live Mode Implementation ---
-
-// runLive executes the live voice session loop.
-func (rs *RunStream) runLive(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig) {
-	defer rs.closeOnce.Do(func() {
-		close(rs.events)
-		close(rs.done)
-	})
-
-	// Validate we're in direct mode
-	if svc.client.mode != modeDirect {
-		rs.send(LiveErrorEvent{Code: "mode_error", Message: "live sessions only supported in direct mode"})
-		return
-	}
-
-	// Get STT provider
-	sttProvider := svc.client.getSTTProvider()
-	if sttProvider == nil {
-		rs.send(LiveErrorEvent{Code: "stt_error", Message: "STT provider not available - ensure CARTESIA_API_KEY is set"})
-		return
-	}
-
-	// Get TTS provider
-	ttsProvider := svc.client.getTTSProvider()
-	if ttsProvider == nil {
-		rs.send(LiveErrorEvent{Code: "tts_error", Message: "TTS provider not available - ensure CARTESIA_API_KEY is set"})
-		return
-	}
-
-	// Build core live config from MessageRequest and LiveConfig
-	liveConfig := rs.buildLiveConfig(req, cfg)
-
-	// Create adapters
-	llmAdapter := &llmClientAdapter{client: svc.client}
-	ttsAdapter := &ttsClientAdapter{provider: ttsProvider}
-	sttAdapter := &sttClientAdapter{provider: sttProvider}
-
-	// Create core live session
-	coreSession := live.NewSession(liveConfig, llmAdapter, ttsAdapter, sttAdapter)
-	if cfg.liveConfig.Debug {
-		coreSession.EnableDebug()
-	}
-
-	// Create audio output with buffering
-	audioOutputConfig := DefaultAudioOutputConfig()
-	if cfg.liveConfig.AudioOutput != nil {
-		audioOutputConfig = *cfg.liveConfig.AudioOutput
-	}
-	rs.audioOutput = NewAudioOutput(liveConfig.SampleRate, audioOutputConfig)
-
-	// Store live session reference
-	rs.liveSession = coreSession
-
-	// Start the session
-	if err := coreSession.Start(ctx); err != nil {
-		rs.send(LiveErrorEvent{Code: "start_error", Message: err.Error()})
-		return
-	}
-
-	// Start event translation goroutine
-	rs.translateLiveEvents(coreSession)
-}
-
-// buildLiveConfig converts MessageRequest and LiveConfig to core live.SessionConfig.
-func (rs *RunStream) buildLiveConfig(req *MessageRequest, cfg *runConfig) live.SessionConfig {
-	liveConfig := live.SessionConfig{
-		Model:      req.Model,
-		System:     systemToString(req.System),
-		Tools:      req.Tools,
-		Messages:   req.Messages,
-		Voice:      req.Voice,
-		SampleRate: cfg.liveConfig.SampleRate,
-		Channels:   cfg.liveConfig.Channels,
-		MaxTokens:  req.MaxTokens,
-	}
-
-	if req.Temperature != nil {
-		liveConfig.Temperature = req.Temperature
-	}
-
-	// Apply sample rate defaults
-	if liveConfig.SampleRate == 0 {
-		liveConfig.SampleRate = 24000
-	}
-	if liveConfig.Channels == 0 {
-		liveConfig.Channels = 1
-	}
-
-	// Apply VAD config
-	if cfg.liveConfig.VAD != nil {
-		liveConfig.VAD = live.VADConfig{
-			Model:               cfg.liveConfig.VAD.Model,
-			PunctuationTrigger:  cfg.liveConfig.VAD.PunctuationTrigger,
-			NoActivityTimeoutMs: cfg.liveConfig.VAD.NoActivityTimeoutMs,
-			SemanticCheck:       cfg.liveConfig.VAD.SemanticCheck,
-			MinWordsForCheck:    cfg.liveConfig.VAD.MinWordsForCheck,
-			EnergyThreshold:     cfg.liveConfig.VAD.EnergyThreshold,
-		}
-	} else {
-		liveConfig.VAD = live.DefaultVADConfig()
-	}
-
-	// Apply grace period config
-	if cfg.liveConfig.GracePeriod != nil {
-		liveConfig.GracePeriod = live.GracePeriodConfig{
-			Enabled:    cfg.liveConfig.GracePeriod.Enabled,
-			DurationMs: cfg.liveConfig.GracePeriod.DurationMs,
-		}
-	} else {
-		liveConfig.GracePeriod = live.DefaultGracePeriodConfig()
-	}
-
-	// Apply interrupt config
-	if cfg.liveConfig.Interrupt != nil {
-		mode := live.InterruptModeAuto
-		switch cfg.liveConfig.Interrupt.Mode {
-		case "always":
-			mode = live.InterruptModeAlways
-		case "never":
-			mode = live.InterruptModeNever
-		}
-
-		savePartial := live.PartialSaveMarked
-		switch cfg.liveConfig.Interrupt.SavePartial {
-		case "none":
-			savePartial = live.PartialSaveNone
-		case "full":
-			savePartial = live.PartialSaveFull
-		}
-
-		liveConfig.Interrupt = live.InterruptConfig{
-			Mode:              mode,
-			EnergyThreshold:   cfg.liveConfig.Interrupt.EnergyThreshold,
-			CaptureDurationMs: cfg.liveConfig.Interrupt.CaptureDurationMs,
-			SemanticCheck:     cfg.liveConfig.Interrupt.SemanticCheck,
-			SemanticModel:     cfg.liveConfig.Interrupt.SemanticModel,
-			SavePartial:       savePartial,
-		}
-	} else {
-		liveConfig.Interrupt = live.DefaultInterruptConfig()
-	}
-
-	return liveConfig
-}
-
-// translateLiveEvents reads events from the core session and translates them to SDK events.
-func (rs *RunStream) translateLiveEvents(coreSession *live.Session) {
-	coreEvents := coreSession.Events()
-
-	for {
-		select {
-		case <-rs.done:
-			return
-		case event, ok := <-coreEvents:
-			if !ok {
-				return
-			}
-			if sdkEvent := rs.convertLiveEvent(event); sdkEvent != nil {
-				rs.send(sdkEvent)
-			}
-		}
-	}
-}
-
-// convertLiveEvent maps a core live.Event to a RunStreamEvent.
-func (rs *RunStream) convertLiveEvent(event live.Event) RunStreamEvent {
-	switch e := event.(type) {
-	case *live.SessionCreatedEvent:
-		return LiveSessionCreatedEvent{
-			SessionID:  e.SessionID,
-			SampleRate: e.SampleRate,
-			Channels:   e.Channels,
-		}
-	case *live.StateChangedEvent:
-		return LiveStateChangedEvent{
-			From: e.From.String(),
-			To:   e.To.String(),
-		}
-	case *live.TranscriptDeltaEvent:
-		return LiveTranscriptDeltaEvent{
-			Delta:   e.Delta,
-			IsFinal: e.IsFinal,
-		}
-	case *live.VADCommittedEvent:
-		return LiveVADCommittedEvent{
-			Transcript: e.Transcript,
-			Forced:     e.Forced,
-		}
-	case *live.InputCommittedEvent:
-		return LiveInputCommittedEvent{
-			Transcript: e.Transcript,
-		}
-	case *live.DiscreteInputReceivedEvent:
-		return LiveDiscreteInputEvent{
-			Content: e.Content,
-		}
-	case *live.MessageStartEvent:
-		return StepStartEvent{Index: 0}
-	case *live.ContentBlockDeltaEvent:
-		return StreamEventWrapper{Event: types.ContentBlockDeltaEvent{
-			Index: e.Index,
-			Delta: types.TextDelta{Type: "text_delta", Text: e.Delta},
-		}}
-	case *live.MessageStopEvent:
-		return StepCompleteEvent{Index: 0, Response: nil}
-	case *live.AudioDeltaEvent:
-		// Push to AudioOutput for buffered playback
-		if rs.audioOutput != nil {
-			rs.audioOutput.pushAudio(e.Data)
-		}
-		return LiveAudioDeltaEvent{
-			Data:   e.Data,
-			Format: e.Format,
-		}
-	case *live.AudioCommittedEvent:
-		return AudioChunkEvent{Data: nil, Format: "done"}
-	case *live.AudioFlushEvent:
-		// Flush AudioOutput buffer
-		if rs.audioOutput != nil {
-			rs.audioOutput.doFlush()
-		}
-		return LiveAudioFlushEvent{}
-	case *live.GracePeriodStartedEvent:
-		return LiveGracePeriodStartedEvent{
-			Transcript: e.Transcript,
-			DurationMs: e.DurationMs,
-			ExpiresAt:  e.ExpiresAt,
-		}
-	case *live.GracePeriodExtendedEvent:
-		return LiveGracePeriodExtendedEvent{
-			PreviousTranscript: e.PreviousTranscript,
-			NewTranscript:      e.NewTranscript,
-		}
-	case *live.GracePeriodExpiredEvent:
-		return LiveGracePeriodExpiredEvent{
-			Transcript: e.Transcript,
-		}
-	case *live.InterruptDetectingEvent:
-		return LiveInterruptDetectingEvent{}
-	case *live.InterruptCapturedEvent:
-		return InterruptedEvent{PartialText: e.Transcript, Behavior: InterruptSaveMarked}
-	case *live.InterruptDismissedEvent:
-		return LiveInterruptDismissedEvent{
-			Transcript: e.Transcript,
-			Reason:     e.Reason,
-		}
-	case *live.ResponseInterruptedEvent:
-		return LiveResponseInterruptedEvent{
-			PartialText:         e.PartialText,
-			InterruptTranscript: e.InterruptTranscript,
-			AudioPositionMs:     e.AudioPositionMs,
-		}
-	case *live.ErrorEvent:
-		return LiveErrorEvent{
-			Code:    e.Code,
-			Message: e.Message,
-		}
-	case *live.SessionClosedEvent:
-		return LiveClosedEvent{
-			Reason: e.Reason,
-		}
-	case *live.DebugEvent:
-		return LiveDebugEvent{
-			Category: e.Category,
-			Message:  e.Message,
-		}
-	default:
-		return nil
-	}
 }

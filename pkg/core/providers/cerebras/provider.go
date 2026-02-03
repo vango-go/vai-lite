@@ -7,8 +7,8 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/vango-go/vai/pkg/core/providers/openai"
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/providers/openai"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 const (

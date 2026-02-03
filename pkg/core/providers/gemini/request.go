@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // geminiRequest is the Gemini API request format.
@@ -27,12 +27,12 @@ type geminiContent struct {
 // geminiPart represents a single part within content.
 // Note: Gemini API uses camelCase for JSON field names.
 type geminiPart struct {
-	Text             string                   `json:"text,omitempty"`
-	InlineData       *geminiBlob              `json:"inlineData,omitempty"`
-	FileData         *geminiFileData          `json:"fileData,omitempty"`
-	FunctionCall     *geminiFunctionCall      `json:"functionCall,omitempty"`
-	FunctionResponse *geminiFunctionResponse  `json:"functionResponse,omitempty"`
-	ThoughtSignature string                   `json:"thoughtSignature,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	InlineData       *geminiBlob             `json:"inlineData,omitempty"`
+	FileData         *geminiFileData         `json:"fileData,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
 }
 
 // geminiBlob represents inline binary data.
@@ -107,8 +107,8 @@ type geminiGenConfig struct {
 
 // geminiThinkingConfig controls thinking/reasoning behavior.
 type geminiThinkingConfig struct {
-	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`  // For Gemini 2.5
-	ThinkingLevel   string `json:"thinkingLevel,omitempty"`   // For Gemini 3: "low" or "high"
+	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"` // For Gemini 2.5
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`  // For Gemini 3: "low" or "high"
 	IncludeThoughts bool   `json:"includeThoughts,omitempty"`
 }
 

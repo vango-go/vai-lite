@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // eventStream implements EventStream for Gemini SSE responses.
@@ -24,13 +24,13 @@ type eventStream struct {
 
 // streamAccumulator accumulates streamed data.
 type streamAccumulator struct {
-	textIndex       int
-	textStarted     bool
-	textContent     strings.Builder
-	toolCalls       map[int]*toolCallAccumulator
-	finishReason    string
-	inputTokens     int
-	outputTokens    int
+	textIndex    int
+	textStarted  bool
+	textContent  strings.Builder
+	toolCalls    map[int]*toolCallAccumulator
+	finishReason string
+	inputTokens  int
+	outputTokens int
 }
 
 // toolCallAccumulator accumulates a single tool call.

@@ -6,7 +6,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 const (
@@ -66,8 +66,8 @@ func (p *Provider) Name() string {
 func (p *Provider) Capabilities() ProviderCapabilities {
 	return ProviderCapabilities{
 		Vision:           true,
-		AudioInput:       true,  // GPT-4o supports audio
-		AudioOutput:      true,  // GPT-4o supports audio
+		AudioInput:       true, // GPT-4o supports audio
+		AudioOutput:      true, // GPT-4o supports audio
 		Video:            false,
 		Tools:            true,
 		ToolStreaming:    true,

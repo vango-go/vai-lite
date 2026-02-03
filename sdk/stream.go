@@ -3,8 +3,8 @@ package vai
 import (
 	"sync/atomic"
 
-	"github.com/vango-go/vai/pkg/core"
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // Stream wraps a streaming response from the Messages API.

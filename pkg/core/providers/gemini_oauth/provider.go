@@ -9,8 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core"
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 var debugRequests = os.Getenv("DEBUG_GEMINI_OAUTH") != ""
@@ -161,12 +161,12 @@ type geminiContent struct {
 
 // geminiPart represents a single part within content.
 type geminiPart struct {
-	Text             string                   `json:"text,omitempty"`
-	InlineData       *geminiBlob              `json:"inlineData,omitempty"`
-	FileData         *geminiFileData          `json:"fileData,omitempty"`
-	FunctionCall     *geminiFunctionCall      `json:"functionCall,omitempty"`
-	FunctionResponse *geminiFunctionResponse  `json:"functionResponse,omitempty"`
-	ThoughtSignature string                   `json:"thoughtSignature,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	InlineData       *geminiBlob             `json:"inlineData,omitempty"`
+	FileData         *geminiFileData         `json:"fileData,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
 }
 
 // geminiBlob represents inline binary data.
@@ -260,9 +260,9 @@ type geminiResponse struct {
 
 // geminiCandidate represents a single candidate response.
 type geminiCandidate struct {
-	Content       geminiContent `json:"content"`
-	FinishReason  string        `json:"finishReason"`
-	Index         int           `json:"index"`
+	Content       geminiContent  `json:"content"`
+	FinishReason  string         `json:"finishReason"`
+	Index         int            `json:"index"`
 	SafetyRatings []safetyRating `json:"safetyRatings,omitempty"`
 }
 

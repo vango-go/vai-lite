@@ -1,7 +1,7 @@
 package vai
 
 import (
-	"github.com/vango-go/vai/pkg/core"
+	"github.com/vango-go/vai-lite/pkg/core"
 )
 
 // SDK-level error type that wraps core errors

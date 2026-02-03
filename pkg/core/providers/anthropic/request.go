@@ -4,25 +4,25 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // anthropicRequest is the Anthropic API request format.
 // Since Vango AI API is based on Anthropic, this is nearly identical.
 type anthropicRequest struct {
-	Model         string                  `json:"model"`
-	Messages      []messageJSON           `json:"messages"`
-	MaxTokens     int                     `json:"max_tokens"`
-	System        any                     `json:"system,omitempty"`
-	Temperature   *float64                `json:"temperature,omitempty"`
-	TopP          *float64                `json:"top_p,omitempty"`
-	TopK          *int                    `json:"top_k,omitempty"`
-	StopSequences []string                `json:"stop_sequences,omitempty"`
-	Tools         []anthropicTool         `json:"tools,omitempty"`
-	ToolChoice    *types.ToolChoice       `json:"tool_choice,omitempty"`
-	Stream        bool                    `json:"stream,omitempty"`
-	Metadata      map[string]any          `json:"metadata,omitempty"`
-	OutputFormat  *anthropicOutputFormat  `json:"output_format,omitempty"`
+	Model         string                 `json:"model"`
+	Messages      []messageJSON          `json:"messages"`
+	MaxTokens     int                    `json:"max_tokens"`
+	System        any                    `json:"system,omitempty"`
+	Temperature   *float64               `json:"temperature,omitempty"`
+	TopP          *float64               `json:"top_p,omitempty"`
+	TopK          *int                   `json:"top_k,omitempty"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	Tools         []anthropicTool        `json:"tools,omitempty"`
+	ToolChoice    *types.ToolChoice      `json:"tool_choice,omitempty"`
+	Stream        bool                   `json:"stream,omitempty"`
+	Metadata      map[string]any         `json:"metadata,omitempty"`
+	OutputFormat  *anthropicOutputFormat `json:"output_format,omitempty"`
 }
 
 // anthropicOutputFormat represents structured output configuration.
@@ -46,10 +46,10 @@ type anthropicTool struct {
 	CacheControl *cacheControl     `json:"cache_control,omitempty"`
 
 	// Web search specific fields
-	MaxUses        int                   `json:"max_uses,omitempty"`
-	AllowedDomains []string              `json:"allowed_domains,omitempty"`
-	BlockedDomains []string              `json:"blocked_domains,omitempty"`
-	UserLocation   *types.UserLocation   `json:"user_location,omitempty"`
+	MaxUses        int                 `json:"max_uses,omitempty"`
+	AllowedDomains []string            `json:"allowed_domains,omitempty"`
+	BlockedDomains []string            `json:"blocked_domains,omitempty"`
+	UserLocation   *types.UserLocation `json:"user_location,omitempty"`
 
 	// Computer use specific fields
 	DisplayWidthPx  int `json:"display_width_px,omitempty"`

@@ -7,8 +7,8 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/vango-go/vai/pkg/core/providers/openai"
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/providers/openai"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 const (
@@ -71,7 +71,7 @@ func (p *Provider) Name() string {
 // Capabilities returns what this provider supports.
 func (p *Provider) Capabilities() ProviderCapabilities {
 	return ProviderCapabilities{
-		Vision:           true,  // Some Groq models support vision (llama-3.2-90b-vision)
+		Vision:           true, // Some Groq models support vision (llama-3.2-90b-vision)
 		AudioInput:       false,
 		AudioOutput:      false,
 		Video:            false,

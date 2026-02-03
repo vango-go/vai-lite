@@ -3,7 +3,7 @@ package vai
 import (
 	"testing"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 func TestGenerateSchema_BasicTypes(t *testing.T) {

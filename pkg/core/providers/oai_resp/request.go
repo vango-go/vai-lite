@@ -6,7 +6,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // buildRequest converts a Vango request to an OpenAI Responses API request.

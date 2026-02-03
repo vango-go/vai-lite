@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	vai "github.com/vango-go/vai/sdk"
+	vai "github.com/vango-go/vai-lite/sdk"
 )
 
 // Integration tests that hit the real Anthropic API.

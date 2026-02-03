@@ -75,48 +75,6 @@ func TestMessageRequest_WithTools(t *testing.T) {
 	}
 }
 
-func TestMessageRequest_WithVoice(t *testing.T) {
-	req := &MessageRequest{
-		Model: "anthropic/claude-sonnet-4",
-		Messages: []Message{
-			{Role: "user", Content: "Hello!"},
-		},
-		Voice: &VoiceConfig{
-			Input: &VoiceInputConfig{
-				Model:    "ink-whisper",
-				Language: "en",
-			},
-			Output: &VoiceOutputConfig{
-				Voice:  "a0e99841-438c-4a64-b679-ae501e7d6091",
-				Speed:  1.0,
-				Format: VoiceFormatMP3,
-			},
-		},
-	}
-
-	data, err := json.Marshal(req)
-	if err != nil {
-		t.Fatalf("Failed to marshal: %v", err)
-	}
-
-	var unmarshaled MessageRequest
-	if err := json.Unmarshal(data, &unmarshaled); err != nil {
-		t.Fatalf("Failed to unmarshal: %v", err)
-	}
-
-	if unmarshaled.Voice == nil {
-		t.Fatal("Voice config is nil")
-	}
-	if unmarshaled.Voice.Input.Model != "ink-whisper" {
-		t.Errorf("Voice input model mismatch: got %q, want %q",
-			unmarshaled.Voice.Input.Model, "ink-whisper")
-	}
-	if unmarshaled.Voice.Output.Voice != "a0e99841-438c-4a64-b679-ae501e7d6091" {
-		t.Errorf("Voice output voice mismatch: got %q, want %q",
-			unmarshaled.Voice.Output.Voice, "a0e99841-438c-4a64-b679-ae501e7d6091")
-	}
-}
-
 func TestMessageRequest_WithOutputFormat(t *testing.T) {
 	req := &MessageRequest{
 		Model: "openai/gpt-4o",

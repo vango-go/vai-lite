@@ -9,10 +9,10 @@ import "encoding/json"
 // responsesRequest is the OpenAI Responses API request format.
 type responsesRequest struct {
 	Model              string           `json:"model"`
-	Input              any              `json:"input"`                         // string | []inputItem
-	Instructions       string           `json:"instructions,omitempty"`        // system prompt
+	Input              any              `json:"input"`                  // string | []inputItem
+	Instructions       string           `json:"instructions,omitempty"` // system prompt
 	Tools              []responsesTool  `json:"tools,omitempty"`
-	ToolChoice         any              `json:"tool_choice,omitempty"`         // "auto" | "none" | "required" | specific
+	ToolChoice         any              `json:"tool_choice,omitempty"` // "auto" | "none" | "required" | specific
 	ParallelToolCalls  *bool            `json:"parallel_tool_calls,omitempty"`
 	MaxOutputTokens    *int             `json:"max_output_tokens,omitempty"`
 	Temperature        *float64         `json:"temperature,omitempty"`
@@ -107,10 +107,10 @@ type textConfig struct {
 
 // formatConfig specifies output format.
 type formatConfig struct {
-	Type       string          `json:"type"`                  // "json_schema", "json_object", "text"
-	Name       string          `json:"name,omitempty"`        // for json_schema
-	Schema     json.RawMessage `json:"schema,omitempty"`      // for json_schema
-	Strict     *bool           `json:"strict,omitempty"`      // for json_schema
+	Type   string          `json:"type"`             // "json_schema", "json_object", "text"
+	Name   string          `json:"name,omitempty"`   // for json_schema
+	Schema json.RawMessage `json:"schema,omitempty"` // for json_schema
+	Strict *bool           `json:"strict,omitempty"` // for json_schema
 }
 
 // --- Response Types ---
@@ -128,9 +128,9 @@ type incompleteDetails struct {
 
 // responsesResponse is the OpenAI Responses API response format.
 type responsesResponse struct {
-	ID                 string             `json:"id"`      // "resp_xxx"
-	Object             string             `json:"object"`  // "response"
-	Status             string             `json:"status"`  // "completed", "in_progress", "failed", "incomplete"
+	ID                 string             `json:"id"`     // "resp_xxx"
+	Object             string             `json:"object"` // "response"
+	Status             string             `json:"status"` // "completed", "in_progress", "failed", "incomplete"
 	IncompleteDetails  *incompleteDetails `json:"incomplete_details,omitempty"`
 	Model              string             `json:"model"`
 	Output             []outputItem       `json:"output"`
@@ -157,21 +157,86 @@ type outputItem struct {
 	Arguments string `json:"arguments,omitempty"`
 
 	// For "web_search_call" type
-	Query   string             `json:"query,omitempty"`
-	Results []webSearchResult  `json:"results,omitempty"`
+	Query   string            `json:"query,omitempty"`
+	Results []webSearchResult `json:"-"`
 
 	// For "code_interpreter_call" type
 	Code       string                  `json:"code,omitempty"`
 	CodeOutput []codeInterpreterOutput `json:"output,omitempty"`
 
 	// For "file_search_call" type
-	FileSearchResults []fileSearchResult `json:"results,omitempty"`
+	FileSearchResults []fileSearchResult `json:"-"`
 
 	// For "image_generation_call" type
 	ImageResult *imageGenResult `json:"result,omitempty"`
 
 	// For "reasoning" type
 	Summary []reasoningSummaryItem `json:"summary,omitempty"`
+}
+
+func (o *outputItem) UnmarshalJSON(data []byte) error {
+	type rawOutputItem struct {
+		Type   string `json:"type"`
+		ID     string `json:"id,omitempty"`
+		Status string `json:"status,omitempty"`
+
+		Role    string          `json:"role,omitempty"`
+		Content []outputContent `json:"content,omitempty"`
+
+		CallID    string `json:"call_id,omitempty"`
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+
+		Query   string          `json:"query,omitempty"`
+		Results json.RawMessage `json:"results,omitempty"`
+
+		Code       string                  `json:"code,omitempty"`
+		CodeOutput []codeInterpreterOutput `json:"output,omitempty"`
+
+		ImageResult *imageGenResult `json:"result,omitempty"`
+
+		Summary []reasoningSummaryItem `json:"summary,omitempty"`
+	}
+
+	var raw rawOutputItem
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	o.Type = raw.Type
+	o.ID = raw.ID
+	o.Status = raw.Status
+	o.Role = raw.Role
+	o.Content = raw.Content
+	o.CallID = raw.CallID
+	o.Name = raw.Name
+	o.Arguments = raw.Arguments
+	o.Query = raw.Query
+	o.Code = raw.Code
+	o.CodeOutput = raw.CodeOutput
+	o.ImageResult = raw.ImageResult
+	o.Summary = raw.Summary
+
+	switch o.Type {
+	case "web_search_call":
+		if len(raw.Results) > 0 && string(raw.Results) != "null" {
+			var results []webSearchResult
+			if err := json.Unmarshal(raw.Results, &results); err != nil {
+				return err
+			}
+			o.Results = results
+		}
+	case "file_search_call":
+		if len(raw.Results) > 0 && string(raw.Results) != "null" {
+			var results []fileSearchResult
+			if err := json.Unmarshal(raw.Results, &results); err != nil {
+				return err
+			}
+			o.FileSearchResults = results
+		}
+	}
+
+	return nil
 }
 
 // outputContent represents content within a message output.
@@ -221,10 +286,10 @@ type imageGenResult struct {
 
 // responsesUsage contains token usage information.
 type responsesUsage struct {
-	InputTokens        int                   `json:"input_tokens"`
-	OutputTokens       int                   `json:"output_tokens"`
-	TotalTokens        int                   `json:"total_tokens"`
-	InputTokensDetails *inputTokensDetails   `json:"input_tokens_details,omitempty"`
+	InputTokens         int                  `json:"input_tokens"`
+	OutputTokens        int                  `json:"output_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	InputTokensDetails  *inputTokensDetails  `json:"input_tokens_details,omitempty"`
 	OutputTokensDetails *outputTokensDetails `json:"output_tokens_details,omitempty"`
 }
 
@@ -259,23 +324,23 @@ type streamEvent struct {
 
 // Stream event types
 const (
-	eventResponseCreated              = "response.created"
-	eventResponseInProgress           = "response.in_progress"
-	eventResponseCompleted            = "response.completed"
-	eventResponseFailed               = "response.failed"
-	eventResponseIncomplete           = "response.incomplete"
-	eventOutputItemAdded              = "response.output_item.added"
-	eventOutputItemDone               = "response.output_item.done"
-	eventContentPartAdded             = "response.content_part.added"
-	eventContentPartDone              = "response.content_part.done"
-	eventOutputTextDelta              = "response.output_text.delta"
-	eventOutputTextDone               = "response.output_text.done"
-	eventFunctionCallArgumentsDelta   = "response.function_call_arguments.delta"
-	eventFunctionCallArgumentsDone    = "response.function_call_arguments.done"
-	eventFileSearchCallSearching      = "response.file_search_call.searching"
-	eventFileSearchCallCompleted      = "response.file_search_call.completed"
-	eventWebSearchCallSearching       = "response.web_search_call.searching"
-	eventWebSearchCallCompleted       = "response.web_search_call.completed"
+	eventResponseCreated               = "response.created"
+	eventResponseInProgress            = "response.in_progress"
+	eventResponseCompleted             = "response.completed"
+	eventResponseFailed                = "response.failed"
+	eventResponseIncomplete            = "response.incomplete"
+	eventOutputItemAdded               = "response.output_item.added"
+	eventOutputItemDone                = "response.output_item.done"
+	eventContentPartAdded              = "response.content_part.added"
+	eventContentPartDone               = "response.content_part.done"
+	eventOutputTextDelta               = "response.output_text.delta"
+	eventOutputTextDone                = "response.output_text.done"
+	eventFunctionCallArgumentsDelta    = "response.function_call_arguments.delta"
+	eventFunctionCallArgumentsDone     = "response.function_call_arguments.done"
+	eventFileSearchCallSearching       = "response.file_search_call.searching"
+	eventFileSearchCallCompleted       = "response.file_search_call.completed"
+	eventWebSearchCallSearching        = "response.web_search_call.searching"
+	eventWebSearchCallCompleted        = "response.web_search_call.completed"
 	eventCodeInterpreterCallInProgress = "response.code_interpreter_call.in_progress"
-	eventCodeInterpreterCallCompleted = "response.code_interpreter_call.completed"
+	eventCodeInterpreterCallCompleted  = "response.code_interpreter_call.completed"
 )

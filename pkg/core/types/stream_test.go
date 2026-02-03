@@ -17,8 +17,6 @@ func TestStreamEvent_Types(t *testing.T) {
 		{MessageDeltaEvent{Type: "message_delta"}, "message_delta"},
 		{MessageStopEvent{Type: "message_stop"}, "message_stop"},
 		{PingEvent{Type: "ping"}, "ping"},
-		{AudioDeltaEvent{Type: "audio_delta"}, "audio_delta"},
-		{TranscriptDeltaEvent{Type: "transcript_delta"}, "transcript_delta"},
 		{ErrorEvent{Type: "error"}, "error"},
 	}
 

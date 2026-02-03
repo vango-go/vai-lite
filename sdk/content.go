@@ -3,7 +3,7 @@ package vai
 import (
 	"encoding/base64"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // ContentBlock is an alias for the core types.ContentBlock interface.
@@ -33,18 +33,6 @@ func ImageURL(url string) types.ContentBlock {
 		Source: types.ImageSource{
 			Type: "url",
 			URL:  url,
-		},
-	}
-}
-
-// Audio creates an audio content block.
-func Audio(data []byte, mediaType string) types.ContentBlock {
-	return types.AudioBlock{
-		Type: "audio",
-		Source: types.AudioSource{
-			Type:      "base64",
-			MediaType: mediaType,
-			Data:      base64.StdEncoding.EncodeToString(data),
 		},
 	}
 }

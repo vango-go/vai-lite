@@ -3,7 +3,7 @@ package types
 // MessageRequest is the primary request structure for the Messages API.
 // Based on Anthropic Messages API with extensions for multi-provider support.
 type MessageRequest struct {
-	Model    string    `json:"model"`    // "provider/model-name"
+	Model    string    `json:"model"` // "provider/model-name"
 	Messages []Message `json:"messages"`
 
 	// Generation parameters
@@ -25,9 +25,6 @@ type MessageRequest struct {
 	OutputFormat *OutputFormat `json:"output_format,omitempty"`
 	Output       *OutputConfig `json:"output,omitempty"`
 
-	// Voice pipeline
-	Voice *VoiceConfig `json:"voice,omitempty"`
-
 	// Provider-specific extensions
 	Extensions map[string]any `json:"extensions,omitempty"`
 
@@ -37,7 +34,7 @@ type MessageRequest struct {
 
 // OutputFormat specifies structured output requirements.
 type OutputFormat struct {
-	Type       string      `json:"type"`                  // "json_schema"
+	Type       string      `json:"type"` // "json_schema"
 	JSONSchema *JSONSchema `json:"json_schema,omitempty"`
 }
 

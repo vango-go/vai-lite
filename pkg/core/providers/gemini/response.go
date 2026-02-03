@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // geminiResponse is the Gemini API response format.
@@ -33,9 +33,9 @@ type geminiUsage struct {
 
 // groundingMetadata contains grounding/search results.
 type groundingMetadata struct {
-	WebSearchQueries  []string          `json:"webSearchQueries,omitempty"`
-	SearchEntryPoint  *searchEntryPoint `json:"searchEntryPoint,omitempty"`
-	GroundingChunks   []groundingChunk  `json:"groundingChunks,omitempty"`
+	WebSearchQueries  []string           `json:"webSearchQueries,omitempty"`
+	SearchEntryPoint  *searchEntryPoint  `json:"searchEntryPoint,omitempty"`
+	GroundingChunks   []groundingChunk   `json:"groundingChunks,omitempty"`
 	GroundingSupports []groundingSupport `json:"groundingSupports,omitempty"`
 }
 
@@ -58,9 +58,9 @@ type webChunk struct {
 
 // groundingSupport links text to sources.
 type groundingSupport struct {
-	Segment              *textSegment `json:"segment,omitempty"`
-	GroundingChunkIndices []int       `json:"groundingChunkIndices,omitempty"`
-	ConfidenceScores     []float64   `json:"confidenceScores,omitempty"`
+	Segment               *textSegment `json:"segment,omitempty"`
+	GroundingChunkIndices []int        `json:"groundingChunkIndices,omitempty"`
+	ConfidenceScores      []float64    `json:"confidenceScores,omitempty"`
 }
 
 // textSegment represents a text segment.

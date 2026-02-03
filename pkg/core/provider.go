@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	"github.com/vango-go/vai/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // Provider is the interface that all LLM providers must implement.

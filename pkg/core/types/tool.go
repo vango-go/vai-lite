@@ -27,9 +27,9 @@ const (
 
 // WebSearchConfig configures the web search tool.
 type WebSearchConfig struct {
-	MaxUses        int      `json:"max_uses,omitempty"`        // Limit searches per request
-	AllowedDomains []string `json:"allowed_domains,omitempty"` // Restrict to these domains
-	BlockedDomains []string `json:"blocked_domains,omitempty"` // Exclude these domains
+	MaxUses        int           `json:"max_uses,omitempty"`        // Limit searches per request
+	AllowedDomains []string      `json:"allowed_domains,omitempty"` // Restrict to these domains
+	BlockedDomains []string      `json:"blocked_domains,omitempty"` // Exclude these domains
 	UserLocation   *UserLocation `json:"user_location,omitempty"`   // Localize results
 }
 
