@@ -55,12 +55,17 @@ func main() {
 `RunStream` emits `HistoryDeltaEvent` events that describe exactly which messages to append to a caller-owned history slice:
 
 ```go
+ctx := context.Background()
 history := []vai.Message{{Role: "user", Content: vai.Text("Hello!")}}
 
-stream, _ := client.Messages.RunStream(ctx, &vai.MessageRequest{
+stream, err := client.Messages.RunStream(ctx, &vai.MessageRequest{
 	Model:    "anthropic/claude-sonnet-4",
 	Messages: history,
 })
+if err != nil {
+	panic(err)
+}
+defer stream.Close()
 
 apply := vai.DefaultHistoryHandler(&history)
 for ev := range stream.Events() {
@@ -68,9 +73,16 @@ for ev := range stream.Events() {
 }
 ```
 
+If you want mismatch detection (e.g. to catch accidental history divergence), use `DefaultHistoryHandlerStrict`.
+
 For advanced context management (pinned memory, trimming, reordering), build per-turn messages at turn boundaries:
 
 ```go
+req := &vai.MessageRequest{
+	Model:    "anthropic/claude-sonnet-4",
+	Messages: history,
+}
+
 stream, _ := client.Messages.RunStream(ctx, req,
 	vai.WithBuildTurnMessages(func(info vai.TurnInfo) []vai.Message {
 		// info.History is an append-only history snapshot for this turn boundary.
@@ -92,9 +104,9 @@ tool := vai.MakeTool("get_weather", "Get current weather for a location.",
 	},
 )
 
+// WithTools(tool) registers the handler and attaches the tool definition for this run.
 result, err := client.Messages.Run(ctx, &vai.MessageRequest{
 	Model: "openai/gpt-4o",
 	Messages: []vai.Message{{Role: "user", Content: vai.Text("What's the weather in Austin?")}},
-	Tools: []vai.Tool{tool.Tool},
 }, vai.WithTools(tool))
 ```

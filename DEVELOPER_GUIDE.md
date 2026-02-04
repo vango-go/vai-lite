@@ -222,8 +222,24 @@ Tools live on `MessageRequest.Tools`:
 req.Tools = []vai.Tool{
 	vai.WebSearch(),
 	vai.CodeExecution(),
-	tool.Tool, // function tool created via MakeTool
 }
+```
+
+For function tools created via `MakeTool(...)`, the recommended pattern is to enable them via `WithTools(tool)`, which:
+
+- registers the handler, and
+- automatically attaches the tool definition for that run/stream.
+
+```go
+tool := vai.MakeTool("get_weather", "Get weather for a location", func(ctx context.Context, in struct {
+	Location string `json:"location"`
+}) (string, error) {
+	return "72F and sunny in " + in.Location, nil
+})
+
+result, err := client.Messages.Run(ctx, req, vai.WithTools(tool))
+_ = result
+_ = err
 ```
 
 Tool selection policy:
@@ -268,23 +284,22 @@ Important:
 ```go
 client := vai.NewClient()
 
-tool := vai.MakeTool("increment", "Increment a counter",
-	func(ctx context.Context, in struct{}) (string, error) {
-		return "ok", nil
-	},
-)
+	tool := vai.MakeTool("increment", "Increment a counter",
+		func(ctx context.Context, in struct{}) (string, error) {
+			return "ok", nil
+		},
+	)
 
-result, err := client.Messages.Run(ctx, &vai.MessageRequest{
-	Model: "anthropic/claude-sonnet-4",
-	Messages: []vai.Message{
-		{Role: "user", Content: vai.Text("Call increment once and then summarize.")},
-	},
-	Tools: []vai.Tool{tool.Tool},
-}, vai.WithTools(tool), vai.WithMaxToolCalls(5))
-if err != nil {
-	// err can be provider errors, context cancellation, etc.
-	panic(err)
-}
+	result, err := client.Messages.Run(ctx, &vai.MessageRequest{
+		Model: "anthropic/claude-sonnet-4",
+		Messages: []vai.Message{
+			{Role: "user", Content: vai.Text("Call increment once and then summarize.")},
+		},
+	}, vai.WithTools(tool), vai.WithMaxToolCalls(5))
+	if err != nil {
+		// err can be provider errors, context cancellation, etc.
+		panic(err)
+	}
 
 fmt.Println(result.Response.TextContent())
 fmt.Println("Tool calls:", result.ToolCallCount)
@@ -447,8 +462,9 @@ Function tools are executed by **your process** during the tool loop.
 
 `MakeTool` gives you:
 
-- a `Tool` definition (`tool.Tool`) to attach to the request
-- a handler embedded in the returned value, which you register via `WithTools(tool)`
+- a `ToolWithHandler` value containing both:
+  - a `Tool` definition (`tool.Tool`)
+  - a handler embedded in the returned value
 - automatic JSON schema generation from the input struct type
 
 Example:
@@ -458,21 +474,21 @@ type SearchInput struct {
 	Query string `json:"query" desc:"Search query"`
 }
 
-search := vai.MakeTool("search_internal", "Search an internal index.",
-	func(ctx context.Context, in SearchInput) (string, error) {
-		return "results for: " + in.Query, nil
-	},
-)
+	search := vai.MakeTool("search_internal", "Search an internal index.",
+		func(ctx context.Context, in SearchInput) (string, error) {
+			return "results for: " + in.Query, nil
+		},
+	)
 
-req := &vai.MessageRequest{
-	Model: "anthropic/claude-sonnet-4",
-	Messages: []vai.Message{
-		{Role: "user", Content: vai.Text("Search internal for 'incident 123'")},
-	},
-	Tools: []vai.Tool{search.Tool},
-}
+	req := &vai.MessageRequest{
+		Model: "anthropic/claude-sonnet-4",
+		Messages: []vai.Message{
+			{Role: "user", Content: vai.Text("Search internal for 'incident 123'")},
+		},
+	}
 
-result, err := client.Messages.Run(ctx, req, vai.WithTools(search))
+	// WithTools registers the handler and attaches the tool definition for this run.
+	result, err := client.Messages.Run(ctx, req, vai.WithTools(search))
 ```
 
 ### 7.2 `FuncAsTool` (returns tool + handler)
@@ -510,8 +526,6 @@ echoTool, echoHandler := vai.FuncAsTool("echo", "Echo input.",
 	},
 )
 ts.Add(echoTool, echoHandler)
-
-req.Tools = ts.Tools()
 
 stream, err := client.Messages.RunStream(ctx, req,
 	vai.WithToolSet(ts),
@@ -685,14 +699,16 @@ gofmt -w $(find pkg sdk -name '*.go')
 - detects tool calls early
 - supports interruption while a turn is in progress
 
-### 12.2 Tool handler registration is separate from tool definitions
+### 12.2 Tool definitions vs handler registration
 
-Attaching a function tool to `req.Tools` is not enough. You must also register its handler:
+If you manually attach a function tool definition to `req.Tools`, you must also register its handler:
 
 - `WithTools(tool)` for `MakeTool(...)`
 - or `WithToolHandler(name, handler)` / `WithToolSet(...)`
 
 If you don’t, the model will call the tool and receive the “no handler registered” result.
+
+Recommended: prefer `WithTools(...)` / `WithToolSet(...)` for function tools, since they both register handlers and attach tool definitions for the run/stream.
 
 ### 12.3 Structured output requires you to parse
 

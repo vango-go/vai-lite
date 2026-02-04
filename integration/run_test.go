@@ -27,16 +27,15 @@ func TestMessages_Run_BasicToolExecution(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("What's the weather in San Francisco?")},
+			result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("What's the weather in San Francisco?")},
+				},
+				MaxTokens: 8000,
 			},
-			Tools:     []vai.Tool{weatherTool.Tool},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(weatherTool),
-			vai.WithMaxToolCalls(1),
+				vai.WithTools(weatherTool),
+				vai.WithMaxToolCalls(1),
 		)
 
 		if err != nil {
@@ -81,16 +80,15 @@ func TestMessages_Run_MultipleToolCalls(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("What's the weather in New York, Los Angeles, and Chicago?")},
+			result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("What's the weather in New York, Los Angeles, and Chicago?")},
+				},
+				MaxTokens: 8000,
 			},
-			Tools:     []vai.Tool{weatherTool.Tool},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(weatherTool),
-			vai.WithMaxToolCalls(5),
+				vai.WithTools(weatherTool),
+				vai.WithMaxToolCalls(5),
 		)
 
 		if err != nil {
@@ -126,16 +124,15 @@ func TestMessages_Run_MaxToolCallsLimit(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Keep calling do_something 10 times.")},
+			result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Keep calling do_something 10 times.")},
+				},
+				ToolChoice: vai.ToolChoiceTool("do_something"),
+				MaxTokens:  8000,
 			},
-			Tools:      []vai.Tool{infiniteTool.Tool},
-			ToolChoice: vai.ToolChoiceTool("do_something"),
-			MaxTokens:  8000,
-		},
-			vai.WithTools(infiniteTool),
+				vai.WithTools(infiniteTool),
 			vai.WithMaxToolCalls(3),
 		)
 
@@ -171,17 +168,16 @@ func TestMessages_Run_MaxTurnsLimit(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Think about many things, calling the think tool each time.")},
+			result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Think about many things, calling the think tool each time.")},
+				},
+				ToolChoice: vai.ToolChoiceAny(),
+				MaxTokens:  8000,
 			},
-			Tools:      []vai.Tool{tool.Tool},
-			ToolChoice: vai.ToolChoiceAny(),
-			MaxTokens:  8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxTurns(2),
+				vai.WithTools(tool),
+				vai.WithMaxTurns(2),
 			vai.WithMaxToolCalls(10),
 		)
 
@@ -267,16 +263,15 @@ func TestMessages_Run_Hooks(t *testing.T) {
 			},
 		)
 
-		_, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Greet Alice using the greet tool")},
+			_, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Greet Alice using the greet tool")},
+				},
+				MaxTokens: 8000,
 			},
-			Tools:     []vai.Tool{tool.Tool},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(1),
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(1),
 			vai.WithBeforeCall(func(req *vai.MessageRequest) {
 				mu.Lock()
 				beforeCallCount++
@@ -324,16 +319,15 @@ func TestMessages_Run_UsageAggregation(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Calculate 1+1 and 2+2 using the calc tool")},
+			result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Calculate 1+1 and 2+2 using the calc tool")},
+				},
+				MaxTokens: 8000,
 			},
-			Tools:     []vai.Tool{tool.Tool},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(3),
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(3),
 		)
 
 		if err != nil {
@@ -410,16 +404,15 @@ func TestMessages_Run_Steps(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Add 2 and 3 using the add tool")},
+			result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Add 2 and 3 using the add tool")},
+				},
+				MaxTokens: 8000,
 			},
-			Tools:     []vai.Tool{tool.Tool},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(2),
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(2),
 		)
 
 		if err != nil {
@@ -464,16 +457,15 @@ func TestMessages_RunStream_Basic(t *testing.T) {
 			},
 		)
 
-		stream, err := testClient.Messages.RunStream(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("What's the weather in Paris?")},
+			stream, err := testClient.Messages.RunStream(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("What's the weather in Paris?")},
+				},
+				MaxTokens: 8000,
 			},
-			Tools:     []vai.Tool{tool.Tool},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(2),
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(2),
 		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -532,16 +524,15 @@ func TestMessages_RunStream_ToolEvents(t *testing.T) {
 			},
 		)
 
-		stream, err := testClient.Messages.RunStream(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Multiply 6 by 7 using the multiply tool")},
+			stream, err := testClient.Messages.RunStream(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Multiply 6 by 7 using the multiply tool")},
+				},
+				MaxTokens: 8000,
 			},
-			Tools:     []vai.Tool{tool.Tool},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(2),
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(2),
 		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -743,17 +734,16 @@ func TestMessages_RunStream_MaxToolCalls(t *testing.T) {
 			},
 		)
 
-		stream, err := testClient.Messages.RunStream(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Keep calling ping 10 times.")},
+			stream, err := testClient.Messages.RunStream(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Keep calling ping 10 times.")},
+				},
+				ToolChoice: vai.ToolChoiceTool("ping"),
+				MaxTokens:  8000,
 			},
-			Tools:      []vai.Tool{tool.Tool},
-			ToolChoice: vai.ToolChoiceTool("ping"),
-			MaxTokens:  8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(3),
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(3),
 		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)

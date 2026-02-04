@@ -106,6 +106,12 @@ func TestWithToolSet(t *testing.T) {
 	if _, ok := cfg.toolHandlers["search"]; !ok {
 		t.Error("tool handler from ToolSet should be registered")
 	}
+	if len(cfg.extraTools) != 1 {
+		t.Fatalf("len(extraTools) = %d, want 1", len(cfg.extraTools))
+	}
+	if cfg.extraTools[0].Name != "search" {
+		t.Fatalf("extraTools[0].Name = %q, want %q", cfg.extraTools[0].Name, "search")
+	}
 }
 
 func TestWithTools_MakeTool(t *testing.T) {
@@ -122,6 +128,12 @@ func TestWithTools_MakeTool(t *testing.T) {
 
 	if _, ok := cfg.toolHandlers["search"]; !ok {
 		t.Error("tool handler from MakeTool should be registered via WithTools")
+	}
+	if len(cfg.extraTools) != 1 {
+		t.Fatalf("len(extraTools) = %d, want 1", len(cfg.extraTools))
+	}
+	if cfg.extraTools[0].Name != "search" {
+		t.Fatalf("extraTools[0].Name = %q, want %q", cfg.extraTools[0].Name, "search")
 	}
 
 	// Test that handler works
@@ -194,6 +206,24 @@ func TestWithBuildTurnMessages(t *testing.T) {
 	})(&cfg)
 	if cfg.buildTurnMsgs == nil {
 		t.Fatalf("buildTurnMsgs should be set")
+	}
+}
+
+func TestMergeTools_DedupFunctionByName(t *testing.T) {
+	reqTools := []types.Tool{
+		{Type: types.ToolTypeFunction, Name: "search"},
+	}
+	extra := []types.Tool{
+		{Type: types.ToolTypeFunction, Name: "search"},
+		{Type: types.ToolTypeFunction, Name: "other"},
+	}
+
+	merged := mergeTools(reqTools, extra)
+	if len(merged) != 2 {
+		t.Fatalf("len(merged) = %d, want 2", len(merged))
+	}
+	if merged[0].Name != "search" || merged[1].Name != "other" {
+		t.Fatalf("merged names = %q,%q", merged[0].Name, merged[1].Name)
 	}
 }
 

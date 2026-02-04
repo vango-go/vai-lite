@@ -73,6 +73,7 @@ type runConfig struct {
 	timeout       time.Duration
 	stopWhen      func(*Response) bool
 	toolHandlers  map[string]ToolHandler
+	extraTools    []types.Tool
 	beforeCall    func(*MessageRequest)
 	afterResponse func(*Response)
 	onToolCall    func(name string, input map[string]any, output any, err error)
@@ -159,6 +160,7 @@ func WithTools(tools ...ToolWithHandler) RunOption {
 		for _, t := range tools {
 			if t.Handler != nil && t.Name != "" {
 				c.toolHandlers[t.Name] = t.Handler
+				c.extraTools = append(c.extraTools, t.Tool)
 			}
 		}
 	}
@@ -173,6 +175,7 @@ func WithToolSet(ts *ToolSet) RunOption {
 		for name, handler := range ts.Handlers() {
 			c.toolHandlers[name] = handler
 		}
+		c.extraTools = append(c.extraTools, ts.Tools()...)
 	}
 }
 
@@ -215,6 +218,33 @@ func WithParallelTools(enabled bool) RunOption {
 // Default is 30 seconds.
 func WithToolTimeout(d time.Duration) RunOption {
 	return func(c *runConfig) { c.toolTimeout = d }
+}
+
+func mergeTools(reqTools []types.Tool, extraTools []types.Tool) []types.Tool {
+	if len(extraTools) == 0 {
+		return reqTools
+	}
+
+	out := make([]types.Tool, 0, len(reqTools)+len(extraTools))
+	seenFunc := make(map[string]struct{}, len(reqTools)+len(extraTools))
+
+	add := func(t types.Tool) {
+		if t.Type == types.ToolTypeFunction && t.Name != "" {
+			if _, ok := seenFunc[t.Name]; ok {
+				return
+			}
+			seenFunc[t.Name] = struct{}{}
+		}
+		out = append(out, t)
+	}
+
+	for _, t := range reqTools {
+		add(t)
+	}
+	for _, t := range extraTools {
+		add(t)
+	}
+	return out
 }
 
 // --- Run Loop Implementation ---
@@ -295,7 +325,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 			TopP:          req.TopP,
 			TopK:          req.TopK,
 			StopSequences: req.StopSequences,
-			Tools:         req.Tools,
+			Tools:         mergeTools(req.Tools, cfg.extraTools),
 			ToolChoice:    req.ToolChoice,
 			OutputFormat:  req.OutputFormat,
 			Output:        req.Output,
@@ -840,7 +870,7 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			TopP:          req.TopP,
 			TopK:          req.TopK,
 			StopSequences: req.StopSequences,
-			Tools:         req.Tools,
+			Tools:         mergeTools(req.Tools, cfg.extraTools),
 			ToolChoice:    req.ToolChoice,
 			Stream:        true, // Always stream in RunStream
 			OutputFormat:  req.OutputFormat,
