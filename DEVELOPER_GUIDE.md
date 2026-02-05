@@ -2,6 +2,8 @@
 
 `vai-lite` is a trimmed-down, **direct-mode only** Go SDK for running tool-using LLM agents.
 
+Most examples use `panic(err)` for brevity. In production code, handle errors explicitly and consider retries/backoff for transient provider failures.
+
 The only “high-level” primitives are:
 
 - `Messages.Run()` — blocking tool-loop execution
@@ -231,15 +233,27 @@ For function tools created via `MakeTool(...)`, the recommended pattern is to en
 - automatically attaches the tool definition for that run/stream.
 
 ```go
-tool := vai.MakeTool("get_weather", "Get weather for a location", func(ctx context.Context, in struct {
-	Location string `json:"location"`
-}) (string, error) {
-	return "72F and sunny in " + in.Location, nil
-})
+	tool := vai.MakeTool("get_weather", "Get weather for a location", func(ctx context.Context, in struct {
+		Location string `json:"location"`
+	}) (string, error) {
+		return "72F and sunny in " + in.Location, nil
+	})
 
-result, err := client.Messages.Run(ctx, req, vai.WithTools(tool))
-_ = result
-_ = err
+	result, err := client.Messages.Run(ctx, &vai.MessageRequest{
+		Model: "openai/gpt-4o",
+		Messages: []vai.Message{
+			{Role: "user", Content: vai.Text("What's the weather in Austin?")},
+		},
+		Tools: []vai.Tool{
+			vai.WebSearch(),
+			vai.CodeExecution(),
+		},
+	}, vai.WithTools(tool))
+	if err != nil {
+		panic(err)
+	}
+
+fmt.Println(result.Response.TextContent())
 ```
 
 Tool selection policy:
@@ -284,22 +298,22 @@ Important:
 ```go
 client := vai.NewClient()
 
-	tool := vai.MakeTool("increment", "Increment a counter",
-		func(ctx context.Context, in struct{}) (string, error) {
-			return "ok", nil
-		},
-	)
+tool := vai.MakeTool("increment", "Increment a counter",
+	func(ctx context.Context, in struct{}) (string, error) {
+		return "ok", nil
+	},
+)
 
-	result, err := client.Messages.Run(ctx, &vai.MessageRequest{
-		Model: "anthropic/claude-sonnet-4",
-		Messages: []vai.Message{
-			{Role: "user", Content: vai.Text("Call increment once and then summarize.")},
-		},
-	}, vai.WithTools(tool), vai.WithMaxToolCalls(5))
-	if err != nil {
-		// err can be provider errors, context cancellation, etc.
-		panic(err)
-	}
+result, err := client.Messages.Run(ctx, &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Call increment once and then summarize.")},
+	},
+}, vai.WithTools(tool), vai.WithMaxToolCalls(5))
+if err != nil {
+	// err can be provider errors, context cancellation, etc.
+	panic(err)
+}
 
 fmt.Println(result.Response.TextContent())
 fmt.Println("Tool calls:", result.ToolCallCount)
@@ -438,6 +452,24 @@ for ev := range stream.Events() {
 }
 ```
 
+Strict variant (mismatch detection):
+
+```go
+history := append([]vai.Message(nil), req.Messages...)
+
+apply := vai.DefaultHistoryHandlerStrict(&history)
+defer func() {
+	if r := recover(); r != nil {
+		// Strict handler panics if your history diverges from the stream's ExpectedLen.
+		panic(r)
+	}
+}()
+
+for ev := range stream.Events() {
+	apply(ev)
+}
+```
+
 For advanced context management (pinned memory, trimming, reordering), build per-turn messages at turn boundaries:
 
 ```go
@@ -446,8 +478,10 @@ stream, err := client.Messages.RunStream(ctx, req,
 		return info.History
 	}),
 )
-_ = stream
-_ = err
+if err != nil {
+	panic(err)
+}
+defer stream.Close()
 ```
 
 `WithBuildTurnMessages` affects only the messages sent to the model on the next turn. It does not change the append-only history represented by `HistoryDeltaEvent`.
@@ -474,21 +508,24 @@ type SearchInput struct {
 	Query string `json:"query" desc:"Search query"`
 }
 
-	search := vai.MakeTool("search_internal", "Search an internal index.",
-		func(ctx context.Context, in SearchInput) (string, error) {
-			return "results for: " + in.Query, nil
-		},
-	)
+search := vai.MakeTool("search_internal", "Search an internal index.",
+	func(ctx context.Context, in SearchInput) (string, error) {
+		return "results for: " + in.Query, nil
+	},
+)
 
-	req := &vai.MessageRequest{
-		Model: "anthropic/claude-sonnet-4",
-		Messages: []vai.Message{
-			{Role: "user", Content: vai.Text("Search internal for 'incident 123'")},
-		},
-	}
+req := &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Search internal for 'incident 123'")},
+	},
+}
 
-	// WithTools registers the handler and attaches the tool definition for this run.
-	result, err := client.Messages.Run(ctx, req, vai.WithTools(search))
+// WithTools registers the handler and attaches the tool definition for this run.
+result, err := client.Messages.Run(ctx, req, vai.WithTools(search))
+if err != nil {
+	panic(err)
+}
 ```
 
 ### 7.2 `FuncAsTool` (returns tool + handler)
@@ -650,6 +687,75 @@ Common cases:
 - auth errors (missing/invalid API key)
 - provider overloads / rate limits
 - invalid request shapes (bad model string, invalid tool schema, etc.)
+
+### Handling errors (recommended)
+
+General guidance:
+
+- Use `context.Context` deadlines (`WithRunTimeout`, `WithToolTimeout`, or your `ctx`) to bound retries and prevent stuck runs.
+- Retry **transient** provider errors (rate limits / overload / generic API errors) with exponential backoff + jitter.
+- Avoid retrying invalid requests (bad model string, malformed tool schema, etc.) unless you modify the request.
+- If you retry a whole `Run`/`RunStream`, treat tool execution as potentially non-idempotent (design tools to be idempotent if possible, or persist tool outcomes and replay them carefully).
+
+The SDK may return `*core.Error` for provider failures, which provides a retry signal and optional `RetryAfter`:
+
+```go
+import (
+	"errors"
+
+	core "github.com/vango-go/vai-lite/pkg/core"
+)
+
+var apiErr *core.Error
+if errors.As(err, &apiErr) && apiErr.IsRetryable() {
+	// consider sleeping based on apiErr.RetryAfter (if set), then retry
+}
+```
+
+Minimal retry loop for `Run` (illustrative):
+
+```go
+import (
+	"errors"
+	"math/rand"
+	"time"
+
+	core "github.com/vango-go/vai-lite/pkg/core"
+)
+
+backoff := func(attempt int) time.Duration {
+	base := 200 * time.Millisecond
+	max := 5 * time.Second
+	d := base << attempt
+	if d > max {
+		d = max
+	}
+	// jitter in [0.5, 1.5)
+	jitter := 0.5 + rand.Float64()
+	return time.Duration(float64(d) * jitter)
+}
+
+for attempt := 0; attempt < 4; attempt++ {
+	result, err := client.Messages.Run(ctx, req, opts...)
+	if err == nil {
+		_ = result
+		break
+	}
+
+	var apiErr *core.Error
+	if errors.As(err, &apiErr) && apiErr.IsRetryable() && attempt < 3 {
+		sleepFor := backoff(attempt)
+		if apiErr.RetryAfter != nil {
+			sleepFor = time.Duration(*apiErr.RetryAfter) * time.Second
+		}
+		time.Sleep(sleepFor)
+		continue
+	}
+
+	// non-retryable (or out of attempts)
+	panic(err)
+}
+```
 
 ### Tool handler errors
 
