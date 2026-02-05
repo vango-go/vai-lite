@@ -102,9 +102,33 @@ func (m *Message) TextContent() string {
 	switch c := m.Content.(type) {
 	case string:
 		return c
+	case ContentBlock:
+		switch b := c.(type) {
+		case TextBlock:
+			return b.Text
+		case *TextBlock:
+			return b.Text
+		default:
+			return ""
+		}
 	case []ContentBlock:
 		var text string
 		for _, block := range c {
+			if tb, ok := block.(TextBlock); ok {
+				text += tb.Text
+			}
+			if tb, ok := block.(*TextBlock); ok {
+				text += tb.Text
+			}
+		}
+		return text
+	case []any:
+		var text string
+		for _, item := range c {
+			block, ok := item.(ContentBlock)
+			if !ok {
+				continue
+			}
 			if tb, ok := block.(TextBlock); ok {
 				text += tb.Text
 			}

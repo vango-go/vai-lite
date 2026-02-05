@@ -179,8 +179,26 @@ func TestMessage_TextContent(t *testing.T) {
 			want:    "Hello!",
 		},
 		{
+			name:    "single text block",
+			content: TextBlock{Type: "text", Text: "Hello!"},
+			want:    "Hello!",
+		},
+		{
+			name:    "single text block pointer",
+			content: &TextBlock{Type: "text", Text: "Hello!"},
+			want:    "Hello!",
+		},
+		{
 			name: "text blocks",
 			content: []ContentBlock{
+				TextBlock{Type: "text", Text: "Hello, "},
+				TextBlock{Type: "text", Text: "world!"},
+			},
+			want: "Hello, world!",
+		},
+		{
+			name: "any slice blocks",
+			content: []any{
 				TextBlock{Type: "text", Text: "Hello, "},
 				TextBlock{Type: "text", Text: "world!"},
 			},
