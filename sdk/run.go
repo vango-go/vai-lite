@@ -680,7 +680,7 @@ func (e StepCompleteEvent) runStreamEventType() string { return "step_complete" 
 // HistoryDeltaEvent signals messages to append to history.
 // This is emitted after StepCompleteEvent.
 type HistoryDeltaEvent struct {
-	ExpectedLen int            `json:"expected_len"`
+	ExpectedLen int             `json:"expected_len"`
 	Append      []types.Message `json:"append"`
 }
 
@@ -818,14 +818,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 
 	stepIndex := 0
 
-	// Track tool blocks as they're being built (persists across turns for interrupt recovery)
-	type pendingTool struct {
-		id        string
-		name      string
-		inputJSON strings.Builder
-		emitted   bool
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -908,8 +900,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		rs.currentStream = stream
 		rs.partialContent.Reset()
 		rs.mu.Unlock()
-
-		pendingTools := make(map[int]*pendingTool)
 
 		// Process stream events with cancel support using select
 	streamLoop:
@@ -1000,33 +990,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 						rs.partialContent.WriteString(textDelta.Text)
 						rs.mu.Unlock()
 					}
-					// Accumulate tool input from input_json_delta events
-					if inputDelta, ok := deltaEvent.Delta.(types.InputJSONDelta); ok {
-						if pt, exists := pendingTools[deltaEvent.Index]; exists {
-							pt.inputJSON.WriteString(inputDelta.PartialJSON)
-						}
-					}
 				}
 
-				// Detect tool calls from content_block_start events
+				// Forward provider-native web search results as tool result lifecycle events.
 				if startEvent, ok := event.(types.ContentBlockStartEvent); ok {
 					switch block := startEvent.ContentBlock.(type) {
-					case types.ToolUseBlock:
-						pendingTools[startEvent.Index] = &pendingTool{
-							id:   block.ID,
-							name: block.Name,
-						}
-						rs.send(ToolCallStartEvent{ID: block.ID, Name: block.Name, Input: block.Input})
-						pendingTools[startEvent.Index].emitted = true
-
-					case types.ServerToolUseBlock:
-						pendingTools[startEvent.Index] = &pendingTool{
-							id:   block.ID,
-							name: block.Name,
-						}
-						rs.send(ToolCallStartEvent{ID: block.ID, Name: block.Name, Input: block.Input})
-						pendingTools[startEvent.Index].emitted = true
-
 					case types.WebSearchToolResultBlock:
 						var resultContent []types.ContentBlock
 						if len(block.Content) > 0 {
@@ -1041,20 +1009,6 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 							Name:    "web_search",
 							Content: resultContent,
 						})
-					}
-				}
-
-				// Emit tool call start when block completes (with full input)
-				if stopEvent, ok := event.(types.ContentBlockStopEvent); ok {
-					if pt, exists := pendingTools[stopEvent.Index]; exists {
-						if !pt.emitted {
-							var input map[string]any
-							if pt.inputJSON.Len() > 0 {
-								json.Unmarshal([]byte(pt.inputJSON.String()), &input)
-							}
-							rs.send(ToolCallStartEvent{ID: pt.id, Name: pt.name, Input: input})
-						}
-						delete(pendingTools, stopEvent.Index)
 					}
 				}
 			}

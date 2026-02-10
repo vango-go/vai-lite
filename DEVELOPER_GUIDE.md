@@ -391,14 +391,20 @@ result, err := client.Messages.Run(ctx, req,
 When the model requests tools (via `tool_use` blocks), the SDK:
 
 1. Looks up a registered handler by tool name.
-2. Marshals the tool `input` object to JSON.
-3. Calls your handler with `context.Context` + `json.RawMessage`.
-4. Converts the returned value into `[]ContentBlock`:
+2. Reconstructs streamed tool inputs (`input_json_delta`) into the final tool `input` object.
+3. Marshals the tool `input` object to JSON.
+4. Calls your handler with `context.Context` + `json.RawMessage`.
+5. Converts the returned value into `[]ContentBlock`:
    - `string` → `[{type:"text", text:"..."}]`
    - `ContentBlock` → wrapped into a slice
    - `[]ContentBlock` → used as-is
    - other types → JSON-marshaled into a `text` block
-5. Injects a `tool_result` block back into the conversation.
+6. Injects a `tool_result` block back into the conversation.
+
+For `RunStream` specifically, `ToolCallStartEvent` is emitted when local SDK tool execution begins (once per tool call) and includes the complete parsed input.
+
+If you need earliest provider-side tool detection, inspect wrapped provider events (`StreamEventWrapper`) such as
+`content_block_start` + `input_json_delta`.
 
 If no handler exists for a tool name, the SDK returns a tool result like:
 
@@ -638,6 +644,9 @@ Important:
    - `HistoryDeltaEvent`
    - `InterruptedEvent`
    - `RunCompleteEvent`
+
+`ToolCallStartEvent` corresponds to SDK local tool execution start (not raw provider detection), and its `Input` reflects the full parsed tool input object.
+Use wrapped provider events if you need lower-level "tool call is being streamed now" signals.
 
 ### 9.2 Helper extractors
 

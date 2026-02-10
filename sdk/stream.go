@@ -1,6 +1,7 @@
 package vai
 
 import (
+	"encoding/json"
 	"sync/atomic"
 
 	"github.com/vango-go/vai-lite/pkg/core"
@@ -40,6 +41,42 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 
 	var response types.MessageResponse
 	var currentContent []types.ContentBlock
+	toolInputBuffers := make(map[int]string)
+
+	applyToolInput := func(index int) {
+		raw, ok := toolInputBuffers[index]
+		if !ok {
+			return
+		}
+		delete(toolInputBuffers, index)
+
+		if raw == "" || index < 0 || index >= len(currentContent) {
+			return
+		}
+
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			// Invalid partial JSON should not fail streaming.
+			return
+		}
+
+		switch block := currentContent[index].(type) {
+		case types.ToolUseBlock:
+			block.Input = parsed
+			currentContent[index] = block
+		case *types.ToolUseBlock:
+			if block != nil {
+				block.Input = parsed
+			}
+		case types.ServerToolUseBlock:
+			block.Input = parsed
+			currentContent[index] = block
+		case *types.ServerToolUseBlock:
+			if block != nil {
+				block.Input = parsed
+			}
+		}
+	}
 
 	for {
 		event, err := s.eventStream.Next()
@@ -67,6 +104,12 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 			if e.Index < len(currentContent) {
 				currentContent[e.Index] = applyDelta(currentContent[e.Index], e.Delta)
 			}
+			if inputDelta, ok := e.Delta.(types.InputJSONDelta); ok {
+				toolInputBuffers[e.Index] += inputDelta.PartialJSON
+			}
+		case types.ContentBlockStopEvent:
+			// Apply buffered tool input when the block is complete.
+			applyToolInput(e.Index)
 		case types.MessageDeltaEvent:
 			response.StopReason = e.Delta.StopReason
 			response.Usage = e.Usage
@@ -84,6 +127,11 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 		}
 	}
 
+	// Some providers don't emit content_block_stop for tool blocks; flush any remaining input.
+	for index := range toolInputBuffers {
+		applyToolInput(index)
+	}
+
 	response.Content = currentContent
 	s.response = &response
 }
@@ -95,14 +143,6 @@ func applyDelta(block types.ContentBlock, delta types.Delta) types.ContentBlock 
 		if tb, ok := block.(types.TextBlock); ok {
 			tb.Text += d.Text
 			return tb
-		}
-	case types.InputJSONDelta:
-		// For tool use blocks, accumulate the partial JSON
-		if tu, ok := block.(types.ToolUseBlock); ok {
-			// Store partial JSON in a way that can be parsed later
-			// For now, just accumulate in a string field
-			_ = tu
-			_ = d.PartialJSON
 		}
 	case types.ThinkingDelta:
 		if tb, ok := block.(types.ThinkingBlock); ok {
