@@ -27,7 +27,7 @@ This repo intentionally **does not** include:
 
 - Proxy/HTTP server mode
 - Live/WebSocket mode
-- Voice/STT/TTS pipeline orchestration
+- Standalone audio service endpoints (`client.Audio.*`)
 - Extra endpoints (`/v1/messages`, `/v1/audio`, `/v1/models`, etc.)
 
 ---
@@ -43,6 +43,7 @@ This repo intentionally **does not** include:
   - [5.2 Messages + content blocks](#52-messages--content-blocks)
   - [5.3 Tools and tool choice](#53-tools-and-tool-choice)
   - [5.4 OutputFormat (structured output)](#54-outputformat-structured-output)
+  - [5.5 VoiceConfig (Cartesia non-live)](#55-voiceconfig-cartesia-non-live)
 - [6. The Tool Loop](#6-the-tool-loop)
   - [6.1 Run](#61-run)
   - [6.2 RunStream](#62-runstream)
@@ -61,6 +62,7 @@ This repo intentionally **does not** include:
   - [9.1 Event model](#91-event-model)
   - [9.2 Helper extractors](#92-helper-extractors)
   - [9.3 `RunStream.Process` convenience](#93-runstreamprocess-convenience)
+  - [9.4 `Messages.Stream` audio side channel](#94-messagesstream-audio-side-channel)
 - [10. Errors and Observability](#10-errors-and-observability)
 - [11. Testing and Local Dev](#11-testing-and-local-dev)
 - [12. Gotchas and Design Notes](#12-gotchas-and-design-notes)
@@ -120,6 +122,7 @@ The core engine loads keys from environment variables in the form:
 - `GROQ_API_KEY`
 - `CEREBRAS_API_KEY`
 - `GEMINI_API_KEY` (also accepts `GOOGLE_API_KEY` as a fallback)
+- `CARTESIA_API_KEY` (for non-live STT/TTS voice mode)
 
 Example:
 
@@ -220,7 +223,9 @@ Notes:
   - a `string`, or
   - a `[]ContentBlock`
 - `vai.Text(...)` returns a `ContentBlock` (a typed block).
-- `vai-lite` does **not** run a voice pipeline. If you include raw audio blocks (via core types), they are just passed through to providers that support audio input.
+- `vai.Audio(bytes, mediaType)` creates input audio blocks.
+- When `req.Voice.Input` is set, audio blocks are transcribed via Cartesia STT before LLM invocation.
+- When `req.Voice.Output` is set, output text is synthesized to audio via Cartesia TTS.
 
 ### 5.3 Tools and tool choice
 
@@ -295,6 +300,40 @@ Important:
 - If `req.OutputFormat` is nil, `Extract` injects a JSON schema generated from your destination struct type.
 - If `req.OutputFormat` is already set, `Extract` preserves it.
 - Structured-output behavior is provider/model-specific.
+
+### 5.5 VoiceConfig (Cartesia non-live)
+
+`MessageRequest` supports:
+
+```go
+req.Voice = &vai.VoiceConfig{
+	Input: &vai.VoiceInputConfig{
+		Model:    "ink-whisper", // default
+		Language: "en",          // default
+	},
+	Output: &vai.VoiceOutputConfig{
+		Voice:      "a0e99841-438c-4a64-b679-ae501e7d6091",
+		Format:     vai.AudioFormatWAV, // wav/mp3/pcm
+		Speed:      1.0,
+		Volume:     1.0,
+		SampleRate: 24000,
+	},
+}
+```
+
+Convenience helpers:
+
+- `vai.VoiceInput(...)`
+- `vai.VoiceOutput(voiceID, ...)`
+- `vai.VoiceFull(voiceID, ...)`
+
+Semantics:
+
+- Voice mode is opt-in (`req.Voice != nil`).
+- Missing Cartesia configuration while voice mode is requested is a fail-fast error.
+- `Messages.Create` and `Messages.Stream` store concatenated input transcript in response metadata (`user_transcript`) when input audio was present.
+- `Messages.Stream` preserves `Events()` and emits audio deltas through `AudioEvents()`.
+- `RunStream` emits `AudioChunkEvent` in `Events()` and appends final audio to terminal `RunResult.Response`.
 
 ---
 
@@ -647,6 +686,7 @@ Important:
    - these are `pkg/core/types.StreamEvent` (e.g. `content_block_delta`, `message_delta`, `error`)
 2. **Tool-loop lifecycle events**
    - `StepStartEvent`
+   - `AudioChunkEvent` (when `req.Voice.Output` is enabled)
    - `ToolCallStartEvent`
    - `ToolResultEvent`
    - `StepCompleteEvent`
@@ -663,6 +703,7 @@ Helpers in `sdk/stream_helpers.go`:
 
 - `TextDeltaFrom(event)` — extracts text chunks from wrapped stream deltas
 - `ThinkingDeltaFrom(event)` — extracts thinking chunks if present
+- `AudioChunkFrom(event)` — extracts run-level audio chunks
 
 Example:
 
@@ -681,6 +722,7 @@ for ev := range stream.Events() {
 ```go
 text, err := stream.Process(vai.StreamCallbacks{
 	OnTextDelta: func(t string) { fmt.Print(t) },
+	OnAudioChunk: func(data []byte, format string) { play(data, format) },
 	OnToolCallStart: func(id, name string, input map[string]any) {
 		log.Printf("tool %s(%v)", name, input)
 	},
@@ -691,6 +733,16 @@ text, err := stream.Process(vai.StreamCallbacks{
 ```
 
 It returns the accumulated output text and any final error.
+
+### 9.4 `Messages.Stream` audio side channel
+
+For single-turn streaming:
+
+- `Events()` remains `chan types.StreamEvent` (text/tool deltas unchanged).
+- `AudioEvents()` emits synthesized audio chunks when `req.Voice.Output` is set.
+- `Response()` includes a final `audio` content block when synthesis succeeded.
+- If voice output is not enabled, `AudioEvents()` is closed immediately.
+- TTS streaming errors are fail-fast: stream ends with `Stream.Err()`.
 
 ---
 

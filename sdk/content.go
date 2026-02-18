@@ -49,6 +49,18 @@ func Video(data []byte, mediaType string) types.ContentBlock {
 	}
 }
 
+// Audio creates an audio content block.
+func Audio(data []byte, mediaType string) types.ContentBlock {
+	return types.AudioBlock{
+		Type: "audio",
+		Source: types.AudioSource{
+			Type:      "base64",
+			MediaType: mediaType,
+			Data:      base64.StdEncoding.EncodeToString(data),
+		},
+	}
+}
+
 // Document creates a document content block.
 func Document(data []byte, mediaType, filename string) types.ContentBlock {
 	return types.DocumentBlock{

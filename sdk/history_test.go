@@ -51,4 +51,3 @@ func TestDefaultHistoryHandlerStrict_PanicsOnMismatch(t *testing.T) {
 		Append:      []types.Message{{Role: "assistant", Content: []types.ContentBlock{Text("nope")}}},
 	})
 }
-

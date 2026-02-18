@@ -42,4 +42,3 @@ func AppendToolResultsMessage(history []types.Message, toolResults []ToolExecuti
 	}
 	return AppendUserMessage(history, blocks)
 }
-

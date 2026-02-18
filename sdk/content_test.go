@@ -32,6 +32,13 @@ func TestVideo(t *testing.T) {
 	}
 }
 
+func TestAudio(t *testing.T) {
+	block := Audio([]byte("audio data"), "audio/wav")
+	if block.BlockType() != "audio" {
+		t.Errorf("BlockType() = %q, want %q", block.BlockType(), "audio")
+	}
+}
+
 func TestDocument(t *testing.T) {
 	block := Document([]byte("pdf data"), "application/pdf", "report.pdf")
 	if block.BlockType() != "document" {

@@ -16,6 +16,9 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/providers/groq"
 	"github.com/vango-go/vai-lite/pkg/core/providers/oai_resp"
 	"github.com/vango-go/vai-lite/pkg/core/providers/openai"
+	"github.com/vango-go/vai-lite/pkg/core/voice"
+	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
+	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 )
 
 // Client is the main entry point for the SDK.
@@ -23,9 +26,10 @@ type Client struct {
 	Messages *MessagesService
 
 	// Internal
-	core         *core.Engine
-	providerKeys map[string]string
-	logger       *slog.Logger
+	core          *core.Engine
+	providerKeys  map[string]string
+	logger        *slog.Logger
+	voicePipeline *voice.Pipeline
 }
 
 // NewClient creates a new client (direct mode only).
@@ -41,6 +45,7 @@ func NewClient(opts ...ClientOption) *Client {
 
 	c.core = core.NewEngine(c.providerKeys)
 	c.initProviders()
+	c.initVoicePipeline()
 
 	c.Messages = &MessagesService{client: c}
 	return c
@@ -87,6 +92,47 @@ func (c *Client) initProviders() {
 	if geminiKey != "" {
 		c.core.RegisterProvider(newGeminiAdapter(gemini.New(geminiKey)))
 	}
+}
+
+func (c *Client) initVoicePipeline() {
+	cartesiaKey := c.getCartesiaAPIKey()
+	if cartesiaKey != "" {
+		c.voicePipeline = voice.NewPipeline(cartesiaKey)
+	}
+}
+
+func (c *Client) getCartesiaAPIKey() string {
+	if key, ok := c.providerKeys["cartesia"]; ok && key != "" {
+		return key
+	}
+	return os.Getenv("CARTESIA_API_KEY")
+}
+
+func (c *Client) getSTTProvider() stt.Provider {
+	if c.voicePipeline != nil {
+		return c.voicePipeline.STTProvider()
+	}
+	cartesiaKey := c.getCartesiaAPIKey()
+	if cartesiaKey == "" {
+		return nil
+	}
+	return stt.NewCartesia(cartesiaKey)
+}
+
+func (c *Client) getTTSProvider() tts.Provider {
+	if c.voicePipeline != nil {
+		return c.voicePipeline.TTSProvider()
+	}
+	cartesiaKey := c.getCartesiaAPIKey()
+	if cartesiaKey == "" {
+		return nil
+	}
+	return tts.NewCartesia(cartesiaKey)
+}
+
+// VoicePipeline returns the voice pipeline when initialized.
+func (c *Client) VoicePipeline() *voice.Pipeline {
+	return c.voicePipeline
 }
 
 // Engine returns the core engine.

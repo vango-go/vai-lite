@@ -1,7 +1,9 @@
 package vai
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/vango-go/vai-lite/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 )
 
 // RunStopReason indicates why the run loop terminated.
@@ -251,17 +254,56 @@ func mergeTools(reqTools []types.Tool, extraTools []types.Tool) []types.Tool {
 
 // runLoop executes the main tool execution loop.
 func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg *runConfig) (*RunResult, error) {
+	if req == nil {
+		return nil, fmt.Errorf("req must not be nil")
+	}
+
 	result := &RunResult{
 		Steps: make([]RunStep, 0),
 	}
 
-	history := make([]types.Message, len(req.Messages))
-	copy(history, req.Messages)
+	workingReq := *req
+	userTranscript := ""
+
+	if req.Voice != nil && req.Voice.Input != nil {
+		processedReq, transcript, err := s.preprocessVoiceInput(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		workingReq = *processedReq
+		userTranscript = transcript
+	}
+	if req.Voice != nil && req.Voice.Output != nil {
+		if err := s.requireVoicePipeline(); err != nil {
+			return nil, err
+		}
+	}
+
+	history := make([]types.Message, len(workingReq.Messages))
+	copy(history, workingReq.Messages)
 
 	snapshotMessages := func() []types.Message {
 		out := make([]types.Message, len(history))
 		copy(out, history)
 		return out
+	}
+
+	finalizeResponse := func(resp *Response) error {
+		if resp == nil || resp.MessageResponse == nil {
+			return nil
+		}
+		if userTranscript != "" {
+			if resp.Metadata == nil {
+				resp.Metadata = make(map[string]any)
+			}
+			resp.Metadata["user_transcript"] = userTranscript
+		}
+		if workingReq.Voice != nil && workingReq.Voice.Output != nil {
+			if err := s.appendVoiceOutput(ctx, &workingReq, resp.MessageResponse); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	// Apply timeout if configured
@@ -317,20 +359,20 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Build request for this turn
 		turnReq := &types.MessageRequest{
-			Model:         req.Model,
+			Model:         workingReq.Model,
 			Messages:      messagesForTurn,
-			MaxTokens:     req.MaxTokens,
-			System:        req.System,
-			Temperature:   req.Temperature,
-			TopP:          req.TopP,
-			TopK:          req.TopK,
-			StopSequences: req.StopSequences,
-			Tools:         mergeTools(req.Tools, cfg.extraTools),
-			ToolChoice:    req.ToolChoice,
-			OutputFormat:  req.OutputFormat,
-			Output:        req.Output,
-			Extensions:    req.Extensions,
-			Metadata:      req.Metadata,
+			MaxTokens:     workingReq.MaxTokens,
+			System:        workingReq.System,
+			Temperature:   workingReq.Temperature,
+			TopP:          workingReq.TopP,
+			TopK:          workingReq.TopK,
+			StopSequences: workingReq.StopSequences,
+			Tools:         mergeTools(workingReq.Tools, cfg.extraTools),
+			ToolChoice:    workingReq.ToolChoice,
+			OutputFormat:  workingReq.OutputFormat,
+			Output:        workingReq.Output,
+			Extensions:    workingReq.Extensions,
+			Metadata:      workingReq.Metadata,
 		}
 
 		// Call before hook
@@ -370,6 +412,14 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Check custom stop condition
 		if cfg.stopWhen != nil && cfg.stopWhen(resp) {
+			if err := finalizeResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotMessages()
+				if cfg.onStop != nil {
+					cfg.onStop(result)
+				}
+				return result, err
+			}
 			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
@@ -383,6 +433,14 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Check if model finished without tool calls
 		if resp.StopReason != types.StopReasonToolUse {
+			if err := finalizeResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotMessages()
+				if cfg.onStop != nil {
+					cfg.onStop(result)
+				}
+				return result, err
+			}
 			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
@@ -397,6 +455,14 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 		// Process tool calls
 		toolUses := resp.ToolUses()
 		if len(toolUses) == 0 {
+			if err := finalizeResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotMessages()
+				if cfg.onStop != nil {
+					cfg.onStop(result)
+				}
+				return result, err
+			}
 			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
@@ -410,6 +476,14 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 		// Check tool call limit
 		if cfg.maxToolCalls > 0 && result.ToolCallCount+len(toolUses) > cfg.maxToolCalls {
+			if err := finalizeResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotMessages()
+				if cfg.onStop != nil {
+					cfg.onStop(result)
+				}
+				return result, err
+			}
 			history = AppendAssistantMessage(history, resp.Content)
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
@@ -693,6 +767,14 @@ type RunCompleteEvent struct {
 
 func (e RunCompleteEvent) runStreamEventType() string { return "run_complete" }
 
+// AudioChunkEvent contains streaming audio data from TTS.
+type AudioChunkEvent struct {
+	Data   []byte `json:"data"`
+	Format string `json:"format"`
+}
+
+func (e AudioChunkEvent) runStreamEventType() string { return "audio_chunk" }
+
 // InterruptedEvent signals that the stream was interrupted.
 type InterruptedEvent struct {
 	PartialText string            `json:"partial_text,omitempty"`
@@ -762,24 +844,223 @@ func (rs *RunStream) InterruptWithText(text string) error {
 	}, InterruptSaveMarked)
 }
 
+// runVoiceStreamer batches text deltas and forwards synthesized audio as run events.
+type runVoiceStreamer struct {
+	ttsCtx      *tts.StreamingContext
+	sendEvents  func(RunStreamEvent)
+	format      string
+	transcript  strings.Builder
+	audioBuffer bytes.Buffer
+
+	buffer     strings.Builder
+	bufferMu   sync.Mutex
+	flushTimer *time.Timer
+	done       chan struct{}
+	wg         sync.WaitGroup
+	closeOnce  sync.Once
+
+	maxChars     int
+	maxDelay     time.Duration
+	sentenceEnds string
+
+	errMu sync.Mutex
+	err   error
+}
+
+func newRunVoiceStreamer(ttsCtx *tts.StreamingContext, format string, sendEvents func(RunStreamEvent)) *runVoiceStreamer {
+	vs := &runVoiceStreamer{
+		ttsCtx:       ttsCtx,
+		sendEvents:   sendEvents,
+		format:       normalizeAudioFormat(format),
+		done:         make(chan struct{}),
+		maxChars:     80,
+		maxDelay:     150 * time.Millisecond,
+		sentenceEnds: ".!?",
+	}
+
+	vs.wg.Add(1)
+	go vs.forwardAudio()
+	return vs
+}
+
+func (vs *runVoiceStreamer) AddText(text string) error {
+	if text == "" {
+		return nil
+	}
+	vs.bufferMu.Lock()
+	defer vs.bufferMu.Unlock()
+
+	if err := vs.Err(); err != nil {
+		return err
+	}
+
+	vs.buffer.WriteString(text)
+	vs.transcript.WriteString(text)
+	content := vs.buffer.String()
+
+	shouldSend := false
+	if len(content) >= vs.maxChars {
+		shouldSend = true
+	}
+	if strings.ContainsAny(text, vs.sentenceEnds) {
+		shouldSend = true
+	}
+
+	if shouldSend {
+		return vs.sendBufferLocked(false)
+	}
+	vs.resetTimerLocked()
+	return nil
+}
+
+func (vs *runVoiceStreamer) sendBufferLocked(isFinal bool) error {
+	content := strings.TrimSpace(vs.buffer.String())
+	if content == "" && !isFinal {
+		return nil
+	}
+
+	vs.buffer.Reset()
+	if vs.flushTimer != nil {
+		vs.flushTimer.Stop()
+		vs.flushTimer = nil
+	}
+
+	var err error
+	if content != "" {
+		err = vs.ttsCtx.SendText(content, isFinal)
+	} else {
+		err = vs.ttsCtx.Flush()
+	}
+	if err != nil {
+		vs.setErr(fmt.Errorf("voice output stream send failed: %w", err))
+		return vs.Err()
+	}
+	return nil
+}
+
+func (vs *runVoiceStreamer) resetTimerLocked() {
+	if vs.flushTimer != nil {
+		vs.flushTimer.Stop()
+	}
+	vs.flushTimer = time.AfterFunc(vs.maxDelay, func() {
+		vs.bufferMu.Lock()
+		defer vs.bufferMu.Unlock()
+		_ = vs.sendBufferLocked(false)
+	})
+}
+
+func (vs *runVoiceStreamer) Flush() error {
+	vs.bufferMu.Lock()
+	defer vs.bufferMu.Unlock()
+	return vs.sendBufferLocked(true)
+}
+
+func (vs *runVoiceStreamer) Close() error {
+	vs.closeOnce.Do(func() {
+		if vs.flushTimer != nil {
+			vs.flushTimer.Stop()
+		}
+
+		close(vs.done)
+
+		if err := vs.ttsCtx.Close(); err != nil {
+			vs.setErr(err)
+		}
+		vs.wg.Wait()
+	})
+	return vs.Err()
+}
+
+func (vs *runVoiceStreamer) Err() error {
+	vs.errMu.Lock()
+	defer vs.errMu.Unlock()
+	return vs.err
+}
+
+func (vs *runVoiceStreamer) setErr(err error) {
+	if err == nil {
+		return
+	}
+	vs.errMu.Lock()
+	defer vs.errMu.Unlock()
+	if vs.err == nil {
+		vs.err = err
+	}
+}
+
+func (vs *runVoiceStreamer) forwardAudio() {
+	defer vs.wg.Done()
+
+	for chunk := range vs.ttsCtx.Audio() {
+		vs.audioBuffer.Write(chunk)
+		vs.sendEvents(AudioChunkEvent{
+			Data:   chunk,
+			Format: vs.format,
+		})
+	}
+	if err := vs.ttsCtx.Err(); err != nil {
+		vs.setErr(fmt.Errorf("voice output stream failed: %w", err))
+	}
+}
+
+func (vs *runVoiceStreamer) AudioBytes() []byte {
+	out := make([]byte, vs.audioBuffer.Len())
+	copy(out, vs.audioBuffer.Bytes())
+	return out
+}
+
+func (vs *runVoiceStreamer) Transcript() string {
+	return strings.TrimSpace(vs.transcript.String())
+}
+
 // runStreamLoop executes the streaming tool loop.
 func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest, cfg *runConfig) *RunStream {
+	var prepErr error
+	var userTranscript string
+
+	workingReq := req
+	if req != nil && req.Voice != nil && req.Voice.Input != nil {
+		workingReq, userTranscript, prepErr = s.preprocessVoiceInput(ctx, req)
+	}
+	if prepErr == nil && req != nil && req.Voice != nil && req.Voice.Output != nil {
+		prepErr = s.requireVoicePipeline()
+	}
+
 	// Copy messages to avoid mutating the original
-	messages := make([]types.Message, len(req.Messages))
-	copy(messages, req.Messages)
+	var initialMessages []types.Message
+	if workingReq != nil {
+		initialMessages = make([]types.Message, len(workingReq.Messages))
+		copy(initialMessages, workingReq.Messages)
+	}
 
 	rs := &RunStream{
-		messages:  messages,
+		messages:  initialMessages,
 		events:    make(chan RunStreamEvent, 100),
 		interrupt: make(chan interruptRequest, 1),
 		done:      make(chan struct{}),
 	}
 
-	go rs.run(ctx, s, req, cfg)
+	if prepErr != nil {
+		go func() {
+			defer rs.closeOnce.Do(func() {
+				close(rs.events)
+				close(rs.done)
+			})
+			rs.err = prepErr
+			rs.result = &RunResult{
+				Steps:      make([]RunStep, 0),
+				StopReason: RunStopError,
+				Messages:   initialMessages,
+			}
+		}()
+		return rs
+	}
+
+	go rs.run(ctx, s, workingReq, cfg, userTranscript)
 	return rs
 }
 
-func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig) {
+func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig, userTranscript string) {
 	defer rs.closeOnce.Do(func() {
 		close(rs.events)
 		close(rs.done)
@@ -788,12 +1069,100 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 	result := &RunResult{
 		Steps: make([]RunStep, 0),
 	}
+	if req == nil {
+		result.StopReason = RunStopError
+		rs.result = result
+		rs.err = fmt.Errorf("req must not be nil")
+		return
+	}
 
 	// Apply timeout
 	if cfg.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.timeout)
 		defer cancel()
+	}
+
+	voiceEnabled := req.Voice != nil && req.Voice.Output != nil
+	var voiceStream *runVoiceStreamer
+	newVoiceStream := func() (*runVoiceStreamer, error) {
+		ttsCtx, err := svc.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice)
+		if err != nil {
+			return nil, fmt.Errorf("initialize voice output stream: %w", err)
+		}
+		return newRunVoiceStreamer(ttsCtx, normalizeStreamingAudioFormat(req.Voice.Output.Format), rs.send), nil
+	}
+	if voiceEnabled {
+		var err error
+		voiceStream, err = newVoiceStream()
+		if err != nil {
+			result.StopReason = RunStopError
+			rs.result = result
+			rs.err = err
+			return
+		}
+	}
+
+	closeVoice := func() {
+		if voiceStream != nil {
+			_ = voiceStream.Close()
+			voiceStream = nil
+		}
+	}
+	defer closeVoice()
+
+	appendTranscript := func(segment string) {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			return
+		}
+		if userTranscript == "" {
+			userTranscript = segment
+			return
+		}
+		userTranscript += "\n" + segment
+	}
+
+	finalizeTerminalResponse := func(resp *Response) error {
+		if resp == nil || resp.MessageResponse == nil {
+			return nil
+		}
+		if userTranscript != "" {
+			if resp.Metadata == nil {
+				resp.Metadata = make(map[string]any)
+			}
+			resp.Metadata["user_transcript"] = userTranscript
+		}
+		if !voiceEnabled || voiceStream == nil {
+			return nil
+		}
+		if err := voiceStream.Flush(); err != nil {
+			return err
+		}
+		if err := voiceStream.Close(); err != nil {
+			return err
+		}
+
+		audio := voiceStream.AudioBytes()
+		if len(audio) == 0 {
+			voiceStream = nil
+			return nil
+		}
+		transcript := voiceStream.Transcript()
+		if transcript == "" {
+			transcript = strings.TrimSpace(resp.TextContent())
+		}
+		resp.Content = append(resp.Content, types.AudioBlock{
+			Type: "audio",
+			Source: types.AudioSource{
+				Type:      "base64",
+				MediaType: mediaTypeForAudioFormat(normalizeStreamingAudioFormat(req.Voice.Output.Format)),
+				Data:      base64.StdEncoding.EncodeToString(audio),
+			},
+			Transcript: &transcript,
+		})
+		voiceStream = nil
+		return nil
 	}
 
 	appendHistoryDelta := func(delta []types.Message) {
@@ -926,6 +1295,12 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 				// Check if this is Cancel (empty message) or Interrupt (has message)
 				isCancel := intReq.message.Role == "" && intReq.message.Content == nil
 
+				// Cut current voice output immediately on any interrupt/cancel.
+				if voiceStream != nil {
+					_ = voiceStream.Close()
+					voiceStream = nil
+				}
+
 				if !isCancel {
 					var delta []types.Message
 
@@ -953,9 +1328,40 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 						// Don't save partial response
 					}
 
+					injectedMessage := intReq.message
+					if req.Voice != nil && req.Voice.Input != nil {
+						processed, transcript, err := svc.client.voicePipeline.ProcessInputAudio(ctx, []types.Message{injectedMessage}, req.Voice)
+						if err != nil {
+							intReq.result <- fmt.Errorf("transcribe interrupt audio: %w", err)
+							result.StopReason = RunStopError
+							result.Messages = snapshotHistory()
+							rs.result = result
+							rs.err = err
+							return
+						}
+						if len(processed) > 0 {
+							injectedMessage = processed[0]
+						}
+						appendTranscript(transcript)
+					}
+
 					// Inject the new message
-					delta = append(delta, intReq.message)
+					delta = append(delta, injectedMessage)
 					appendHistoryDelta(delta)
+
+					// Start a fresh voice stream for subsequent turns after interruption.
+					if voiceEnabled {
+						nextVoiceStream, err := newVoiceStream()
+						if err != nil {
+							intReq.result <- err
+							result.StopReason = RunStopError
+							result.Messages = snapshotHistory()
+							rs.result = result
+							rs.err = err
+							return
+						}
+						voiceStream = nextVoiceStream
+					}
 				}
 
 				// Notify caller
@@ -989,6 +1395,16 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 						rs.mu.Lock()
 						rs.partialContent.WriteString(textDelta.Text)
 						rs.mu.Unlock()
+						if voiceStream != nil {
+							if err := voiceStream.AddText(textDelta.Text); err != nil {
+								stream.Close()
+								result.StopReason = RunStopError
+								result.Messages = snapshotHistory()
+								rs.result = result
+								rs.err = err
+								return
+							}
+						}
 					}
 				}
 
@@ -1028,6 +1444,14 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			stream.Close()
 			return
 		}
+		if voiceStream != nil && voiceStream.Err() != nil {
+			result.StopReason = RunStopError
+			result.Messages = snapshotHistory()
+			rs.result = result
+			rs.err = voiceStream.Err()
+			stream.Close()
+			return
+		}
 
 		coreResp := stream.Response()
 		stream.Close()
@@ -1050,6 +1474,13 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 
 		// Check custom stop
 		if cfg.stopWhen != nil && cfg.stopWhen(resp) {
+			if err := finalizeTerminalResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotHistory()
+				rs.result = result
+				rs.err = err
+				return
+			}
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopCustom
@@ -1065,6 +1496,13 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 
 		// Check if done
 		if resp.StopReason != types.StopReasonToolUse {
+			if err := finalizeTerminalResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotHistory()
+				rs.result = result
+				rs.err = err
+				return
+			}
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopEndTurn
@@ -1081,6 +1519,13 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		// Process tool calls
 		toolUses := resp.ToolUses()
 		if len(toolUses) == 0 {
+			if err := finalizeTerminalResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotHistory()
+				rs.result = result
+				rs.err = err
+				return
+			}
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopEndTurn
@@ -1096,6 +1541,13 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 
 		// Check tool call limit
 		if cfg.maxToolCalls > 0 && result.ToolCallCount+len(toolUses) > cfg.maxToolCalls {
+			if err := finalizeTerminalResponse(resp); err != nil {
+				result.StopReason = RunStopError
+				result.Messages = snapshotHistory()
+				rs.result = result
+				rs.err = err
+				return
+			}
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
 			result.StopReason = RunStopMaxToolCalls

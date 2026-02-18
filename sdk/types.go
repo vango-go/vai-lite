@@ -96,6 +96,15 @@ type (
 
 	// OutputConfig specifies multimodal output settings.
 	OutputConfig = types.OutputConfig
+
+	// VoiceConfig configures STT/TTS processing.
+	VoiceConfig = types.VoiceConfig
+
+	// VoiceInputConfig configures speech-to-text options.
+	VoiceInputConfig = types.VoiceInputConfig
+
+	// VoiceOutputConfig configures text-to-speech options.
+	VoiceOutputConfig = types.VoiceOutputConfig
 )
 
 // Stop reason constants

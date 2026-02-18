@@ -24,6 +24,7 @@ type MessageRequest struct {
 	// Output configuration
 	OutputFormat *OutputFormat `json:"output_format,omitempty"`
 	Output       *OutputConfig `json:"output,omitempty"`
+	Voice        *VoiceConfig  `json:"voice,omitempty"`
 
 	// Provider-specific extensions
 	Extensions map[string]any `json:"extensions,omitempty"`

@@ -5,13 +5,23 @@ Minimal Vango AI Go SDK focused on:
 - `Messages.Run()` and `Messages.RunStream()`
 - Tool execution + tool helpers (native tool normalization, `MakeTool`, `FuncAsTool`, `ToolSet`, etc.)
 
-This repo is **direct-mode only**: it runs in-process and calls providers directly. There is no proxy server, live mode, or voice/audio pipeline.
+This repo is **direct-mode only**: it runs in-process and calls providers directly. There is no proxy server or live mode.
+
+Cartesia non-live audio mode is supported through request `Voice` config:
+- Audio input blocks can be transcribed via STT before model invocation.
+- Output text can be synthesized to audio chunks/final audio.
 
 ## Install
 
 ```bash
 go get github.com/vango-go/vai-lite/sdk
 ```
+
+## Cartesia setup
+
+Configure Cartesia using either:
+- `CARTESIA_API_KEY`
+- `vai.WithProviderKey("cartesia", "...")`
 
 ## Quickstart (RunStream)
 
@@ -83,6 +93,70 @@ for ev := range stream.Events() {
 	}
 }
 ```
+
+## Cartesia Audio Mode (non-live)
+
+### `Create` with audio input + final audio output
+
+```go
+req := &vai.MessageRequest{
+	Model: "openai/gpt-4o",
+	Messages: []vai.Message{
+		{
+			Role: "user",
+			Content: vai.ContentBlocks(
+				vai.Audio(wavBytes, "audio/wav"),
+			),
+		},
+	},
+	Voice: vai.VoiceFull(
+		"a0e99841-438c-4a64-b679-ae501e7d6091",
+		vai.WithLanguage("en"),
+		vai.WithAudioFormat(vai.AudioFormatWAV),
+	),
+}
+
+resp, err := client.Messages.Create(ctx, req)
+if err != nil {
+	panic(err)
+}
+fmt.Println("Transcript:", resp.UserTranscript())
+if audio := resp.AudioContent(); audio != nil {
+	fmt.Println("Synthesized media type:", audio.Source.MediaType)
+}
+```
+
+### `Stream` with text events + audio side channel
+
+```go
+stream, err := client.Messages.Stream(ctx, &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Tell me a short story.")},
+	},
+	Voice: vai.VoiceOutput("a0e99841-438c-4a64-b679-ae501e7d6091"),
+})
+if err != nil {
+	panic(err)
+}
+defer stream.Close()
+
+go func() {
+	for chunk := range stream.AudioEvents() {
+		play(chunk.Data, chunk.Format)
+	}
+}()
+
+for ev := range stream.Events() {
+	if delta, ok := ev.(vai.ContentBlockDeltaEvent); ok {
+		if t, ok := delta.Delta.(vai.TextDelta); ok {
+			fmt.Print(t.Text)
+		}
+	}
+}
+```
+
+`Run`/`RunStream` remain the primary agent APIs; voice mode is additive when `req.Voice` is set.
 
 ## Structured output
 

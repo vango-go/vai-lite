@@ -353,6 +353,7 @@ func TestRunStreamEvents(t *testing.T) {
 	events := []RunStreamEvent{
 		StepStartEvent{Index: 0},
 		StreamEventWrapper{Event: types.PingEvent{}},
+		AudioChunkEvent{Data: []byte("chunk"), Format: "wav"},
 		ToolCallStartEvent{ID: "call_1", Name: "test", Input: nil},
 		ToolResultEvent{ID: "call_1", Name: "test", Content: nil},
 		StepCompleteEvent{Index: 0, Response: nil},
@@ -363,6 +364,7 @@ func TestRunStreamEvents(t *testing.T) {
 	expectedTypes := []string{
 		"step_start",
 		"stream_event",
+		"audio_chunk",
 		"tool_call_start",
 		"tool_result",
 		"step_complete",

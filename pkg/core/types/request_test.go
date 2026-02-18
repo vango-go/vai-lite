@@ -112,3 +112,42 @@ func TestMessageRequest_WithOutputFormat(t *testing.T) {
 			unmarshaled.OutputFormat.Type, "json_schema")
 	}
 }
+
+func TestMessageRequest_WithVoice(t *testing.T) {
+	req := &MessageRequest{
+		Model: "anthropic/claude-sonnet-4",
+		Messages: []Message{
+			{Role: "user", Content: "Transcribe and respond"},
+		},
+		Voice: &VoiceConfig{
+			Input: &VoiceInputConfig{
+				Model:    "ink-whisper",
+				Language: "en",
+			},
+			Output: &VoiceOutputConfig{
+				Voice:      "voice-123",
+				Format:     VoiceFormatWAV,
+				SampleRate: 24000,
+			},
+		},
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+
+	var unmarshaled MessageRequest
+	if err := json.Unmarshal(data, &unmarshaled); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+	if unmarshaled.Voice == nil {
+		t.Fatalf("Voice config is nil after unmarshal")
+	}
+	if unmarshaled.Voice.Input == nil || unmarshaled.Voice.Input.Model != "ink-whisper" {
+		t.Fatalf("Voice input mismatch: %#v", unmarshaled.Voice.Input)
+	}
+	if unmarshaled.Voice.Output == nil || unmarshaled.Voice.Output.Voice != "voice-123" {
+		t.Fatalf("Voice output mismatch: %#v", unmarshaled.Voice.Output)
+	}
+}

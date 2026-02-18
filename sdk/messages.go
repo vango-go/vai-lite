@@ -2,6 +2,7 @@ package vai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -28,12 +29,66 @@ type Response struct {
 
 // Create sends a non-streaming single-turn message request.
 func (s *MessagesService) Create(ctx context.Context, req *MessageRequest) (*Response, error) {
-	return s.createTurn(ctx, req)
+	if req == nil {
+		return nil, fmt.Errorf("req must not be nil")
+	}
+
+	processedReq, userTranscript, err := s.preprocessVoiceInput(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := s.createTurn(ctx, processedReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if userTranscript != "" {
+		if resp.Metadata == nil {
+			resp.Metadata = make(map[string]any)
+		}
+		resp.Metadata["user_transcript"] = userTranscript
+	}
+
+	if err := s.appendVoiceOutput(ctx, req, resp.MessageResponse); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // Stream sends a streaming single-turn message request.
 func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (*Stream, error) {
-	return s.streamTurn(ctx, req)
+	if req == nil {
+		return nil, fmt.Errorf("req must not be nil")
+	}
+
+	processedReq, userTranscript, err := s.preprocessVoiceInput(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCopy := *processedReq
+	reqCopy.Stream = true
+
+	eventStream, err := s.client.core.StreamMessage(ctx, &reqCopy)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := []streamOption{withStreamUserTranscript(userTranscript)}
+	if req.Voice != nil && req.Voice.Output != nil {
+		if err := s.requireVoicePipeline(); err != nil {
+			return nil, err
+		}
+		ttsCtx, err := s.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice)
+		if err != nil {
+			return nil, fmt.Errorf("initialize voice stream: %w", err)
+		}
+		opts = append(opts, withStreamVoiceOutput(ttsCtx, normalizeStreamingAudioFormat(req.Voice.Output.Format), req.Voice.Output.Voice))
+	}
+
+	return newStreamFromEventStream(eventStream, opts...), nil
 }
 
 // CreateStream is an alias for Stream.
@@ -142,6 +197,95 @@ func (s *MessagesService) streamTurn(ctx context.Context, req *types.MessageRequ
 		return nil, err
 	}
 	return newStreamFromEventStream(eventStream), nil
+}
+
+func (s *MessagesService) preprocessVoiceInput(ctx context.Context, req *MessageRequest) (*MessageRequest, string, error) {
+	if req == nil {
+		return nil, "", fmt.Errorf("req must not be nil")
+	}
+	if req.Voice == nil || req.Voice.Input == nil {
+		return req, "", nil
+	}
+	if err := s.requireVoicePipeline(); err != nil {
+		return nil, "", err
+	}
+
+	processed, transcript, err := s.client.voicePipeline.ProcessInputAudio(ctx, req.Messages, req.Voice)
+	if err != nil {
+		return nil, "", fmt.Errorf("transcribe input audio: %w", err)
+	}
+
+	reqCopy := *req
+	reqCopy.Messages = processed
+	return &reqCopy, transcript, nil
+}
+
+func (s *MessagesService) appendVoiceOutput(ctx context.Context, req *MessageRequest, resp *types.MessageResponse) error {
+	if req == nil || resp == nil || req.Voice == nil || req.Voice.Output == nil {
+		return nil
+	}
+	if err := s.requireVoicePipeline(); err != nil {
+		return err
+	}
+
+	text := strings.TrimSpace(resp.TextContent())
+	if text == "" {
+		return nil
+	}
+
+	audioData, err := s.client.voicePipeline.SynthesizeResponse(ctx, text, req.Voice)
+	if err != nil {
+		return fmt.Errorf("synthesize voice output: %w", err)
+	}
+	if len(audioData) == 0 {
+		return nil
+	}
+
+	transcript := text
+	resp.Content = append(resp.Content, types.AudioBlock{
+		Type: "audio",
+		Source: types.AudioSource{
+			Type:      "base64",
+			MediaType: mediaTypeForAudioFormat(req.Voice.Output.Format),
+			Data:      base64.StdEncoding.EncodeToString(audioData),
+		},
+		Transcript: &transcript,
+	})
+	return nil
+}
+
+func (s *MessagesService) requireVoicePipeline() error {
+	if s.client != nil && s.client.voicePipeline != nil {
+		return nil
+	}
+	return fmt.Errorf("voice mode requested but Cartesia is not configured (set CARTESIA_API_KEY or WithProviderKey(\"cartesia\", ...))")
+}
+
+func normalizeAudioFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "mp3":
+		return "mp3"
+	case "pcm", "raw":
+		return "pcm"
+	default:
+		return "wav"
+	}
+}
+
+func normalizeStreamingAudioFormat(format string) string {
+	// Cartesia WebSocket streaming endpoint emits raw PCM chunks.
+	return "pcm"
+}
+
+func mediaTypeForAudioFormat(format string) string {
+	switch normalizeAudioFormat(format) {
+	case "mp3":
+		return "audio/mpeg"
+	case "pcm":
+		return "audio/pcm"
+	default:
+		return "audio/wav"
+	}
 }
 
 func unmarshalStructuredOutput(text string, dest any) error {

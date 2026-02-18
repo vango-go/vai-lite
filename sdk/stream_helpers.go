@@ -13,6 +13,7 @@ type StreamCallbacks struct {
 	// Content deltas
 	OnTextDelta     func(text string)     // Text content as it streams
 	OnThinkingDelta func(thinking string) // Claude's reasoning process (extended thinking)
+	OnAudioChunk    func(data []byte, format string)
 
 	// Tools (for RunStream)
 	OnToolCallStart func(id, name string, input map[string]any)                    // Tool execution starting
@@ -55,6 +56,12 @@ func ThinkingDeltaFrom(event RunStreamEvent) (string, bool) {
 	return "", false
 }
 
+// AudioChunkFrom extracts streaming audio chunks from run stream events.
+func AudioChunkFrom(event RunStreamEvent) (AudioChunkEvent, bool) {
+	audio, ok := event.(AudioChunkEvent)
+	return audio, ok
+}
+
 // Process consumes the stream with callbacks and returns the accumulated text.
 // This is a convenience method for the common pattern of handling stream events.
 //
@@ -70,6 +77,11 @@ func (rs *RunStream) Process(callbacks StreamCallbacks) (string, error) {
 		switch e := event.(type) {
 		case StreamEventWrapper:
 			rs.processStreamEvent(e.Event, &text, callbacks)
+
+		case AudioChunkEvent:
+			if callbacks.OnAudioChunk != nil {
+				callbacks.OnAudioChunk(e.Data, e.Format)
+			}
 
 		case StepStartEvent:
 			if callbacks.OnStepStart != nil {
