@@ -33,9 +33,17 @@ func (s *scriptedEventStream) Close() error {
 type scriptedProvider struct {
 	name string
 
-	mu      sync.Mutex
-	streams [][]types.StreamEvent
-	calls   int
+	mu sync.Mutex
+
+	streams     [][]types.StreamEvent
+	streamCalls int
+
+	createResponses []*types.MessageResponse
+	createCalls     int
+	createErr       error
+
+	createRequests []*types.MessageRequest
+	streamRequests []*types.MessageRequest
 }
 
 func newScriptedProvider(name string, streams ...[]types.StreamEvent) *scriptedProvider {
@@ -49,19 +57,34 @@ func (p *scriptedProvider) Name() string {
 	return p.name
 }
 
-func (p *scriptedProvider) CreateMessage(context.Context, *types.MessageRequest) (*types.MessageResponse, error) {
-	return nil, fmt.Errorf("CreateMessage not implemented in scriptedProvider")
-}
-
-func (p *scriptedProvider) StreamMessage(context.Context, *types.MessageRequest) (core.EventStream, error) {
+func (p *scriptedProvider) CreateMessage(_ context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.calls >= len(p.streams) {
-		return nil, fmt.Errorf("no scripted stream for call %d", p.calls)
+	p.createRequests = append(p.createRequests, cloneMessageRequest(req))
+
+	if p.createErr != nil {
+		return nil, p.createErr
 	}
-	events := p.streams[p.calls]
-	p.calls++
+	if p.createCalls >= len(p.createResponses) {
+		return nil, fmt.Errorf("no scripted create response for call %d", p.createCalls)
+	}
+	resp := cloneMessageResponse(p.createResponses[p.createCalls])
+	p.createCalls++
+	return resp, nil
+}
+
+func (p *scriptedProvider) StreamMessage(_ context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.streamRequests = append(p.streamRequests, cloneMessageRequest(req))
+
+	if p.streamCalls >= len(p.streams) {
+		return nil, fmt.Errorf("no scripted stream for call %d", p.streamCalls)
+	}
+	events := p.streams[p.streamCalls]
+	p.streamCalls++
 
 	cloned := make([]types.StreamEvent, len(events))
 	copy(cloned, events)
@@ -73,4 +96,32 @@ func (p *scriptedProvider) Capabilities() core.ProviderCapabilities {
 		Tools:         true,
 		ToolStreaming: true,
 	}
+}
+
+func (p *scriptedProvider) withCreateResponses(responses ...*types.MessageResponse) *scriptedProvider {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.createResponses = responses
+	return p
+}
+
+func cloneMessageRequest(req *types.MessageRequest) *types.MessageRequest {
+	if req == nil {
+		return nil
+	}
+	copied := *req
+	return &copied
+}
+
+func cloneMessageResponse(resp *types.MessageResponse) *types.MessageResponse {
+	if resp == nil {
+		return nil
+	}
+	copied := *resp
+	if resp.Content != nil {
+		content := make([]types.ContentBlock, len(resp.Content))
+		copy(content, resp.Content)
+		copied.Content = content
+	}
+	return &copied
 }

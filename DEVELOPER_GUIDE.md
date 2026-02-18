@@ -4,12 +4,18 @@
 
 Most examples use `panic(err)` for brevity. In production code, handle errors explicitly and consider retries/backoff for transient provider failures.
 
-The only “high-level” primitives are:
+The high-level primitives are:
 
-- `Messages.Run()` — blocking tool-loop execution
-- `Messages.RunStream()` — streaming tool-loop execution with interrupts/cancel and deterministic history deltas
+- Single-turn:
+  - `Messages.Create()` — one request/response turn
+  - `Messages.Stream()` / `Messages.CreateStream()` — one streaming turn
+- Agent loop:
+  - `Messages.Run()` — blocking tool-loop execution
+  - `Messages.RunStream()` — streaming tool-loop execution with interrupts/cancel and deterministic history deltas
 
-Everything else is in service of those primitives:
+`Run`/`RunStream` are still the core agent APIs; the single-turn methods are useful when you don’t want loop orchestration.
+
+Everything else is in service of these primitives:
 
 - Multi-provider routing via model strings like `anthropic/claude-sonnet-4`
 - A canonical request/response format based on **Anthropic Messages API** (messages + typed content blocks)
@@ -67,7 +73,7 @@ Key directories you’ll touch:
 
 - `sdk/` — The public SDK you import (`github.com/vango-go/vai-lite/sdk`)
   - `sdk/client.go` — direct-mode client + provider registration
-  - `sdk/messages.go` — `Run` / `RunStream`
+  - `sdk/messages.go` — `Create` / `Stream` / `CreateStream` / `Extract` / `Run` / `RunStream`
   - `sdk/run.go` — the tool loop implementation
   - `sdk/tools.go` — tool builders (`MakeTool`, `ToolSet`, native tool constructors)
   - `sdk/stream.go` — stream wrapper that accumulates final responses
@@ -284,7 +290,10 @@ req.OutputFormat = &vai.OutputFormat{
 
 Important:
 
-- `vai-lite` does not include a dedicated `Extract()` helper; you parse the response text yourself.
+- `Messages.Extract(ctx, req, &dest)` executes the request and unmarshals JSON into your struct.
+- `ExtractTyped[T](ctx, client.Messages, req)` is the generic helper that returns `(T, *Response, error)`.
+- If `req.OutputFormat` is nil, `Extract` injects a JSON schema generated from your destination struct type.
+- If `req.OutputFormat` is already set, `Extract` preserves it.
 - Structured-output behavior is provider/model-specific.
 
 ---
@@ -825,9 +834,9 @@ If you don’t, the model will call the tool and receive the “no handler regis
 
 Recommended: prefer `WithTools(...)` / `WithToolSet(...)` for function tools, since they both register handlers and attach tool definitions for the run/stream.
 
-### 12.3 Structured output requires you to parse
+### 12.3 Structured output helper behavior
 
-`OutputFormat` is supported at the request type level, but `vai-lite` does not include an “Extract into struct” helper. Parse `result.Response.TextContent()` yourself.
+`Messages.Extract(...)` first attempts to parse `Response.TextContent()` as direct JSON. If that fails, it tries common fenced JSON blocks (for example, ```json ... ```). If no parseable JSON is found, it returns an explicit error.
 
 ### 12.4 Native tool behavior depends on the provider
 

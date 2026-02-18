@@ -1,6 +1,7 @@
 # vai-lite
 
 Minimal Vango AI Go SDK focused on:
+- Single-turn methods: `Messages.Create()`, `Messages.Stream()`, `Messages.CreateStream()`
 - `Messages.Run()` and `Messages.RunStream()`
 - Tool execution + tool helpers (native tool normalization, `MakeTool`, `FuncAsTool`, `ToolSet`, etc.)
 
@@ -48,6 +49,68 @@ func main() {
 	}
 	fmt.Println()
 }
+```
+
+## Single-turn calls
+
+```go
+resp, err := client.Messages.Create(ctx, &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Summarize this in one sentence.")},
+	},
+})
+if err != nil {
+	panic(err)
+}
+fmt.Println(resp.TextContent())
+```
+
+```go
+stream, err := client.Messages.CreateStream(ctx, &vai.MessageRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Stream a short haiku.")},
+	},
+})
+if err != nil {
+	panic(err)
+}
+defer stream.Close()
+for ev := range stream.Events() {
+	if delta, ok := vai.TextDeltaFrom(ev); ok {
+		fmt.Print(delta)
+	}
+}
+```
+
+## Structured output
+
+```go
+type Contact struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+var out Contact
+_, err = client.Messages.Extract(ctx, &vai.MessageRequest{
+	Model: "openai/gpt-4o",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Jane Doe <jane@example.com>")},
+	},
+}, &out)
+if err != nil {
+	panic(err)
+}
+```
+
+```go
+contact, _, err := vai.ExtractTyped[Contact](ctx, client.Messages, &vai.MessageRequest{
+	Model: "openai/gpt-4o",
+	Messages: []vai.Message{
+		{Role: "user", Content: vai.Text("Jane Doe <jane@example.com>")},
+	},
+})
 ```
 
 ## History + context management
