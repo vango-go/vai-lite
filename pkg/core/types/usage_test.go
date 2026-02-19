@@ -62,6 +62,42 @@ func TestUsage_Add_WithOptionalFields(t *testing.T) {
 	}
 }
 
+func TestUsage_Add_FallsBackToInputOutputWhenTotalMissing(t *testing.T) {
+	u1 := Usage{
+		InputTokens:  100,
+		OutputTokens: 50,
+		TotalTokens:  0,
+	}
+	u2 := Usage{
+		InputTokens:  200,
+		OutputTokens: 100,
+		TotalTokens:  0,
+	}
+
+	result := u1.Add(u2)
+	if result.TotalTokens != 450 {
+		t.Errorf("TotalTokens = %d, want 450", result.TotalTokens)
+	}
+}
+
+func TestUsage_Add_FallsBackPerSideWhenOneTotalMissing(t *testing.T) {
+	u1 := Usage{
+		InputTokens:  100,
+		OutputTokens: 50,
+		TotalTokens:  150,
+	}
+	u2 := Usage{
+		InputTokens:  40,
+		OutputTokens: 10,
+		TotalTokens:  0,
+	}
+
+	result := u1.Add(u2)
+	if result.TotalTokens != 200 {
+		t.Errorf("TotalTokens = %d, want 200", result.TotalTokens)
+	}
+}
+
 func TestUsage_IsEmpty(t *testing.T) {
 	empty := Usage{}
 	if !empty.IsEmpty() {

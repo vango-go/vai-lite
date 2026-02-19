@@ -375,6 +375,7 @@ What you get back (`RunResult`):
 - `ToolCallCount`: total tool calls across the loop
 - `TurnCount`: total model turns
 - `Usage`: aggregated usage across turns (provider-reported)
+  - If a provider omits `total_tokens`, aggregation defensively computes `total_tokens = input_tokens + output_tokens` for that turn.
 - `StopReason`: why the loop ended
 - `Messages` (optional): snapshot of final message history
 
@@ -467,6 +468,11 @@ There are three layers:
 1. **Whole-run timeout** (`WithRunTimeout`)
 2. **Per-tool timeout** (`WithToolTimeout`)
 3. **Context cancellation** (your `ctx`)
+
+Stop reason mapping:
+
+- `context.DeadlineExceeded` maps to `timeout`
+- `context.Canceled` maps to `cancelled`
 
 Additionally, `RunStream` supports:
 
@@ -697,6 +703,11 @@ Important:
 `ToolCallStartEvent` corresponds to SDK local tool execution start (not raw provider detection), and its `Input` reflects the full parsed tool input object.
 Use wrapped provider events if you need lower-level "tool call is being streamed now" signals.
 
+Provider stream contract note:
+
+- Consumers process any non-nil event even if `Next()` also returns `io.EOF` in the same call.
+- In-tree providers normalize to emit terminal events with `nil` error and return `io.EOF` on the next call.
+
 ### 9.2 Helper extractors
 
 Helpers in `sdk/stream_helpers.go`:
@@ -899,3 +910,9 @@ Even though `vai-lite` normalizes tool *types*, providers still differ in:
 - what events/blocks appear in the stream
 
 Plan for graceful degradation.
+
+### 12.5 Gemini thought signatures in tool loops
+
+Gemini/Gemini OAuth may require `thoughtSignature` on repeated function-call context. The SDK preserves this by carrying it on `tool_use` input as `__thought_signature` in history and translating it back to provider-native `thoughtSignature` on subsequent turns.
+
+If you manage history manually, preserve this field on assistant `tool_use` blocks.

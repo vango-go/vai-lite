@@ -3,6 +3,8 @@ package vai
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,6 +296,7 @@ func TestRunStopReason_Constants(t *testing.T) {
 		RunStopMaxTurns,
 		RunStopMaxTokens,
 		RunStopTimeout,
+		RunStopCancelled,
 		RunStopCustom,
 		RunStopError,
 	}
@@ -432,6 +435,185 @@ func TestRunStream_Close_Idempotent(t *testing.T) {
 	err = rs.Close()
 	if err != nil {
 		t.Errorf("Second Close() returned error: %v", err)
+	}
+}
+
+func TestRunStream_Close_MidStream_ClosesEventsAndFinishes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	provider := &delayedStreamProvider{
+		name:   "test",
+		events: singleTurnTextStream("hello world"),
+		delay:  60 * time.Millisecond,
+	}
+	svc := newMessagesServiceForRunStreamTest(provider)
+
+	stream, err := svc.RunStream(ctx, &MessageRequest{
+		Model:    "test/model",
+		Messages: []Message{{Role: "user", Content: Text("start")}},
+	})
+	if err != nil {
+		t.Fatalf("RunStream() error = %v", err)
+	}
+
+	select {
+	case _, ok := <-stream.Events():
+		if !ok {
+			t.Fatalf("events channel closed before Close()")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for first event")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- stream.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Close() did not return")
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-stream.Events():
+			if !ok {
+				result := stream.Result()
+				if result == nil {
+					t.Fatalf("stream.Result() = nil after Close()")
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatalf("events channel did not close after Close()")
+		}
+	}
+}
+
+func TestRun_ContextCanceled_StopReasonCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	svc := newMessagesServiceForMessagesTest(newScriptedProvider("test").withCreateResponses(textResponse("done")))
+
+	result, err := svc.Run(ctx, &MessageRequest{
+		Model:    "test/model",
+		Messages: []Message{{Role: "user", Content: Text("hello")}},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	if result == nil {
+		t.Fatalf("Run() result is nil")
+	}
+	if result.StopReason != RunStopCancelled {
+		t.Fatalf("stop reason = %q, want %q", result.StopReason, RunStopCancelled)
+	}
+}
+
+func TestRun_ContextDeadlineExceeded_StopReasonTimeout(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	svc := newMessagesServiceForMessagesTest(newScriptedProvider("test").withCreateResponses(textResponse("done")))
+
+	result, err := svc.Run(ctx, &MessageRequest{
+		Model:    "test/model",
+		Messages: []Message{{Role: "user", Content: Text("hello")}},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run() error = %v, want context.DeadlineExceeded", err)
+	}
+	if result == nil {
+		t.Fatalf("Run() result is nil")
+	}
+	if result.StopReason != RunStopTimeout {
+		t.Fatalf("stop reason = %q, want %q", result.StopReason, RunStopTimeout)
+	}
+}
+
+func TestRunStream_ContextCanceled_StopReasonCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	provider := &delayedStreamProvider{
+		name:   "test",
+		events: singleTurnTextStream(strings.Repeat("hello ", 20)),
+		delay:  40 * time.Millisecond,
+	}
+	svc := newMessagesServiceForRunStreamTest(provider)
+
+	stream, err := svc.RunStream(ctx, &MessageRequest{
+		Model:    "test/model",
+		Messages: []Message{{Role: "user", Content: Text("start")}},
+	})
+	if err != nil {
+		t.Fatalf("RunStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	select {
+	case _, ok := <-stream.Events():
+		if !ok {
+			t.Fatalf("events closed before cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for first stream event")
+	}
+
+	cancel()
+
+	for range stream.Events() {
+	}
+
+	if runErr := stream.Err(); !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("stream.Err() = %v, want context.Canceled", runErr)
+	}
+	result := stream.Result()
+	if result == nil {
+		t.Fatalf("expected non-nil result")
+	}
+	if result.StopReason != RunStopCancelled {
+		t.Fatalf("stop reason = %q, want %q", result.StopReason, RunStopCancelled)
+	}
+}
+
+func TestRunStream_ContextDeadlineExceeded_StopReasonTimeout(t *testing.T) {
+	provider := &delayedStreamProvider{
+		name:   "test",
+		events: singleTurnTextStream(strings.Repeat("hello ", 20)),
+		delay:  100 * time.Millisecond,
+	}
+	svc := newMessagesServiceForRunStreamTest(provider)
+
+	stream, err := svc.RunStream(context.Background(), &MessageRequest{
+		Model:    "test/model",
+		Messages: []Message{{Role: "user", Content: Text("start")}},
+	}, WithRunTimeout(20*time.Millisecond))
+	if err != nil {
+		t.Fatalf("RunStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	for range stream.Events() {
+	}
+
+	if runErr := stream.Err(); !errors.Is(runErr, context.DeadlineExceeded) {
+		t.Fatalf("stream.Err() = %v, want context.DeadlineExceeded", runErr)
+	}
+	result := stream.Result()
+	if result == nil {
+		t.Fatalf("expected non-nil result")
+	}
+	if result.StopReason != RunStopTimeout {
+		t.Fatalf("stop reason = %q, want %q", result.StopReason, RunStopTimeout)
 	}
 }
 

@@ -275,7 +275,8 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 func (s *eventStream) buildFinalEvent() (types.StreamEvent, error) {
 	s.finished = true
 
-	// Return message_delta with stop reason and usage
+	// Return message_delta with stop reason and usage.
+	// Next() call after this returns io.EOF.
 	return types.MessageDeltaEvent{
 		Type: "message_delta",
 		Delta: struct {
@@ -288,7 +289,7 @@ func (s *eventStream) buildFinalEvent() (types.StreamEvent, error) {
 			OutputTokens: s.accumulator.outputTokens,
 			TotalTokens:  s.accumulator.inputTokens + s.accumulator.outputTokens,
 		},
-	}, io.EOF
+	}, nil
 }
 
 // Close releases resources associated with the stream.

@@ -167,8 +167,8 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 streamLoop:
 	for {
 		event, err := s.eventStream.Next()
-		if err != nil {
-			// io.EOF means normal end
+		if event == nil && err != nil {
+			// io.EOF means normal end.
 			s.err = err
 			break
 		}
@@ -226,6 +226,13 @@ streamLoop:
 		case events <- event:
 		case <-s.done:
 			return
+		}
+
+		// Some providers may return a terminal event with io.EOF in the same Next() call.
+		// Preserve the event, then terminate the loop.
+		if err != nil {
+			s.err = err
+			break
 		}
 	}
 

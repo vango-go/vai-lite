@@ -25,6 +25,7 @@ type Provider interface {
 // EventStream is an iterator over streaming events.
 type EventStream interface {
 	// Next returns the next event. Returns nil, io.EOF when done.
+	// If both an event and io.EOF are returned, consumers should process the event first.
 	Next() (types.StreamEvent, error)
 
 	// Close releases resources.

@@ -193,14 +193,7 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 						toolIndex = partIdx + 1
 					}
 
-					// Prepare input with thought signature if present
-					input := acc.Args
-					if input == nil {
-						input = make(map[string]any)
-					}
-					if acc.ThoughtSignature != "" {
-						input["__thought_signature"] = acc.ThoughtSignature
-					}
+					input := streamToolInput(acc.Args, acc.ThoughtSignature)
 
 					// Queue the tool use start event
 					s.pending = append(s.pending, types.ContentBlockStartEvent{
@@ -215,8 +208,8 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 					})
 
 					// Queue the input delta
-					if len(acc.Args) > 0 {
-						argsJSON, _ := json.Marshal(acc.Args)
+					if len(input) > 0 {
+						argsJSON, _ := json.Marshal(input)
 						s.pending = append(s.pending, types.ContentBlockDeltaEvent{
 							Type:  "content_block_delta",
 							Index: toolIndex,
@@ -237,6 +230,20 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 			return event, nil
 		}
 	}
+}
+
+func streamToolInput(args map[string]any, thoughtSignature string) map[string]any {
+	if args == nil && thoughtSignature == "" {
+		return nil
+	}
+	out := make(map[string]any, len(args)+1)
+	for k, v := range args {
+		out[k] = v
+	}
+	if thoughtSignature != "" {
+		out["__thought_signature"] = thoughtSignature
+	}
+	return out
 }
 
 // buildFinalEvent builds the final events when stream ends.

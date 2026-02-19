@@ -232,16 +232,10 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 						toolIndex = partIdx + 1
 					}
 
-					input := acc.Args
-					if input == nil {
-						input = make(map[string]any)
-					}
-					if acc.ThoughtSignature != "" {
-						input["__thought_signature"] = acc.ThoughtSignature
-					}
+					input := streamToolInput(acc.Args, acc.ThoughtSignature)
 
-					if len(acc.Args) > 0 {
-						argsJSON, _ := json.Marshal(acc.Args)
+					if len(input) > 0 {
+						argsJSON, _ := json.Marshal(input)
 						s.pending = append(s.pending, types.ContentBlockDeltaEvent{
 							Type:  "content_block_delta",
 							Index: toolIndex,
@@ -323,13 +317,7 @@ func (s *eventStream) processParts(parts []geminiPart) {
 					toolIndex = partIdx + 1
 				}
 
-				input := acc.Args
-				if input == nil {
-					input = make(map[string]any)
-				}
-				if acc.ThoughtSignature != "" {
-					input["__thought_signature"] = acc.ThoughtSignature
-				}
+				input := streamToolInput(acc.Args, acc.ThoughtSignature)
 
 				s.pending = append(s.pending, types.ContentBlockStartEvent{
 					Type:  "content_block_start",
@@ -342,8 +330,8 @@ func (s *eventStream) processParts(parts []geminiPart) {
 					},
 				})
 
-				if len(acc.Args) > 0 {
-					argsJSON, _ := json.Marshal(acc.Args)
+				if len(input) > 0 {
+					argsJSON, _ := json.Marshal(input)
 					s.pending = append(s.pending, types.ContentBlockDeltaEvent{
 						Type:  "content_block_delta",
 						Index: toolIndex,
@@ -358,10 +346,26 @@ func (s *eventStream) processParts(parts []geminiPart) {
 	}
 }
 
+func streamToolInput(args map[string]any, thoughtSignature string) map[string]any {
+	if args == nil && thoughtSignature == "" {
+		return nil
+	}
+	out := make(map[string]any, len(args)+1)
+	for k, v := range args {
+		out[k] = v
+	}
+	if thoughtSignature != "" {
+		out["__thought_signature"] = thoughtSignature
+	}
+	return out
+}
+
 // buildFinalEvent builds the final events when stream ends.
 func (s *eventStream) buildFinalEvent() (types.StreamEvent, error) {
 	s.finished = true
 
+	// Return message_delta with stop reason and usage.
+	// Next() call after this returns io.EOF.
 	return types.MessageDeltaEvent{
 		Type: "message_delta",
 		Delta: struct {
@@ -374,7 +378,7 @@ func (s *eventStream) buildFinalEvent() (types.StreamEvent, error) {
 			OutputTokens: s.accumulator.outputTokens,
 			TotalTokens:  s.accumulator.inputTokens + s.accumulator.outputTokens,
 		},
-	}, io.EOF
+	}, nil
 }
 
 // Close releases resources associated with the stream.

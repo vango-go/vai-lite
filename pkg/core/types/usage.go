@@ -12,10 +12,19 @@ type Usage struct {
 
 // Add combines two Usage objects (for aggregation).
 func (u Usage) Add(other Usage) Usage {
+	leftTotal := u.TotalTokens
+	if leftTotal == 0 && (u.InputTokens > 0 || u.OutputTokens > 0) {
+		leftTotal = u.InputTokens + u.OutputTokens
+	}
+	rightTotal := other.TotalTokens
+	if rightTotal == 0 && (other.InputTokens > 0 || other.OutputTokens > 0) {
+		rightTotal = other.InputTokens + other.OutputTokens
+	}
+
 	result := Usage{
 		InputTokens:  u.InputTokens + other.InputTokens,
 		OutputTokens: u.OutputTokens + other.OutputTokens,
-		TotalTokens:  u.TotalTokens + other.TotalTokens,
+		TotalTokens:  leftTotal + rightTotal,
 	}
 
 	// Handle optional cache tokens

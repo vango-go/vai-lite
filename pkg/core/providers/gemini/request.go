@@ -290,18 +290,19 @@ func (p *Provider) translateContentBlocks(blocks []types.ContentBlock) []geminiP
 
 		case types.ToolUseBlock:
 			// Tool use from assistant message - include function call
+			args := cloneInputMap(b.Input)
 			part := geminiPart{
 				FunctionCall: &geminiFunctionCall{
 					Name: b.Name,
-					Args: b.Input,
+					Args: args,
 				},
 			}
 			// Check for thought signature in metadata (for Gemini 3)
-			if b.Input != nil {
-				if sig, ok := b.Input["__thought_signature"].(string); ok {
+			if args != nil {
+				if sig, ok := args["__thought_signature"].(string); ok {
 					part.ThoughtSignature = sig
 					// Remove from args
-					delete(b.Input, "__thought_signature")
+					delete(args, "__thought_signature")
 				}
 			}
 			parts = append(parts, part)
@@ -314,6 +315,17 @@ func (p *Provider) translateContentBlocks(blocks []types.ContentBlock) []geminiP
 	}
 
 	return parts
+}
+
+func cloneInputMap(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	return out
 }
 
 // translateTools converts Vango tools to Gemini format.

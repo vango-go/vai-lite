@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -67,6 +68,17 @@ type ToolExecutionResult struct {
 
 // ToolHandler is a function that handles a tool call.
 type ToolHandler func(ctx context.Context, input json.RawMessage) (any, error)
+
+func stopReasonFromContextErr(err error) (RunStopReason, bool) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return RunStopCancelled, true
+	case errors.Is(err, context.DeadlineExceeded):
+		return RunStopTimeout, true
+	default:
+		return "", false
+	}
+}
 
 // runConfig holds configuration for the Run loop.
 type runConfig struct {
@@ -318,7 +330,11 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 		// Check timeout
 		select {
 		case <-ctx.Done():
-			result.StopReason = RunStopTimeout
+			if stopReason, ok := stopReasonFromContextErr(ctx.Err()); ok {
+				result.StopReason = stopReason
+			} else {
+				result.StopReason = RunStopError
+			}
 			result.Messages = snapshotMessages()
 			if cfg.onStop != nil {
 				cfg.onStop(result)
@@ -386,7 +402,11 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 		stepDuration := time.Since(stepStart).Milliseconds()
 
 		if err != nil {
-			result.StopReason = RunStopError
+			if stopReason, ok := stopReasonFromContextErr(err); ok {
+				result.StopReason = stopReason
+			} else {
+				result.StopReason = RunStopError
+			}
 			result.Messages = snapshotMessages()
 			if cfg.onStop != nil {
 				cfg.onStop(result)
@@ -692,6 +712,7 @@ type RunStream struct {
 	messages       []types.Message
 	currentStream  *Stream
 	partialContent strings.Builder
+	cancel         context.CancelFunc
 
 	// Channels
 	events    chan RunStreamEvent
@@ -699,10 +720,10 @@ type RunStream struct {
 	done      chan struct{}
 
 	// Result state
-	result    *RunResult
-	err       error
-	closed    atomic.Bool
-	closeOnce sync.Once
+	result     *RunResult
+	err        error
+	closed     atomic.Bool
+	finishOnce sync.Once
 }
 
 // RunStreamEvent is an event from the RunStream.
@@ -1041,30 +1062,30 @@ func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest
 	}
 
 	if prepErr != nil {
-		go func() {
-			defer rs.closeOnce.Do(func() {
-				close(rs.events)
-				close(rs.done)
-			})
-			rs.err = prepErr
-			rs.result = &RunResult{
-				Steps:      make([]RunStep, 0),
-				StopReason: RunStopError,
-				Messages:   initialMessages,
-			}
-		}()
+		rs.err = prepErr
+		rs.result = &RunResult{
+			Steps:      make([]RunStep, 0),
+			StopReason: RunStopError,
+			Messages:   initialMessages,
+		}
+		rs.finish()
 		return rs
 	}
 
-	go rs.run(ctx, s, workingReq, cfg, userTranscript)
+	runCtx, cancel := context.WithCancel(ctx)
+	rs.mu.Lock()
+	rs.cancel = cancel
+	rs.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		rs.run(runCtx, s, workingReq, cfg, userTranscript)
+	}()
 	return rs
 }
 
 func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig, userTranscript string) {
-	defer rs.closeOnce.Do(func() {
-		close(rs.events)
-		close(rs.done)
-	})
+	defer rs.finish()
 
 	result := &RunResult{
 		Steps: make([]RunStep, 0),
@@ -1190,7 +1211,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 	for {
 		select {
 		case <-ctx.Done():
-			result.StopReason = RunStopTimeout
+			if stopReason, ok := stopReasonFromContextErr(ctx.Err()); ok {
+				result.StopReason = stopReason
+			} else {
+				result.StopReason = RunStopError
+			}
 			result.Messages = snapshotHistory()
 			rs.result = result
 			rs.err = ctx.Err()
@@ -1257,7 +1282,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		// Stream this turn
 		stream, err := svc.streamTurn(ctx, turnReq)
 		if err != nil {
-			result.StopReason = RunStopError
+			if stopReason, ok := stopReasonFromContextErr(err); ok {
+				result.StopReason = stopReason
+			} else {
+				result.StopReason = RunStopError
+			}
 			result.Messages = snapshotHistory()
 			rs.result = result
 			rs.err = err
@@ -1276,7 +1305,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			select {
 			case <-ctx.Done():
 				stream.Close()
-				result.StopReason = RunStopTimeout
+				if stopReason, ok := stopReasonFromContextErr(ctx.Err()); ok {
+					result.StopReason = stopReason
+				} else {
+					result.StopReason = RunStopError
+				}
 				result.Messages = snapshotHistory()
 				rs.result = result
 				rs.err = ctx.Err()
@@ -1437,7 +1470,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 
 		// EOF is normal stream termination, not an error
 		if streamErr := stream.Err(); streamErr != nil && streamErr != io.EOF {
-			result.StopReason = RunStopError
+			if stopReason, ok := stopReasonFromContextErr(streamErr); ok {
+				result.StopReason = stopReason
+			} else {
+				result.StopReason = RunStopError
+			}
 			result.Messages = snapshotHistory()
 			rs.result = result
 			rs.err = streamErr
@@ -1445,10 +1482,15 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			return
 		}
 		if voiceStream != nil && voiceStream.Err() != nil {
-			result.StopReason = RunStopError
+			voiceErr := voiceStream.Err()
+			if stopReason, ok := stopReasonFromContextErr(voiceErr); ok {
+				result.StopReason = stopReason
+			} else {
+				result.StopReason = RunStopError
+			}
 			result.Messages = snapshotHistory()
 			rs.result = result
-			rs.err = voiceStream.Err()
+			rs.err = voiceErr
 			stream.Close()
 			return
 		}
@@ -1605,9 +1647,22 @@ func (rs *RunStream) send(event RunStreamEvent) {
 		return
 	}
 	select {
+	case <-rs.done:
+		return
+	default:
+	}
+	select {
 	case rs.events <- event:
 	case <-rs.done:
 	}
+}
+
+func (rs *RunStream) finish() {
+	rs.finishOnce.Do(func() {
+		// Close done before events so senders can cheaply bail out before touching events.
+		close(rs.done)
+		close(rs.events)
+	})
 }
 
 // Events returns the channel of run stream events.
@@ -1630,13 +1685,33 @@ func (rs *RunStream) Err() error {
 // Close stops the run stream.
 func (rs *RunStream) Close() error {
 	if rs.closed.Swap(true) {
+		rs.mu.RLock()
+		cancel := rs.cancel
+		rs.mu.RUnlock()
+		if cancel != nil {
+			<-rs.done
+		}
 		return nil
 	}
 
-	// Only close done channel once; the closeOnce ensures this
-	// Note: done might already be closed by run() goroutine via closeOnce
-	rs.closeOnce.Do(func() {
-		close(rs.done)
-	})
+	rs.mu.RLock()
+	cancel := rs.cancel
+	stream := rs.currentStream
+	rs.mu.RUnlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if stream != nil {
+		_ = stream.Close()
+	}
+
+	// Synthetic test streams may not have an owner goroutine; finish directly in that case.
+	if cancel == nil {
+		rs.finish()
+		return nil
+	}
+
+	<-rs.done
 	return nil
 }
