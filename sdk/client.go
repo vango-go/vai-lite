@@ -16,6 +16,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/providers/groq"
 	"github.com/vango-go/vai-lite/pkg/core/providers/oai_resp"
 	"github.com/vango-go/vai-lite/pkg/core/providers/openai"
+	"github.com/vango-go/vai-lite/pkg/core/providers/openrouter"
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
@@ -71,6 +72,11 @@ func (c *Client) initProviders() {
 	// Cerebras
 	if key := c.core.GetAPIKey("cerebras"); key != "" {
 		c.core.RegisterProvider(newCerebrasAdapter(cerebras.New(key)))
+	}
+
+	// OpenRouter
+	if key := c.core.GetAPIKey("openrouter"); key != "" {
+		c.core.RegisterProvider(newOpenRouterAdapter(openrouter.New(key)))
 	}
 
 	// Gemini OAuth (optional; uses ~/.config/vango/gemini-oauth-credentials.json)

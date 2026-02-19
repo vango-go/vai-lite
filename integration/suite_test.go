@@ -128,6 +128,24 @@ var providerConfigs = []providerConfig{
 		Extensions:               []string{"reasoning_effort", "include_reasoning"},
 	},
 	{
+		Name:                     "openrouter",
+		Model:                    "openrouter/z-ai/glm-4.7",
+		KeyName:                  "openrouter",
+		RequireKey:               requireOpenRouterKey,
+		SupportsVision:           false,
+		SupportsAudioInput:       false,
+		SupportsVideoInput:       false,
+		SupportsAudioOutput:      false,
+		SupportsTools:            true,
+		SupportsToolStreaming:    true,
+		SupportsThinking:         false,
+		SupportsStructuredOutput: false,
+		SupportsStopSequences:    true,
+		SupportsTemperature:      true,
+		NativeTools:              []string{},
+		Extensions:               []string{},
+	},
+	{
 		Name:                     "gemini-oauth",
 		Model:                    "gemini-oauth/gemini-3-pro-preview",
 		KeyName:                  "gemini-oauth",
@@ -325,6 +343,12 @@ func requireGeminiKey(t *testing.T) {
 func requireGroqKey(t *testing.T) {
 	if os.Getenv("GROQ_API_KEY") == "" {
 		t.Skip("GROQ_API_KEY not set")
+	}
+}
+
+func requireOpenRouterKey(t *testing.T) {
+	if os.Getenv("OPENROUTER_API_KEY") == "" {
+		t.Skip("OPENROUTER_API_KEY not set")
 	}
 }
 

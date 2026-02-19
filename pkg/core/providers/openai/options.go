@@ -82,12 +82,17 @@ func WithStreamIncludeUsage(include bool) Option {
 // WithAuth sets custom auth header behavior.
 func WithAuth(auth AuthConfig) Option {
 	return func(p *Provider) {
-		headerProvided := auth.Header != ""
 		if auth.Header == "" {
 			auth.Header = p.auth.Header
 		}
-		if auth.Prefix == "" && auth.Value == "" && !headerProvided {
-			auth.Prefix = p.auth.Prefix
+
+		// If caller does not provide an explicit value/prefix:
+		// - preserve default prefix for Authorization-like headers
+		// - use raw API key for non-Authorization headers (common X-API-Key style)
+		if auth.Value == "" && auth.Prefix == "" {
+			if strings.EqualFold(auth.Header, p.auth.Header) {
+				auth.Prefix = p.auth.Prefix
+			}
 		}
 		p.auth = auth
 	}

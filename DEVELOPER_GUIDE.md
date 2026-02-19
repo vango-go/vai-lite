@@ -124,6 +124,7 @@ The core engine loads keys from environment variables in the form:
 - `OPENAI_API_KEY`
 - `GROQ_API_KEY`
 - `CEREBRAS_API_KEY`
+- `OPENROUTER_API_KEY`
 - `GEMINI_API_KEY` (also accepts `GOOGLE_API_KEY` as a fallback)
 - `CARTESIA_API_KEY` (for non-live STT/TTS voice mode)
 
@@ -146,7 +147,7 @@ client := vai.NewClient(
 
 ### 3.1 OpenAI-Compatible Chat Providers
 
-`openai`, `groq`, and `cerebras` all use the same Chat Completions translation layer in `pkg/core/providers/openai`.
+`openai`, `groq`, `cerebras`, and `openrouter` all use the same Chat Completions translation layer in `pkg/core/providers/openai`.
 Wrappers differ primarily by base URL, capabilities, and compatibility options.
 
 OpenAI provider options used by compatibility wrappers:
@@ -161,6 +162,7 @@ Current defaults in-tree:
 
 - `openai` uses `max_completion_tokens` and emits `openai/<model>` in normalized responses.
 - `groq` and `cerebras` use `max_tokens` and emit `groq/<model>` / `cerebras/<model>`.
+- `openrouter` uses `max_tokens`, emits `openrouter/<model>`, and supports optional attribution headers via `openrouter.WithSiteURL(...)` / `openrouter.WithSiteName(...)`.
 
 ### Gemini OAuth (optional)
 
@@ -213,6 +215,7 @@ Examples:
 - `openai/gpt-4o`
 - `oai-resp/gpt-4o` (OpenAI Responses API provider in this repo; name is provider-specific)
 - `groq/llama-3.3-70b`
+- `openrouter/openai/gpt-4o`
 - `gemini/gemini-2.0-flash`
 - `gemini-oauth/gemini-2.0-flash`
 - `cerebras/llama-3.1-8b`
@@ -905,7 +908,7 @@ Integration tests support per-provider targeting:
 VAI_INTEGRATION_PROVIDERS=gemini-oauth go test -tags=integration ./integration -count=1 -timeout=45m -v
 ```
 
-`VAI_INTEGRATION_PROVIDERS` accepts a comma-separated provider list (`anthropic,oai-resp,groq,gemini,gemini-oauth`) or `all`.
+`VAI_INTEGRATION_PROVIDERS` accepts a comma-separated provider list (`anthropic,oai-resp,groq,openrouter,gemini,gemini-oauth`) or `all`.
 
 Reliability controls for capacity-prone providers:
 

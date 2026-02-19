@@ -68,6 +68,40 @@ func TestCreateMessage_AppliesPathAuthAndExtraHeaders(t *testing.T) {
 	}
 }
 
+func TestCreateMessage_WithAuthAuthorizationKeepsBearerPrefix(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"chatcmpl_1",
+			"model":"gpt-4o-mini",
+			"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer server.Close()
+
+	p := New(
+		"test-key",
+		WithBaseURL(server.URL),
+		WithAuth(AuthConfig{Header: "Authorization"}),
+	)
+
+	_, err := p.CreateMessage(t.Context(), &types.MessageRequest{
+		Model: "gpt-4o-mini",
+		Messages: []types.Message{
+			{Role: "user", Content: "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization header = %q, want Bearer test-key", gotAuth)
+	}
+}
+
 func TestStreamMessage_StreamIncludeUsageOption(t *testing.T) {
 	t.Run("default true includes stream_options", func(t *testing.T) {
 		var gotBody map[string]any

@@ -11,6 +11,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/providers/groq"
 	"github.com/vango-go/vai-lite/pkg/core/providers/oai_resp"
 	"github.com/vango-go/vai-lite/pkg/core/providers/openai"
+	"github.com/vango-go/vai-lite/pkg/core/providers/openrouter"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
@@ -214,6 +215,46 @@ func (a *cerebrasAdapter) Capabilities() core.ProviderCapabilities {
 	}
 }
 
+// openrouterAdapter wraps the openrouter.Provider to implement core.Provider.
+type openrouterAdapter struct {
+	provider *openrouter.Provider
+}
+
+func newOpenRouterAdapter(p *openrouter.Provider) *openrouterAdapter {
+	return &openrouterAdapter{provider: p}
+}
+
+func (a *openrouterAdapter) Name() string {
+	return a.provider.Name()
+}
+
+func (a *openrouterAdapter) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	return a.provider.CreateMessage(ctx, req)
+}
+
+func (a *openrouterAdapter) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	stream, err := a.provider.StreamMessage(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return &openrouterEventStreamAdapter{stream: stream}, nil
+}
+
+func (a *openrouterAdapter) Capabilities() core.ProviderCapabilities {
+	caps := a.provider.Capabilities()
+	return core.ProviderCapabilities{
+		Vision:           caps.Vision,
+		AudioInput:       caps.AudioInput,
+		AudioOutput:      caps.AudioOutput,
+		Video:            caps.Video,
+		Tools:            caps.Tools,
+		ToolStreaming:    caps.ToolStreaming,
+		Thinking:         caps.Thinking,
+		StructuredOutput: caps.StructuredOutput,
+		NativeTools:      caps.NativeTools,
+	}
+}
+
 // geminiAdapter wraps the gemini.Provider to implement core.Provider.
 type geminiAdapter struct {
 	provider *gemini.Provider
@@ -303,6 +344,19 @@ func (a *cerebrasEventStreamAdapter) Next() (types.StreamEvent, error) {
 }
 
 func (a *cerebrasEventStreamAdapter) Close() error {
+	return a.stream.Close()
+}
+
+// openrouterEventStreamAdapter wraps openrouter.EventStream to implement core.EventStream.
+type openrouterEventStreamAdapter struct {
+	stream openrouter.EventStream
+}
+
+func (a *openrouterEventStreamAdapter) Next() (types.StreamEvent, error) {
+	return a.stream.Next()
+}
+
+func (a *openrouterEventStreamAdapter) Close() error {
 	return a.stream.Close()
 }
 
