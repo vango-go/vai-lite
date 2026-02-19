@@ -823,9 +823,17 @@ func (rs *RunStream) Cancel() error {
 
 	select {
 	case rs.interrupt <- req:
-		return <-req.result
+		// Interrupt was sent; wait for the run goroutine to process it.
+		// Also select on rs.done in case the run goroutine exits without
+		// reading the interrupt (e.g., it was between streamLoop and finish).
+		select {
+		case err := <-req.result:
+			return err
+		case <-rs.done:
+			return nil
+		}
 	case <-rs.done:
-		return nil // Closed while we were waiting
+		return nil // Closed while we were waiting to send
 	}
 }
 
@@ -848,7 +856,15 @@ func (rs *RunStream) Interrupt(msg types.Message, behavior InterruptBehavior) er
 
 	select {
 	case rs.interrupt <- req:
-		return <-req.result
+		// Interrupt was sent; wait for the run goroutine to process it.
+		// Also select on rs.done in case the run goroutine exits without
+		// reading the interrupt (e.g., it was between streamLoop and finish).
+		select {
+		case err := <-req.result:
+			return err
+		case <-rs.done:
+			return fmt.Errorf("stream closed before interrupt was processed")
+		}
 	case <-rs.done:
 		return fmt.Errorf("stream already closed")
 	}
