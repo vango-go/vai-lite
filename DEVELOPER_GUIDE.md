@@ -65,6 +65,8 @@ This repo intentionally **does not** include:
   - [9.4 `Messages.Stream` audio side channel](#94-messagesstream-audio-side-channel)
 - [10. Errors and Observability](#10-errors-and-observability)
 - [11. Testing and Local Dev](#11-testing-and-local-dev)
+  - [11.1 Integration provider filtering + reliability controls](#111-integration-provider-filtering--reliability-controls)
+  - [11.2 CI release gate workflow](#112-ci-release-gate-workflow)
 - [12. Gotchas and Design Notes](#12-gotchas-and-design-notes)
 
 ---
@@ -856,6 +858,8 @@ client := vai.NewClient(vai.WithLogger(myLogger))
 
 Providers may log debug messages in some cases (e.g. gemini oauth init failure).
 
+For production SLOs, fallback policy, incident handling, and release criteria, see `PRODUCTION_OPERATIONS.md`.
+
 ---
 
 ## 11. Testing and Local Dev
@@ -873,6 +877,35 @@ GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./...
 ```bash
 gofmt -w $(find pkg sdk -name '*.go')
 ```
+
+### 11.1 Integration provider filtering + reliability controls
+
+Integration tests support per-provider targeting:
+
+```bash
+VAI_INTEGRATION_PROVIDERS=gemini-oauth go test -tags=integration ./integration -count=1 -timeout=45m -v
+```
+
+`VAI_INTEGRATION_PROVIDERS` accepts a comma-separated provider list (`anthropic,oai-resp,groq,gemini,gemini-oauth`) or `all`.
+
+Reliability controls for capacity-prone providers:
+
+- `VAI_INTEGRATION_RETRY_ATTEMPTS`
+- `VAI_INTEGRATION_GEMINI_RETRY_ATTEMPTS`
+- `VAI_INTEGRATION_GEMINI_OAUTH_RETRY_ATTEMPTS`
+- `VAI_INTEGRATION_RETRY_BASE_MS`
+- `VAI_INTEGRATION_RETRY_MAX_MS`
+- `VAI_INTEGRATION_GEMINI_MIN_GAP_MS`
+- `VAI_INTEGRATION_GEMINI_OAUTH_MIN_GAP_MS`
+- `VAI_INTEGRATION_DIAGNOSTICS=1` (structured retry/classification logs)
+
+### 11.2 CI release gate workflow
+
+The provider matrix release gate is defined in:
+
+- `.github/workflows/integration-release-gate.yml`
+
+It runs tagged integration tests per provider, enforces credential presence, and uploads JSON + summary artifacts for deterministic triage.
 
 ---
 

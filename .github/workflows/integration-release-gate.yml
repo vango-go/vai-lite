@@ -1,0 +1,98 @@
+name: Integration Release Gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
+  push:
+    tags:
+      - "v*"
+    branches:
+      - "release/**"
+
+jobs:
+  integration-matrix:
+    name: integration (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [anthropic, oai-resp, groq, gemini, gemini-oauth]
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_OAUTH_PROJECT_ID: ${{ secrets.GEMINI_OAUTH_PROJECT_ID }}
+      VAI_INTEGRATION_PROVIDERS: ${{ matrix.provider }}
+      VAI_INTEGRATION_GEMINI_RETRY_ATTEMPTS: "3"
+      VAI_INTEGRATION_GEMINI_OAUTH_RETRY_ATTEMPTS: "4"
+      VAI_INTEGRATION_GEMINI_MIN_GAP_MS: "750"
+      VAI_INTEGRATION_GEMINI_OAUTH_MIN_GAP_MS: "2500"
+      VAI_INTEGRATION_RETRY_BASE_MS: "750"
+      VAI_INTEGRATION_RETRY_MAX_MS: "10000"
+      VAI_INTEGRATION_DIAGNOSTICS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate provider credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.provider }}" in
+            anthropic)
+              test -n "${ANTHROPIC_API_KEY}" || { echo "Missing ANTHROPIC_API_KEY"; exit 1; }
+              ;;
+            oai-resp)
+              test -n "${OPENAI_API_KEY}" || { echo "Missing OPENAI_API_KEY"; exit 1; }
+              ;;
+            groq)
+              test -n "${GROQ_API_KEY}" || { echo "Missing GROQ_API_KEY"; exit 1; }
+              ;;
+            gemini)
+              test -n "${GEMINI_API_KEY}" || { echo "Missing GEMINI_API_KEY"; exit 1; }
+              ;;
+            gemini-oauth)
+              test -n "${GEMINI_OAUTH_PROJECT_ID}" || { echo "Missing GEMINI_OAUTH_PROJECT_ID"; exit 1; }
+              ;;
+          esac
+
+      - name: Run integration suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          LOG_JSON="artifacts/integration-${{ matrix.provider }}.jsonl"
+          LOG_TXT="artifacts/integration-${{ matrix.provider }}.log"
+
+          set +e
+          go test -tags=integration ./integration -count=1 -timeout=60m -json 2>&1 | tee "${LOG_JSON}" > "${LOG_TXT}"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          pass_count=$(grep -c '"Action":"pass","Test":"' "${LOG_JSON}" || true)
+          fail_count=$(grep -c '"Action":"fail","Test":"' "${LOG_JSON}" || true)
+          skip_count=$(grep -c '"Action":"skip","Test":"' "${LOG_JSON}" || true)
+          {
+            echo "provider=${{ matrix.provider }}"
+            echo "pass_count=${pass_count}"
+            echo "fail_count=${fail_count}"
+            echo "skip_count=${skip_count}"
+          } > "artifacts/summary-${{ matrix.provider }}.txt"
+
+          exit ${status}
+
+      - name: Upload integration artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-${{ matrix.provider }}
+          path: artifacts/

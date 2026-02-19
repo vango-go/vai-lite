@@ -359,6 +359,9 @@ func requireAllVoiceKeys(t *testing.T) {
 
 func forEachProvider(t *testing.T, fn func(t *testing.T, p providerConfig)) {
 	for _, provider := range providerConfigs {
+		if !providerSelected(provider.Name) {
+			continue
+		}
 		provider := provider
 		t.Run(provider.Name, func(t *testing.T) {
 			provider.RequireKey(t)
@@ -372,12 +375,28 @@ func forEachProviderWith(t *testing.T, predicate func(providerConfig) bool, fn f
 		if !predicate(provider) {
 			continue
 		}
+		if !providerSelected(provider.Name) {
+			continue
+		}
 		provider := provider
 		t.Run(provider.Name, func(t *testing.T) {
 			provider.RequireKey(t)
 			fn(t, provider)
 		})
 	}
+}
+
+func providerSelected(name string) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv("VAI_INTEGRATION_PROVIDERS")))
+	if raw == "" || raw == "all" {
+		return true
+	}
+	for _, part := range strings.Split(raw, ",") {
+		if strings.TrimSpace(part) == strings.ToLower(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Test context helpers ---

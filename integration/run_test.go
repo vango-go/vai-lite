@@ -17,8 +17,6 @@ func TestMessages_Run_BasicToolExecution(t *testing.T) {
 	forEachProviderWith(t, func(provider providerConfig) bool {
 		return provider.SupportsTools
 	}, func(t *testing.T, provider providerConfig) {
-		ctx := testContext(t, 60*time.Second)
-
 		weatherTool := vai.MakeTool("get_weather", "Get weather for a location",
 			func(ctx context.Context, input struct {
 				Location string `json:"location"`
@@ -27,16 +25,18 @@ func TestMessages_Run_BasicToolExecution(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("What's the weather in San Francisco?")},
+		result, err := runWithProviderRetry(t, provider, 60*time.Second, "Run_BasicToolExecution", func(ctx context.Context) (*vai.RunResult, error) {
+			return testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("What's the weather in San Francisco?")},
+				},
+				MaxTokens: 8000,
 			},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(weatherTool),
-			vai.WithMaxToolCalls(1),
-		)
+				vai.WithTools(weatherTool),
+				vai.WithMaxToolCalls(1),
+			)
+		})
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -50,12 +50,8 @@ func TestMessages_Run_BasicToolExecution(t *testing.T) {
 		if result.StopReason != vai.RunStopEndTurn && result.StopReason != vai.RunStopMaxToolCalls {
 			t.Errorf("unexpected stop reason: %q", result.StopReason)
 		}
-
-		// Response should mention the weather
-		text := result.Response.TextContent()
-		if !strings.Contains(text, "72") && !strings.Contains(text, "sunny") {
-			t.Logf("Response: %s", text)
-			t.Log("warning: expected weather info in response")
+		if !toolResultsContainText(result, "sunny") {
+			t.Fatalf("expected tool result payload to include weather text, got result=%+v", result.Steps)
 		}
 	})
 }
@@ -64,8 +60,6 @@ func TestMessages_Run_MultipleToolCalls(t *testing.T) {
 	forEachProviderWith(t, func(provider providerConfig) bool {
 		return provider.SupportsTools
 	}, func(t *testing.T, provider providerConfig) {
-		ctx := testContext(t, 90*time.Second)
-
 		var callCount int
 		var mu sync.Mutex
 
@@ -80,16 +74,18 @@ func TestMessages_Run_MultipleToolCalls(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("What's the weather in New York, Los Angeles, and Chicago?")},
+		result, err := runWithProviderRetry(t, provider, 90*time.Second, "Run_MultipleToolCalls", func(ctx context.Context) (*vai.RunResult, error) {
+			return testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("What's the weather in New York, Los Angeles, and Chicago?")},
+				},
+				MaxTokens: 8000,
 			},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(weatherTool),
-			vai.WithMaxToolCalls(5),
-		)
+				vai.WithTools(weatherTool),
+				vai.WithMaxToolCalls(5),
+			)
+		})
 
 		if err != nil {
 			// Model sometimes generates invalid tool call JSON that the provider can't parse
@@ -116,29 +112,29 @@ func TestMessages_Run_MaxToolCallsLimit(t *testing.T) {
 	forEachProviderWith(t, func(provider providerConfig) bool {
 		return provider.SupportsTools
 	}, func(t *testing.T, provider providerConfig) {
-		ctx := testContext(t, 60*time.Second)
-
 		infiniteTool := vai.MakeTool("do_something", "Do something that might need repetition",
 			func(ctx context.Context, input struct{}) (string, error) {
 				return "Done, but you might want to do it again", nil
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Keep calling do_something 10 times.")},
+		result, err := runWithProviderRetry(t, provider, 60*time.Second, "Run_MaxToolCallsLimit", func(ctx context.Context) (*vai.RunResult, error) {
+			return testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Keep calling do_something 10 times.")},
+				},
+				ToolChoice: vai.ToolChoiceTool("do_something"),
+				MaxTokens:  8000,
 			},
-			ToolChoice: vai.ToolChoiceTool("do_something"),
-			MaxTokens:  8000,
-		},
-			vai.WithTools(infiniteTool),
-			vai.WithMaxToolCalls(3),
-		)
+				vai.WithTools(infiniteTool),
+				vai.WithMaxToolCalls(3),
+			)
+		})
 
 		if err != nil {
 			// Model sometimes refuses to call tools even when required - this is model-dependent
-			if strings.Contains(err.Error(), "tool_use_failed") || strings.Contains(err.Error(), "did not call a tool") {
+			if isModelToolRefusal(err) {
 				t.Skipf("Model refused to call tools despite tool_choice (model limitation): %v", err)
 			}
 			t.Fatalf("unexpected error: %v", err)
@@ -160,28 +156,31 @@ func TestMessages_Run_MaxTurnsLimit(t *testing.T) {
 	forEachProviderWith(t, func(provider providerConfig) bool {
 		return provider.SupportsTools
 	}, func(t *testing.T, provider providerConfig) {
-		ctx := testContext(t, 60*time.Second)
-
 		tool := vai.MakeTool("think", "Think about something",
 			func(ctx context.Context, input struct{}) (string, error) {
 				return "I thought about it", nil
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Think about many things, calling the think tool each time.")},
+		result, err := runWithProviderRetry(t, provider, 60*time.Second, "Run_MaxTurnsLimit", func(ctx context.Context) (*vai.RunResult, error) {
+			return testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Think about many things, calling the think tool each time.")},
+				},
+				ToolChoice: vai.ToolChoiceAny(),
+				MaxTokens:  8000,
 			},
-			ToolChoice: vai.ToolChoiceAny(),
-			MaxTokens:  8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxTurns(2),
-			vai.WithMaxToolCalls(10),
-		)
+				vai.WithTools(tool),
+				vai.WithMaxTurns(2),
+				vai.WithMaxToolCalls(10),
+			)
+		})
 
 		if err != nil {
+			if provider.Name == "groq" && isModelToolRefusal(err) {
+				t.Skipf("Groq model refused tool usage in max-turn test (known model variance): %v", err)
+			}
 			t.Fatalf("unexpected error: %v", err)
 		}
 
@@ -250,8 +249,6 @@ func TestMessages_Run_Hooks(t *testing.T) {
 	forEachProviderWith(t, func(provider providerConfig) bool {
 		return provider.SupportsTools
 	}, func(t *testing.T, provider providerConfig) {
-		ctx := testContext(t, 60*time.Second)
-
 		var beforeCallCount, afterResponseCount, toolCallCount int
 		var mu sync.Mutex
 
@@ -263,31 +260,33 @@ func TestMessages_Run_Hooks(t *testing.T) {
 			},
 		)
 
-		_, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Greet Alice using the greet tool")},
+		_, err := runWithProviderRetry(t, provider, 60*time.Second, "Run_Hooks", func(ctx context.Context) (*vai.RunResult, error) {
+			return testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Greet Alice using the greet tool")},
+				},
+				MaxTokens: 8000,
 			},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(1),
-			vai.WithBeforeCall(func(req *vai.MessageRequest) {
-				mu.Lock()
-				beforeCallCount++
-				mu.Unlock()
-			}),
-			vai.WithAfterResponse(func(resp *vai.Response) {
-				mu.Lock()
-				afterResponseCount++
-				mu.Unlock()
-			}),
-			vai.WithOnToolCall(func(name string, input map[string]any, output any, err error) {
-				mu.Lock()
-				toolCallCount++
-				mu.Unlock()
-			}),
-		)
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(1),
+				vai.WithBeforeCall(func(req *vai.MessageRequest) {
+					mu.Lock()
+					beforeCallCount++
+					mu.Unlock()
+				}),
+				vai.WithAfterResponse(func(resp *vai.Response) {
+					mu.Lock()
+					afterResponseCount++
+					mu.Unlock()
+				}),
+				vai.WithOnToolCall(func(name string, input map[string]any, output any, err error) {
+					mu.Lock()
+					toolCallCount++
+					mu.Unlock()
+				}),
+			)
+		})
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -309,8 +308,6 @@ func TestMessages_Run_UsageAggregation(t *testing.T) {
 	forEachProviderWith(t, func(provider providerConfig) bool {
 		return provider.SupportsTools
 	}, func(t *testing.T, provider providerConfig) {
-		ctx := testContext(t, 90*time.Second)
-
 		tool := vai.MakeTool("calc", "Calculate",
 			func(ctx context.Context, input struct {
 				Expr string `json:"expr"`
@@ -319,16 +316,18 @@ func TestMessages_Run_UsageAggregation(t *testing.T) {
 			},
 		)
 
-		result, err := testClient.Messages.Run(ctx, &vai.MessageRequest{
-			Model: provider.Model,
-			Messages: []vai.Message{
-				{Role: "user", Content: vai.Text("Calculate 1+1 and 2+2 using the calc tool")},
+		result, err := runWithProviderRetry(t, provider, 90*time.Second, "Run_UsageAggregation", func(ctx context.Context) (*vai.RunResult, error) {
+			return testClient.Messages.Run(ctx, &vai.MessageRequest{
+				Model: provider.Model,
+				Messages: []vai.Message{
+					{Role: "user", Content: vai.Text("Calculate 1+1 and 2+2 using the calc tool")},
+				},
+				MaxTokens: 8000,
 			},
-			MaxTokens: 8000,
-		},
-			vai.WithTools(tool),
-			vai.WithMaxToolCalls(3),
-		)
+				vai.WithTools(tool),
+				vai.WithMaxToolCalls(3),
+			)
+		})
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -340,6 +339,9 @@ func TestMessages_Run_UsageAggregation(t *testing.T) {
 		}
 		if result.Usage.OutputTokens <= 0 {
 			t.Error("expected positive output tokens")
+		}
+		if result.Usage.TotalTokens <= 0 {
+			t.Error("expected positive total tokens")
 		}
 
 		t.Logf("Usage: input=%d, output=%d, total=%d",
