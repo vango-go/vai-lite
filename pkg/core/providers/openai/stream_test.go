@@ -9,7 +9,7 @@ import (
 )
 
 func TestEventStream_EmitsTerminalMessageDeltaBeforeEOF(t *testing.T) {
-	stream := newEventStream(io.NopCloser(strings.NewReader("")))
+	stream := newEventStream(io.NopCloser(strings.NewReader("")), "openai")
 	stream.accumulator.finishReason = "tool_calls"
 	stream.accumulator.inputTokens = 11
 	stream.accumulator.outputTokens = 7
@@ -36,5 +36,22 @@ func TestEventStream_EmitsTerminalMessageDeltaBeforeEOF(t *testing.T) {
 	}
 	if event != nil {
 		t.Fatalf("second Next() event = %T, want nil", event)
+	}
+}
+
+func TestEventStream_UsesConfiguredModelPrefix(t *testing.T) {
+	stream := newEventStream(io.NopCloser(strings.NewReader("data: {\"id\":\"chatcmpl_1\",\"model\":\"model-x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n")), "groq")
+
+	event, err := stream.Next()
+	if err != nil {
+		t.Fatalf("Next() error = %v", err)
+	}
+
+	start, ok := event.(types.MessageStartEvent)
+	if !ok {
+		t.Fatalf("event type = %T, want MessageStartEvent", event)
+	}
+	if start.Message.Model != "groq/model-x" {
+		t.Fatalf("model = %q, want groq/model-x", start.Message.Model)
 	}
 }

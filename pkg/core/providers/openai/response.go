@@ -74,7 +74,7 @@ func (p *Provider) parseResponse(body []byte) (*types.MessageResponse, error) {
 		ID:         openaiResp.ID,
 		Type:       "message",
 		Role:       "assistant",
-		Model:      "openai/" + openaiResp.Model,
+		Model:      p.modelPrefix + "/" + openaiResp.Model,
 		Content:    content,
 		StopReason: stopReason,
 		Usage: types.Usage{

@@ -37,18 +37,20 @@ type EventStream interface {
 
 // Provider implements the Groq API using OpenAI-compatible interface.
 type Provider struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
-	inner      *openai.Provider
+	apiKey         string
+	baseURL        string
+	httpClient     *http.Client
+	maxTokensField openai.MaxTokensField
+	inner          *openai.Provider
 }
 
 // New creates a new Groq provider.
 func New(apiKey string, opts ...Option) *Provider {
 	p := &Provider{
-		apiKey:     apiKey,
-		baseURL:    DefaultBaseURL,
-		httpClient: &http.Client{},
+		apiKey:         apiKey,
+		baseURL:        DefaultBaseURL,
+		httpClient:     &http.Client{},
+		maxTokensField: openai.MaxTokensFieldMaxTokens,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -58,6 +60,8 @@ func New(apiKey string, opts ...Option) *Provider {
 	p.inner = openai.New(apiKey,
 		openai.WithBaseURL(p.baseURL),
 		openai.WithHTTPClient(p.httpClient),
+		openai.WithResponseModelPrefix("groq"),
+		openai.WithMaxTokensField(p.maxTokensField),
 	)
 
 	return p
@@ -85,61 +89,10 @@ func (p *Provider) Capabilities() ProviderCapabilities {
 
 // CreateMessage sends a non-streaming request to Groq.
 func (p *Provider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
-	// Use the inner OpenAI provider
-	resp, err := p.inner.CreateMessage(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Update model prefix from openai/ to groq/
-	if resp != nil {
-		resp.Model = "groq/" + stripOpenAIPrefix(resp.Model)
-	}
-
-	return resp, nil
+	return p.inner.CreateMessage(ctx, req)
 }
 
 // StreamMessage sends a streaming request to Groq.
 func (p *Provider) StreamMessage(ctx context.Context, req *types.MessageRequest) (EventStream, error) {
-	// Use the inner OpenAI provider
-	stream, err := p.inner.StreamMessage(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	return &groqEventStream{inner: stream}, nil
-}
-
-// groqEventStream wraps the OpenAI event stream to fix model names.
-type groqEventStream struct {
-	inner openai.EventStream
-}
-
-// Next returns the next event from the stream.
-func (s *groqEventStream) Next() (types.StreamEvent, error) {
-	event, err := s.inner.Next()
-	if err != nil {
-		return nil, err
-	}
-
-	// Fix model name in message_start event
-	if mse, ok := event.(types.MessageStartEvent); ok {
-		mse.Message.Model = "groq/" + stripOpenAIPrefix(mse.Message.Model)
-		return mse, nil
-	}
-
-	return event, nil
-}
-
-// Close releases resources associated with the stream.
-func (s *groqEventStream) Close() error {
-	return s.inner.Close()
-}
-
-// stripOpenAIPrefix removes the openai/ prefix from a model string.
-func stripOpenAIPrefix(model string) string {
-	if len(model) > 7 && model[:7] == "openai/" {
-		return model[7:]
-	}
-	return model
+	return p.inner.StreamMessage(ctx, req)
 }

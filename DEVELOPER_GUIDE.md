@@ -37,6 +37,7 @@ This repo intentionally **does not** include:
 - [1. Repository Layout](#1-repository-layout)
 - [2. Installation and Requirements](#2-installation-and-requirements)
 - [3. Provider Authentication](#3-provider-authentication)
+  - [3.1 OpenAI-Compatible Chat Providers](#31-openai-compatible-chat-providers)
 - [4. Mental Model: Request → Provider → Tool Loop](#4-mental-model-request--provider--tool-loop)
 - [5. Core Types](#5-core-types)
   - [5.1 Model strings](#51-model-strings)
@@ -142,6 +143,24 @@ client := vai.NewClient(
 	vai.WithProviderKey("anthropic", "sk-ant-..."),
 )
 ```
+
+### 3.1 OpenAI-Compatible Chat Providers
+
+`openai`, `groq`, and `cerebras` all use the same Chat Completions translation layer in `pkg/core/providers/openai`.
+Wrappers differ primarily by base URL, capabilities, and compatibility options.
+
+OpenAI provider options used by compatibility wrappers:
+
+- `WithResponseModelPrefix("...")` — controls normalized response model prefix (for example `groq/...`).
+- `WithMaxTokensField(...)` — choose `max_tokens` or `max_completion_tokens`.
+- `WithStreamIncludeUsage(bool)` — toggle `stream_options.include_usage` in streaming requests.
+- `WithChatCompletionsPath("...")` — override endpoint path under the configured base URL.
+- `WithAuth(...)` and `WithExtraHeader(s)` — customize auth/header behavior for OpenAI-compatible gateways.
+
+Current defaults in-tree:
+
+- `openai` uses `max_completion_tokens` and emits `openai/<model>` in normalized responses.
+- `groq` and `cerebras` use `max_tokens` and emit `groq/<model>` / `cerebras/<model>`.
 
 ### Gemini OAuth (optional)
 
@@ -949,3 +968,9 @@ Plan for graceful degradation.
 Gemini/Gemini OAuth may require `thoughtSignature` on repeated function-call context. The SDK preserves this by carrying it on `tool_use` input as `__thought_signature` in history and translating it back to provider-native `thoughtSignature` on subsequent turns.
 
 If you manage history manually, preserve this field on assistant `tool_use` blocks.
+
+### 12.6 OpenAI-compatible providers should compose, not fork
+
+For OpenAI-compatible Chat Completions providers, prefer composing `pkg/core/providers/openai` and configuring behavior with options (`baseURL`, model prefix, max tokens field, headers) instead of duplicating translation and streaming logic.
+
+`oai-resp` remains separate by design because the OpenAI Responses API has a different request/response and streaming shape from Chat Completions.

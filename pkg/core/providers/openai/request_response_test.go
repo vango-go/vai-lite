@@ -8,7 +8,7 @@ import (
 )
 
 func TestBuildRequest_TranslatesMessagesToolsAndSchema(t *testing.T) {
-	p := &Provider{}
+	p := New("test-key")
 	temperature := 0.4
 
 	req := &types.MessageRequest{
@@ -78,8 +78,11 @@ func TestBuildRequest_TranslatesMessagesToolsAndSchema(t *testing.T) {
 
 	translated := p.buildRequest(req)
 
-	if translated.MaxTokens == nil || *translated.MaxTokens != DefaultMaxTokens {
-		t.Fatalf("max tokens = %v, want %d", translated.MaxTokens, DefaultMaxTokens)
+	if translated.MaxCompletionTokens == nil || *translated.MaxCompletionTokens != DefaultMaxTokens {
+		t.Fatalf("max completion tokens = %v, want %d", translated.MaxCompletionTokens, DefaultMaxTokens)
+	}
+	if translated.MaxTokens != nil {
+		t.Fatalf("max tokens should be nil when using max_completion_tokens, got %v", translated.MaxTokens)
 	}
 	if translated.ToolChoice == nil {
 		t.Fatal("tool choice should be translated")
@@ -126,7 +129,7 @@ func TestBuildRequest_TranslatesMessagesToolsAndSchema(t *testing.T) {
 }
 
 func TestParseResponse_MapsTextToolUseStopReasonAndUsage(t *testing.T) {
-	p := &Provider{}
+	p := New("test-key")
 
 	body := []byte(`{
 		"id":"chatcmpl_1",
@@ -187,7 +190,7 @@ func TestParseResponse_MapsTextToolUseStopReasonAndUsage(t *testing.T) {
 }
 
 func TestParseResponse_NoChoices(t *testing.T) {
-	p := &Provider{}
+	p := New("test-key")
 
 	body, _ := json.Marshal(map[string]any{
 		"id":      "chatcmpl_empty",
@@ -203,5 +206,43 @@ func TestParseResponse_NoChoices(t *testing.T) {
 	_, err := p.parseResponse(body)
 	if err == nil {
 		t.Fatal("expected error for response with no choices")
+	}
+}
+
+func TestBuildRequest_UsesMaxTokensFieldWhenConfigured(t *testing.T) {
+	p := New("test-key", WithMaxTokensField(MaxTokensFieldMaxTokens))
+
+	translated := p.buildRequest(&types.MessageRequest{
+		Model:     "gpt-4o-mini",
+		MaxTokens: 1234,
+		Messages: []types.Message{
+			{Role: "user", Content: "hello"},
+		},
+	})
+
+	if translated.MaxTokens == nil || *translated.MaxTokens != 1234 {
+		t.Fatalf("max tokens = %v, want 1234", translated.MaxTokens)
+	}
+	if translated.MaxCompletionTokens != nil {
+		t.Fatalf("max_completion_tokens should be nil, got %v", translated.MaxCompletionTokens)
+	}
+}
+
+func TestParseResponse_UsesConfiguredModelPrefix(t *testing.T) {
+	p := New("test-key", WithResponseModelPrefix("groq"))
+
+	body := []byte(`{
+		"id":"chatcmpl_1",
+		"model":"llama-3.3-70b-versatile",
+		"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],
+		"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+	}`)
+
+	resp, err := p.parseResponse(body)
+	if err != nil {
+		t.Fatalf("parseResponse() error = %v", err)
+	}
+	if resp.Model != "groq/llama-3.3-70b-versatile" {
+		t.Fatalf("model = %q, want groq/llama-3.3-70b-versatile", resp.Model)
 	}
 }

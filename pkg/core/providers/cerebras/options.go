@@ -1,6 +1,10 @@
 package cerebras
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/vango-go/vai-lite/pkg/core/providers/openai"
+)
 
 // Option configures the Cerebras provider.
 type Option func(*Provider)
@@ -16,5 +20,15 @@ func WithBaseURL(url string) Option {
 func WithHTTPClient(client *http.Client) Option {
 	return func(p *Provider) {
 		p.httpClient = client
+	}
+}
+
+// WithMaxTokensField controls which max tokens field name is sent.
+func WithMaxTokensField(field openai.MaxTokensField) Option {
+	return func(p *Provider) {
+		if field != openai.MaxTokensFieldMaxTokens && field != openai.MaxTokensFieldMaxCompletionTokens {
+			return
+		}
+		p.maxTokensField = field
 	}
 }

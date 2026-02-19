@@ -14,6 +14,7 @@ type eventStream struct {
 	reader      *bufio.Reader
 	closer      io.Closer
 	err         error
+	modelPrefix string
 	responseID  string
 	model       string
 	accumulator streamAccumulator
@@ -73,10 +74,14 @@ type toolCallDelta struct {
 }
 
 // newEventStream creates a new event stream from an HTTP response body.
-func newEventStream(body io.ReadCloser) *eventStream {
+func newEventStream(body io.ReadCloser, modelPrefix string) *eventStream {
+	if modelPrefix == "" {
+		modelPrefix = "openai"
+	}
 	return &eventStream{
 		reader: bufio.NewReader(body),
 		closer: body,
+		modelPrefix: modelPrefix,
 		accumulator: streamAccumulator{
 			toolCalls: make(map[int]*toolCallAccumulator),
 		},
@@ -170,7 +175,7 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 					ID:      s.responseID,
 					Type:    "message",
 					Role:    "assistant",
-					Model:   "openai/" + s.model,
+					Model:   s.modelPrefix + "/" + s.model,
 					Content: []types.ContentBlock{},
 					Usage:   types.Usage{},
 				},

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // doRequest sends a non-streaming request to OpenAI.
@@ -16,7 +17,7 @@ func (p *Provider) doRequest(ctx context.Context, req *chatRequest) ([]byte, err
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.chatCompletionsURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -51,7 +52,7 @@ func (p *Provider) doStreamRequest(ctx context.Context, req *chatRequest) (io.Re
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.chatCompletionsURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -76,9 +77,26 @@ func (p *Provider) doStreamRequest(ctx context.Context, req *chatRequest) (io.Re
 // setHeaders sets the required OpenAI API headers.
 func (p *Provider) setHeaders(req *http.Request, stream bool) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	headerValue := p.auth.Value
+	if headerValue == "" {
+		headerValue = p.auth.Prefix + p.apiKey
+	}
+	authHeader := p.auth.Header
+	if authHeader == "" {
+		authHeader = "Authorization"
+	}
+	req.Header.Set(authHeader, headerValue)
+
+	for key, value := range p.extraHeaders {
+		req.Header.Set(key, value)
+	}
 
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
+}
+
+func (p *Provider) chatCompletionsURL() string {
+	return strings.TrimRight(p.baseURL, "/") + p.chatCompletionsPath
 }

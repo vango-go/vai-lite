@@ -1,42 +1,32 @@
 package groq
 
 import (
-	"io"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
-type fakeGroqInnerStream struct {
-	events []types.StreamEvent
-	index  int
-	closed bool
-}
-
-func (f *fakeGroqInnerStream) Next() (types.StreamEvent, error) {
-	if f.index >= len(f.events) {
-		return nil, io.EOF
-	}
-	ev := f.events[f.index]
-	f.index++
-	return ev, nil
-}
-
-func (f *fakeGroqInnerStream) Close() error {
-	f.closed = true
-	return nil
-}
-
 func TestNew_AppliesOptionsAndCapabilities(t *testing.T) {
 	client := &http.Client{}
-	p := New("test-key", WithBaseURL("https://example.com"), WithHTTPClient(client))
+	p := New(
+		"test-key",
+		WithBaseURL("https://example.com"),
+		WithHTTPClient(client),
+		WithMaxTokensField("max_completion_tokens"),
+	)
 
 	if p.baseURL != "https://example.com" {
 		t.Fatalf("baseURL = %q, want https://example.com", p.baseURL)
 	}
 	if p.httpClient != client {
 		t.Fatal("httpClient option was not applied")
+	}
+	if p.maxTokensField != "max_completion_tokens" {
+		t.Fatalf("maxTokensField = %q, want max_completion_tokens", p.maxTokensField)
 	}
 	if p.inner == nil {
 		t.Fatal("expected inner OpenAI provider to be initialized")
@@ -51,59 +41,76 @@ func TestNew_AppliesOptionsAndCapabilities(t *testing.T) {
 	}
 }
 
-func TestGroqEventStream_RewritesMessageStartModel(t *testing.T) {
-	inner := &fakeGroqInnerStream{
-		events: []types.StreamEvent{
-			types.MessageStartEvent{
-				Type: "message_start",
-				Message: types.MessageResponse{
-					Model: "openai/moonshot/model-x",
-				},
-			},
-			types.MessageStopEvent{Type: "message_stop"},
+func TestCreateMessage_UsesGroqPrefixAndMaxTokensField(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("path = %q, want /chat/completions", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"chatcmpl_1",
+			"model":"moonshot/model-x",
+			"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer server.Close()
+
+	p := New("test-key", WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	resp, err := p.CreateMessage(t.Context(), &types.MessageRequest{
+		Model: "moonshot/model-x",
+		Messages: []types.Message{
+			{Role: "user", Content: "hello"},
 		},
-	}
-
-	stream := &groqEventStream{inner: inner}
-
-	first, err := stream.Next()
+		MaxTokens: 42,
+	})
 	if err != nil {
-		t.Fatalf("first Next() error = %v", err)
+		t.Fatalf("CreateMessage() error = %v", err)
 	}
-	start, ok := first.(types.MessageStartEvent)
-	if !ok {
-		t.Fatalf("first event type = %T, want MessageStartEvent", first)
+	if resp.Model != "groq/moonshot/model-x" {
+		t.Fatalf("model = %q, want groq/moonshot/model-x", resp.Model)
 	}
-	if start.Message.Model != "groq/moonshot/model-x" {
-		t.Fatalf("rewritten model = %q, want groq/moonshot/model-x", start.Message.Model)
+	if _, exists := gotBody["max_tokens"]; !exists {
+		t.Fatalf("request missing max_tokens field: %#v", gotBody)
 	}
-
-	second, err := stream.Next()
-	if err != nil {
-		t.Fatalf("second Next() error = %v", err)
-	}
-	if _, ok := second.(types.MessageStopEvent); !ok {
-		t.Fatalf("second event type = %T, want MessageStopEvent", second)
-	}
-
-	_, err = stream.Next()
-	if err != io.EOF {
-		t.Fatalf("third Next() error = %v, want io.EOF", err)
-	}
-
-	if err := stream.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-	if !inner.closed {
-		t.Fatal("expected inner stream to be closed")
+	if _, exists := gotBody["max_completion_tokens"]; exists {
+		t.Fatalf("request unexpectedly included max_completion_tokens: %#v", gotBody)
 	}
 }
 
-func TestStripOpenAIPrefix(t *testing.T) {
-	if got := stripOpenAIPrefix("openai/gpt-oss"); got != "gpt-oss" {
-		t.Fatalf("stripOpenAIPrefix(openai/gpt-oss) = %q, want gpt-oss", got)
+func TestStreamMessage_UsesGroqPrefix(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"id\":\"chatcmpl_1\",\"model\":\"moonshot/model-x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	p := New("test-key", WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	stream, err := p.StreamMessage(t.Context(), &types.MessageRequest{
+		Model: "moonshot/model-x",
+		Messages: []types.Message{
+			{Role: "user", Content: "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("StreamMessage() error = %v", err)
 	}
-	if got := stripOpenAIPrefix("groq/model"); got != "groq/model" {
-		t.Fatalf("stripOpenAIPrefix(groq/model) = %q, want groq/model", got)
+	defer stream.Close()
+
+	event, err := stream.Next()
+	if err != nil {
+		t.Fatalf("Next() error = %v", err)
+	}
+	start, ok := event.(types.MessageStartEvent)
+	if !ok {
+		t.Fatalf("event type = %T, want MessageStartEvent", event)
+	}
+	if start.Message.Model != "groq/moonshot/model-x" {
+		t.Fatalf("model = %q, want groq/moonshot/model-x", start.Message.Model)
 	}
 }

@@ -13,6 +13,9 @@ const (
 	// DefaultBaseURL is the default OpenAI API endpoint.
 	DefaultBaseURL = "https://api.openai.com/v1"
 
+	// DefaultChatCompletionsPath is the default chat completions endpoint path.
+	DefaultChatCompletionsPath = "/chat/completions"
+
 	// DefaultMaxTokens is the default max tokens if not specified.
 	DefaultMaxTokens = 4096
 )
@@ -39,17 +42,32 @@ type EventStream interface {
 
 // Provider implements the OpenAI Chat Completions API.
 type Provider struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
+	apiKey              string
+	baseURL             string
+	chatCompletionsPath string
+	httpClient          *http.Client
+	modelPrefix         string
+	maxTokensField      MaxTokensField
+	streamIncludeUsage  bool
+	auth                AuthConfig
+	extraHeaders        map[string]string
 }
 
 // New creates a new OpenAI provider.
 func New(apiKey string, opts ...Option) *Provider {
 	p := &Provider{
-		apiKey:     apiKey,
-		baseURL:    DefaultBaseURL,
-		httpClient: &http.Client{},
+		apiKey:              apiKey,
+		baseURL:             DefaultBaseURL,
+		chatCompletionsPath: DefaultChatCompletionsPath,
+		httpClient:          &http.Client{},
+		modelPrefix:         "openai",
+		maxTokensField:      MaxTokensFieldMaxCompletionTokens,
+		streamIncludeUsage:  true,
+		auth: AuthConfig{
+			Header: "Authorization",
+			Prefix: "Bearer ",
+		},
+		extraHeaders: make(map[string]string),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -97,7 +115,9 @@ func (p *Provider) StreamMessage(ctx context.Context, req *types.MessageRequest)
 	// Build request with stream=true
 	openaiReq := p.buildRequest(req)
 	openaiReq.Stream = true
-	openaiReq.StreamOptions = &streamOptions{IncludeUsage: true}
+	if p.streamIncludeUsage {
+		openaiReq.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
 
 	// Make HTTP call (returns SSE stream)
 	body, err := p.doStreamRequest(ctx, openaiReq)
@@ -105,5 +125,5 @@ func (p *Provider) StreamMessage(ctx context.Context, req *types.MessageRequest)
 		return nil, err
 	}
 
-	return newEventStream(body), nil
+	return newEventStream(body, p.modelPrefix), nil
 }
