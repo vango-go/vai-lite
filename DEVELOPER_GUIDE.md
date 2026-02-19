@@ -692,7 +692,8 @@ Native tools are represented as `Tool{Type: "...", Config: ...}` and are execute
 
 SDK constructors:
 
-- `vai.WebSearch(...)`
+- `vai.WebSearch(...)` — web search (Anthropic, OpenAI Responses, Gemini)
+- `vai.WebFetch(...)` — web page content extraction (Anthropic only)
 - `vai.CodeExecution(...)`
 - `vai.ComputerUse(width, height)`
 - `vai.TextEditor()`
@@ -703,6 +704,85 @@ Important:
 - Native tool support is **provider/model dependent**.
 - The providers in `pkg/core/providers/*` map these normalized tool types to provider-specific tool names and request formats.
 - Since providers execute these tools, you generally do **not** register handlers for them.
+- `WebFetch` currently maps to Anthropic's `web_fetch_20250910` only. For other providers, use `VAIWebFetch()` instead.
+
+Native web search mapping:
+
+| Provider | `WebSearch()` maps to | `WebFetch()` maps to |
+|----------|-----------------------|----------------------|
+| Anthropic | `web_search_20250305` | `web_fetch_20250910` |
+| OpenAI Responses | `web_search` | _(skipped)_ |
+| Gemini | `googleSearch` grounding | _(skipped)_ |
+| OpenAI Chat | _(skipped)_ | _(skipped)_ |
+
+### 8.1 VAI-Native Web Tools (Configurable)
+
+For providers that don't support native web search/fetch, or when you want to use a specific third-party search provider regardless of LLM provider, use the **VAI-native** variants:
+
+```go
+import (
+    vai "github.com/vango-go/vai-lite/sdk"
+    "github.com/vango-go/vai-lite/sdk/adapters/tavily"
+    "github.com/vango-go/vai-lite/sdk/adapters/firecrawl"
+)
+
+// VAI-native web search via Tavily
+search := vai.VAIWebSearch(tavily.NewSearch(os.Getenv("TAVILY_API_KEY")))
+
+// VAI-native web fetch via Firecrawl
+fetch := vai.VAIWebFetch(firecrawl.NewScrape(os.Getenv("FIRECRAWL_API_KEY")))
+
+// Use with any provider — even those without native search support
+result, err := client.Messages.Run(ctx, &vai.MessageRequest{
+    Model:    "groq/llama-3.3-70b",
+    Messages: msgs,
+}, vai.WithTools(search, fetch))
+```
+
+**Key difference from native tools:**
+
+- `vai.WebSearch()` / `vai.WebFetch()` → provider-executed native tools (no handler needed)
+- `vai.VAIWebSearch(provider)` / `vai.VAIWebFetch(provider)` → VAI-executed function tools (handler is built in)
+
+`VAIWebSearch` and `VAIWebFetch` return `ToolWithHandler`, so they work with `WithTools()` for automatic handler registration.
+
+**Available adapters:**
+
+| Package | Search | Fetch | Import |
+|---------|--------|-------|--------|
+| Tavily | `tavily.NewSearch(apiKey)` | `tavily.NewExtract(apiKey)` | `sdk/adapters/tavily` |
+| Firecrawl | — | `firecrawl.NewScrape(apiKey)` | `sdk/adapters/firecrawl` |
+| Exa | `exa.NewSearch(apiKey)` | `exa.NewContents(apiKey)` | `sdk/adapters/exa` |
+
+**Custom providers:** Implement `vai.WebSearchProvider` or `vai.WebFetchProvider`:
+
+```go
+type WebSearchProvider interface {
+    Search(ctx context.Context, query string, opts WebSearchOpts) ([]WebSearchHit, error)
+}
+
+type WebFetchProvider interface {
+    Fetch(ctx context.Context, url string, opts WebFetchOpts) (*WebFetchResult, error)
+}
+```
+
+**Configuration options:**
+
+```go
+// Custom tool name and max results
+search := vai.VAIWebSearch(tavily.NewSearch(apiKey), vai.VAIWebSearchConfig{
+    ToolName:       "my_search",
+    MaxResults:     10,
+    AllowedDomains: []string{"docs.example.com"},
+    BlockedDomains: []string{"spam.site"},
+})
+
+// Custom format for fetch
+fetch := vai.VAIWebFetch(firecrawl.NewScrape(apiKey), vai.VAIWebFetchConfig{
+    ToolName: "my_fetch",
+    Format:   "text",
+})
+```
 
 ---
 

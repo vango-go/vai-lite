@@ -185,6 +185,24 @@ func WebSearch(configs ...WebSearchConfig) types.Tool {
 	}
 }
 
+// WebFetchConfig configures the web fetch tool.
+type WebFetchConfig = types.WebFetchConfig
+
+// WebFetch creates a web fetch tool.
+// This tool allows the model to fetch and extract content from specific URLs.
+// Currently only Anthropic supports this as a native tool (web_fetch_20250910).
+// For other providers, use VAIWebFetch() with a third-party provider instead.
+func WebFetch(configs ...WebFetchConfig) types.Tool {
+	var cfg *WebFetchConfig
+	if len(configs) > 0 {
+		cfg = &configs[0]
+	}
+	return types.Tool{
+		Type:   types.ToolTypeWebFetch,
+		Config: cfg,
+	}
+}
+
 // CodeExecutionConfig configures the code execution tool.
 type CodeExecutionConfig = types.CodeExecutionConfig
 

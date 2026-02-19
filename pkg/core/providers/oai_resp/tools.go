@@ -96,6 +96,11 @@ func (p *Provider) translateTools(tools []types.Tool) []responsesTool {
 				Type: "image_generation",
 			})
 
+		case types.ToolTypeWebFetch:
+			// Web fetch is not supported in OpenAI Responses API — skip
+			// Users should use VAIWebFetch() instead
+			continue
+
 		case types.ToolTypeTextEditor:
 			// Text editor is Anthropic-specific, skip for OpenAI
 			continue

@@ -160,6 +160,23 @@ func convertTools(tools []types.Tool) []anthropicTool {
 			}
 			result = append(result, webTool)
 
+		case types.ToolTypeWebFetch:
+			fetchTool := anthropicTool{
+				Type: "web_fetch_20250910",
+				Name: "web_fetch",
+			}
+			// Apply config if provided
+			if cfg, ok := tool.Config.(*types.WebFetchConfig); ok && cfg != nil {
+				fetchTool.MaxUses = cfg.MaxUses
+				fetchTool.AllowedDomains = cfg.AllowedDomains
+				fetchTool.BlockedDomains = cfg.BlockedDomains
+			} else if cfg, ok := tool.Config.(types.WebFetchConfig); ok {
+				fetchTool.MaxUses = cfg.MaxUses
+				fetchTool.AllowedDomains = cfg.AllowedDomains
+				fetchTool.BlockedDomains = cfg.BlockedDomains
+			}
+			result = append(result, fetchTool)
+
 		case types.ToolTypeCodeExecution:
 			result = append(result, anthropicTool{
 				Type: "code_execution_20250522",

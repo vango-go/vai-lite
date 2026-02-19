@@ -19,6 +19,7 @@ type ToolChoice struct {
 const (
 	ToolTypeFunction      = "function"
 	ToolTypeWebSearch     = "web_search"
+	ToolTypeWebFetch      = "web_fetch"
 	ToolTypeCodeExecution = "code_execution"
 	ToolTypeFileSearch    = "file_search"
 	ToolTypeComputerUse   = "computer_use"
@@ -39,6 +40,13 @@ type UserLocation struct {
 	Region   string `json:"region,omitempty"`
 	Country  string `json:"country,omitempty"`
 	Timezone string `json:"timezone,omitempty"`
+}
+
+// WebFetchConfig configures the web fetch tool.
+type WebFetchConfig struct {
+	MaxUses        int      `json:"max_uses,omitempty"`        // Limit fetches per request
+	AllowedDomains []string `json:"allowed_domains,omitempty"` // Restrict to these domains
+	BlockedDomains []string `json:"blocked_domains,omitempty"` // Exclude these domains
 }
 
 // CodeExecutionConfig configures the code execution tool.
@@ -77,6 +85,14 @@ func NewFunctionTool(name, description string, schema *JSONSchema) Tool {
 func NewWebSearchTool(config *WebSearchConfig) Tool {
 	return Tool{
 		Type:   ToolTypeWebSearch,
+		Config: config,
+	}
+}
+
+// NewWebFetchTool creates a new web fetch tool.
+func NewWebFetchTool(config *WebFetchConfig) Tool {
+	return Tool{
+		Type:   ToolTypeWebFetch,
 		Config: config,
 	}
 }

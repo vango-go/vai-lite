@@ -56,8 +56,8 @@ func TestProvider_Capabilities(t *testing.T) {
 	if caps.Video {
 		t.Error("expected Video to be false")
 	}
-	if len(caps.NativeTools) != 4 {
-		t.Errorf("expected 4 native tools, got %d", len(caps.NativeTools))
+	if len(caps.NativeTools) != 5 {
+		t.Errorf("expected 5 native tools, got %d", len(caps.NativeTools))
 	}
 }
 
@@ -448,6 +448,7 @@ func TestConvertTools_NativeTools(t *testing.T) {
 		expectedType string
 	}{
 		{types.ToolTypeWebSearch, "web_search_20250305"},
+		{types.ToolTypeWebFetch, "web_fetch_20250910"},
 		{types.ToolTypeCodeExecution, "code_execution_20250522"},
 		{types.ToolTypeComputerUse, "computer_20250124"},
 		{types.ToolTypeTextEditor, "text_editor_20250124"},

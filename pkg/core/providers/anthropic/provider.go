@@ -17,8 +17,8 @@ const (
 	// APIVersion is the required Anthropic API version header.
 	APIVersion = "2023-06-01"
 
-	// BetaHeader enables beta features like prompt caching, web search, and structured outputs.
-	BetaHeader = "prompt-caching-2024-07-31,web-search-2025-03-05,structured-outputs-2025-11-13"
+	// BetaHeader enables beta features like prompt caching, web search, web fetch, and structured outputs.
+	BetaHeader = "prompt-caching-2024-07-31,web-search-2025-03-05,web-fetch-2025-09-10,structured-outputs-2025-11-13"
 
 	// DefaultMaxTokens is the default max tokens if not specified.
 	DefaultMaxTokens = 4096
@@ -80,7 +80,7 @@ func (p *Provider) Capabilities() ProviderCapabilities {
 		ToolStreaming:    true,
 		Thinking:         true,
 		StructuredOutput: true,
-		NativeTools:      []string{"web_search", "code_execution", "computer_use", "text_editor"},
+		NativeTools:      []string{"web_search", "web_fetch", "code_execution", "computer_use", "text_editor"},
 	}
 }
 
