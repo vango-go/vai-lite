@@ -134,6 +134,23 @@ Server responds with `hello_ack`:
 - rate limits / max frame size
 - session id
 
+### 4.1.1 Session resume (reconnection) — reserved in v1
+
+Mobile and flaky networks will drop WebSockets. Even if v1 does not implement full resume, the wire protocol
+should reserve a clean path so SDKs don’t need breaking changes later.
+
+Proposal:
+- `hello` MAY include:
+  - `resume_session_id`: a previously issued `session_id`
+  - `last_client_audio_seq`: last mic frame seq the server acknowledged (if using seq)
+  - `last_playback_mark`: the latest `playback_mark` the server should consider authoritative for the active `assistant_audio_id`
+- Server replies in `hello_ack` with:
+  - `resume`: `{ "supported": bool, "accepted": bool, "reason": string }`
+
+Initial implementation options:
+- **v1 (simple):** `resume.supported=false` always; clients reconnect as a new session.
+- **v1.1+:** accept resume for short windows (e.g. 10–30s) by persisting session state (played history, pending segment IDs).
+
 ### 4.2 Message transport
 
 To maximize cross-language SDK compatibility:
@@ -141,6 +158,21 @@ To maximize cross-language SDK compatibility:
 - All control messages are **JSON text frames** with a top-level `type`.
 - Audio frames SHOULD be binary WS frames if negotiated (`audio_transport: "binary"`).
   - If binary isn’t available (or for simplicity), support `audio_transport: "base64_json"` as a fallback.
+
+### 4.2.1 Ordering guarantees (binary + JSON frames)
+
+WebSocket ordering is guaranteed **per direction**:
+- client→server frames arrive in order relative to other client→server frames
+- server→client frames arrive in order relative to other server→client frames
+
+There is no global ordering across directions (client sends do not “interleave” with server sends in any meaningful ordering sense).
+
+Implications for this design:
+- It is safe to mix JSON control frames and binary audio frames in the same direction.
+- Sequence numbers (`seq`) are still recommended for:
+  - debugging
+  - reconnection/resume
+  - detecting dropped frames in intermediary stacks
 
 ### 4.3 Client -> Server message types (minimum)
 
@@ -157,7 +189,8 @@ To maximize cross-language SDK compatibility:
     "audio_transport": "binary",
     "send_playback_marks": true,
     "want_partial_transcripts": true,
-    "want_assistant_text": true
+    "want_assistant_text": true,
+    "client_has_aec": true
   }
 }
 ```
@@ -195,6 +228,20 @@ Client provides ground truth for “what has actually played” to drive truncat
   "state": "playing"
 }
 ```
+
+`state` values (recommended):
+- `playing`: actively playing audio for this segment
+- `paused`: playback paused (user/system)
+- `stopped`: playback stopped early (typically after `audio_reset`)
+- `finished`: playback naturally completed (all audio for the segment played)
+
+Normative v1 requirements:
+- After the client receives `audio_reset{assistant_audio_id}`, it MUST clear its buffers and emit a `playback_mark`
+  for that `assistant_audio_id` with `state:"stopped"` as soon as it has actually stopped output (target: < 500ms).
+- The gateway should wait a bounded time (e.g. 500ms) for this final mark; if it doesn’t arrive, fall back to the
+  last known `played_ms` and proceed.
+- When the client naturally finishes playing a segment, it SHOULD emit `state:"finished"` (helps the gateway commit
+  played history confidently, independent of network timing).
 
 #### `control`
 Examples:
@@ -310,6 +357,35 @@ Sent to force the client to drop buffered audio immediately (interrupt/grace).
 Optional: forward selected `RunStream` lifecycle/tool events for debugging / UI.
 This must be curated; do not leak provider-internal details by default.
 
+#### `session_config` (reserved)
+Reserved for mid-session changes (v1.1+), such as changing voice, adjusting silence thresholds, or toggling features,
+without reconnecting.
+
+### 4.5 Backpressure contract (required for production)
+
+Live TTS produces data continuously; slow or backgrounded clients can cause unbounded buffering if not managed.
+
+v1 should define a concrete backpressure mechanism. Two practical approaches:
+
+1. **Playback-mark windowing (recommended):**
+   - Treat client `playback_mark.played_ms` as the authoritative “ack”.
+   - Track `unplayed_ms = sent_ms - played_ms` per `assistant_audio_id`.
+   - `sent_ms` MUST be computed from the decoded PCM duration of audio emitted for the segment (not byte counts of a
+     compressed transport codec). For this reason, v1 should strongly prefer `audio_out=pcm_*`.
+   - If `unplayed_ms` exceeds a threshold (e.g. 1500–3000ms), the gateway must:
+     - stop the TTS context (provider-specific close/cancel)
+     - emit `audio_reset{reason:"backpressure"}`
+     - downgrade behavior (shorter segments, or pause speaking until marks recover)
+   - Mark-timeout/backpressure timers should only run while the gateway is actively sending audio chunks for the
+     segment (not during LLM “thinking time” when no audio is being emitted).
+
+2. **Credit-based flow control:**
+   - Client grants “audio credits” (bytes or ms) and replenishes as it plays audio.
+   - Server only sends audio while credits remain.
+   - More complex but can be more deterministic for embedded clients.
+
+Regardless of approach, the server must never buffer unbounded audio in memory.
+
 ---
 
 ## 5. Audio Formats and Normalization
@@ -329,6 +405,10 @@ For lowest latency and easiest playback across platforms:
 The protocol allows negotiation; SDKs should provide a “best default”:
 - web: opus is bandwidth-friendly but adds decoding complexity
 - native: PCM is simplest if bandwidth is fine
+
+v1 recommendation:
+- Prefer `audio_out=pcm_*` to keep timing/backpressure math simple and correct. If you support compressed `audio_out`
+  formats (opus/mp3) later, the gateway must still maintain a `sent_ms` clock based on decoded PCM duration.
 
 ---
 
@@ -536,6 +616,27 @@ Suggested minimum heuristics:
 
 If client provides echo cancellation (AEC), that should be required for web/mobile SDKs; server still uses gating.
 
+Client capability negotiation:
+- `hello.features.client_has_aec` should be treated as a hint that the gateway can use less aggressive gating.
+- If `client_has_aec=false` (or unknown), the gateway should tighten gating thresholds to reduce false barge-ins.
+
+### 7.3 Grace period truth table (normative)
+
+Grace is active for `<= 5s` after `utterance_final.end_ms` while the assistant may already be generating/speaking.
+
+The gateway should apply the following rules while **Grace is active**:
+
+| Condition | Meaning | Action |
+|---|---|---|
+| no speech detected | silence / no transcript signal | keep current assistant run; remain in `Grace` until timeout |
+| speech detected but **not** confirmed real speech | noise, echo, too-short delta | do **not** cancel; remain in `Grace` and continue observing |
+| confirmed real speech arrives | user is actually continuing | immediately `audio_reset` + stop TTS; cancel run; append transcript to pending user turn; return to listening until 600ms silence commits |
+| grace window expires | 5s passes without confirmed real speech | resume assistant run (or continue speaking if already speaking) and exit `Grace` |
+
+Notes:
+- “speech detected” may come from VAD energy or interim STT deltas; “confirmed” should be based on semantic gating.
+- The assistant should never be cancelled due to noise-only activity.
+
 ---
 
 ## 8. RunStream Integration and `talk_to_user`
@@ -562,6 +663,16 @@ Handler responsibilities (gateway-side):
 - Stream audio chunks to client tagged with `assistant_audio_id`
 - Close context and emit `assistant_audio_end`
 
+#### V1 requirement (speech gate)
+
+For v1 Live mode, `talk_to_user` is not optional:
+- Models used in Live mode should be instructed to **always** respond by calling `talk_to_user` (or choose to remain silent and wait).
+- The gateway should treat “assistant plain text output without `talk_to_user`” as a policy violation and handle it explicitly (choose one):
+  1. **Strict:** return an error to the client (developer-mode), or
+  2. **Lenient:** wrap the plain text into a synthetic `talk_to_user` call server-side (safer UX, but changes semantics).
+
+Recommendation: start lenient for reliability, log + meter it, and move to strict once prompts/models stabilize.
+
 ### 8.3 Terminal tool semantics
 
 **Requirement:** After `talk_to_user` runs, the LLM turn should be treated as complete for Live mode.
@@ -579,6 +690,10 @@ Tool input for `talk_to_user` may arrive as a streamed `input_json_delta` (provi
 - Start TTS before the full JSON input is complete by reconstructing `text` incrementally from deltas.
 - This reduces time-to-first-audio but complicates correctness.
 v1 should wait for the fully parsed tool input.
+
+Addendum: perceived latency
+- Streaming `talk_to_user` input (reconstructing tool JSON from `input_json_delta`) can substantially improve TTFA in production.
+- If TTFA is a primary KPI for v1, prioritize this optimization earlier, but only after you have a robust “partial JSON reassembly” implementation and tests.
 
 ---
 
@@ -703,6 +818,43 @@ The session should not branch on provider name; it should branch on capabilities
 - if `SupportsAlignment`: enable precise truncation
 - else: coarse truncation + stricter buffer resets + shorter segments
 
+### 12.4 WIP baseline provider settings (starting point)
+
+These are recommended initial settings for a production live gateway. Treat them as defaults that
+must be tuned with real traffic (latency, noise environments, voice choice, and tier constraints).
+
+#### ElevenLabs live TTS (primary)
+
+- **Model:** `eleven_flash_v2_5` (multi-context is not available for `eleven_v3`)
+- **Output format:** `pcm_24000` (good quality/bandwidth baseline for conversational audio)
+- **Alignment:** `sync_alignment=true` (enables `alignment` + `normalizedAlignment` for truncation)
+- **Text normalization:** `apply_text_normalization=off`
+  - Prefer LLM “pre-normalization” in the `talk_to_user` tool prompt (expand numbers/symbols/abbreviations).
+  - If `off` is not permitted for your account/model tier, fall back to `auto` and treat `normalizedAlignment` as canonical.
+- **Inactivity timeout:** `inactivity_timeout=60` (default is 20s; raise to tolerate “thinking time”)
+- **Keepalive:** if a context must stay open while no text is being sent, send `{"text":"", "context_id":"..."}` every ~15s.
+- **Chunking:** stream sentence-ish chunks; set `flush:true` at sentence boundaries and at the end of the segment.
+
+#### Cartesia live STT (default)
+
+- **Model:** `ink-whisper`
+- **Encoding:** `pcm_s16le`
+- **Sample rate:** `16000 Hz`, mono
+- **Frame size:** ~20ms frames (~640 bytes at 16kHz PCM16 mono)
+- **min_volume:** start around `0.1` and tune per environment (too high will miss quiet speakers)
+- **Endpointing:** two viable approaches:
+  1. **Gateway-owned endpointing (recommended):** keep STT streaming without provider silence-based endpointing and commit turns based on the gateway’s 600ms silence detector + semantic “real speech” checks.
+  2. **Provider endpointing:** set provider silence threshold to `0.6s` so STT emits finals on silence; still keep semantic checks and grace/interrupt logic in the gateway.
+
+#### Cartesia live TTS (secondary / fallback)
+
+- **Model:** `sonic-3`
+- **Output format:** `container=raw`, `encoding=pcm_s16le`, `sample_rate=24000`
+- **Input streaming:** stream transcript chunks with `continue:true`; finish with `continue:false` (empty transcript allowed).
+- **Provider buffering:** `max_buffer_delay_ms=200` as a starting point (latency/quality tradeoff).
+- **Timestamps:** `add_timestamps=true` and `use_normalized_timestamps=true` if you plan to do word-level truncation.
+- **Interrupt stop:** send `{"context_id":"...","cancel":true}` as best-effort, but always drop late chunks after `audio_reset` (Cartesia may continue in-flight generation).
+
 ---
 
 ## 13. Operational Concerns for a Hosted Gateway
@@ -711,6 +863,12 @@ The session should not branch on provider name; it should branch on capabilities
 - The gateway authenticates the client (API key / JWT).
 - The gateway stores per-tenant provider credentials (ElevenLabs API key, Cartesia key, etc.).
 - The gateway never forwards raw provider keys to clients.
+
+Fail-fast policy:
+- If the requested `voice_provider` is not configured for the tenant (missing credentials), the gateway should fail
+  fast during the handshake (e.g. `hello_ack` includes an explicit error, or a terminal error message is sent and the
+  socket is closed).
+- Provider fallback should be explicit (tenant policy/config), not an implicit runtime surprise.
 
 ### 13.2 Rate limits and resource caps
 - enforce:
