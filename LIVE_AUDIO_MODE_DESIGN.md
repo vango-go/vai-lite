@@ -174,6 +174,19 @@ Implications for this design:
   - reconnection/resume
   - detecting dropped frames in intermediary stacks
 
+### 4.2.2 Timebase (audio clock) — normative
+
+Many behaviors depend on timing: endpointing, grace window, and interrupt truncation.
+
+Define a single session-relative timebase:
+- `session_time_ms` starts at `0` at the moment the client receives `hello_ack`.
+- All `timestamp_ms`, `end_ms`, and `played_ms` values are interpreted relative to this timebase.
+
+Normative v1 guidance:
+- Client SHOULD include `audio_frame.timestamp_ms` in `session_time_ms` and keep it monotonic.
+- If missing, the gateway falls back to server receipt time estimates (works but reduces determinism).
+- `playback_mark.played_ms` is segment-relative (resets to 0 for each `assistant_audio_id`), but `playback_mark` messages themselves may include an optional `timestamp_ms` in `session_time_ms` for diagnostics.
+
 ### 4.3 Client -> Server message types (minimum)
 
 #### `hello`
@@ -269,6 +282,46 @@ Examples:
 }
 ```
 
+#### `error` (session or turn scoped)
+
+The server should send structured errors. Some are terminal (socket will close), others are per-turn.
+
+```json
+{
+  "type": "error",
+  "scope": "session",
+  "code": "unauthorized",
+  "message": "Missing or invalid API key.",
+  "retryable": false,
+  "close": true,
+  "details": {}
+}
+```
+
+Recommended `code` values:
+- `unauthorized`, `forbidden`
+- `bad_request` (invalid JSON, invalid fields)
+- `unsupported` (unsupported format/feature)
+- `rate_limited`
+- `provider_error` (upstream STT/TTS failure)
+- `internal`
+
+#### `warning`
+
+Non-fatal issues (e.g., dropped mic frames, suspected echo-only speech).
+
+```json
+{"type":"warning","code":"mic_overrun","message":"Dropping audio frames: inbound rate too high."}
+```
+
+#### `audio_in_ack` (optional)
+
+Optional acknowledgements for mic audio ingestion (useful for debugging and future resume).
+
+```json
+{"type":"audio_in_ack","stream_id":"mic","last_seq":123,"timestamp_ms":1700}
+```
+
 #### `transcript_delta`
 ```json
 {
@@ -320,6 +373,10 @@ Binary variant:
 {"type":"assistant_audio_chunk_header","assistant_audio_id":"a_42","seq":1,"bytes":4096}
 ```
 - Follow with a binary frame of audio bytes.
+
+Normative binary framing rule (server→client):
+- When using binary transport for assistant audio, the server MUST send the header immediately followed by exactly one binary frame of the specified length for the same `assistant_audio_id` + `seq`.
+- The server MUST NOT interleave other server→client frames between the header and its binary frame.
 
 If alignment is supported (ElevenLabs char alignment; others may be word alignment), include a normalized shape:
 ```json
@@ -385,6 +442,20 @@ v1 should define a concrete backpressure mechanism. Two practical approaches:
    - More complex but can be more deterministic for embedded clients.
 
 Regardless of approach, the server must never buffer unbounded audio in memory.
+
+### 4.6 Inbound mic limits (required)
+
+To avoid abuse and runaway memory/CPU usage, v1 should enforce hard limits for inbound audio.
+
+Recommended v1 policy (starting point):
+- Require `audio_in=pcm_s16le@16000Hz mono`.
+- Expected mic frame size: 10–40ms per frame (20ms recommended).
+- Max single frame bytes: 8192.
+- Max sustained inbound rate: ~1.5× expected PCM bandwidth for the negotiated format (to tolerate burstiness).
+
+Overload behavior:
+- If inbound rate is too high, the gateway may drop frames and emit `warning{code:"mic_overrun"}`.
+- If overload persists (e.g., > 2s continuously), the gateway should send `error{code:"rate_limited", close:true}` and close the socket.
 
 ---
 
@@ -619,6 +690,15 @@ If client provides echo cancellation (AEC), that should be required for web/mobi
 Client capability negotiation:
 - `hello.features.client_has_aec` should be treated as a hint that the gateway can use less aggressive gating.
 - If `client_has_aec=false` (or unknown), the gateway should tighten gating thresholds to reduce false barge-ins.
+
+Recommended v1 defaults (tunable by tenant/session):
+- `minChars = 4` (after trimming)
+- `minWords = 1` (best-effort split on whitespace/punctuation)
+- `requireLetterOrDigit = true` (reject segments that are purely punctuation/symbols)
+- If the STT provider returns confidence: `minConfidence = 0.5` (start point; tune)
+
+When the assistant is speaking (risk of echo), tighten:
+- increase `minChars` (e.g. 8) and/or require a final segment before treating as “confirmed speech”.
 
 ### 7.3 Grace period truth table (normative)
 
@@ -869,6 +949,22 @@ Fail-fast policy:
   fast during the handshake (e.g. `hello_ack` includes an explicit error, or a terminal error message is sent and the
   socket is closed).
 - Provider fallback should be explicit (tenant policy/config), not an implicit runtime surprise.
+
+### 13.2 Tooling policy (live mode)
+
+Live mode is still a tool-using agent, but to keep latencies bounded and user experience predictable, v1 should have
+a conservative policy:
+
+- Allowlist tools per tenant/session (default: only `talk_to_user` + a small safe set).
+- Enforce strict budgets:
+  - `max_tool_calls_per_turn` (e.g. 5)
+  - `tool_timeout_ms` (e.g. 10_000 per call)
+  - `run_timeout_ms` for the whole turn (e.g. 30_000)
+- If a tool fails or times out:
+  - emit a `run_event` (optional) and/or a `warning`
+  - the model may recover by calling `talk_to_user` with an apology/next-step
+
+The goal is: live sessions should not “hang” because a tool got stuck.
 
 ### 13.2 Rate limits and resource caps
 - enforce:

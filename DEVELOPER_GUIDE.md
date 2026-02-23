@@ -1092,6 +1092,7 @@ Canonical design doc (more detailed): `LIVE_AUDIO_MODE_DESIGN.md`.
 - **Grace period (5s):** if the user resumes speaking and produces confirmed speech within `5s` of the end of the last committed utterance, the gateway cancels any in-progress assistant output/run and appends the resumed transcript to the same user turn.
 - **Noise vs real speech:** the gateway must not cancel the assistant due to noise/echo-only activity; it should require “confirmed speech” before cancelling during grace/interrupt detection.
 - **User timestamps:** user messages should carry the timestamp of when the user finished speaking (session-relative `end_ms`).
+- **Timebase:** client timestamps should be session-relative and monotonic (see `LIVE_AUDIO_MODE_DESIGN.md`).
 
 ### 13.3 `talk_to_user(text)` terminal tool
 
@@ -1182,6 +1183,11 @@ These are *recommended starting points* for a live gateway; validate against rea
 
 Credential policy:
 - If a tenant selects `voice_provider=elevenlabs` but has no ElevenLabs credential configured, fail fast during handshake with a clear error. Do not silently fall back to Cartesia unless that is an explicit tenant policy.
+
+Operational notes:
+- Prefer `audio_out=pcm_*` for v1 so timing/backpressure math is correct; compressed audio output is possible later but requires `sent_ms` to be computed from decoded PCM duration.
+- Enforce inbound mic limits (frame size/rate); drop with warnings and fail fast on sustained overload.
+- Use an allowlisted tool policy + timeouts so live sessions can’t hang on tools.
 
 #### Cartesia (STT default)
 - `model=ink-whisper`
