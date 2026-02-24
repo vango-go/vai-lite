@@ -76,6 +76,21 @@ type PingEvent struct {
 
 func (e PingEvent) EventType() string { return "ping" }
 
+// AudioChunkEvent is an incremental synthesized audio payload emitted by the gateway
+// when voice output is enabled for a streaming request.
+//
+// This event type is gateway-emitted (not provider-emitted) and is intended to be used
+// for proxy mode SSE and Live Audio Mode fan-out.
+type AudioChunkEvent struct {
+	Type         string `json:"type"` // "audio_chunk"
+	Format       string `json:"format"`
+	Audio        string `json:"audio"`                    // base64-encoded audio bytes
+	SampleRateHz int    `json:"sample_rate_hz,omitempty"` // optional (recommended for PCM)
+	IsFinal      bool   `json:"is_final,omitempty"`
+}
+
+func (e AudioChunkEvent) EventType() string { return "audio_chunk" }
+
 // --- Delta Types ---
 
 // TextDelta contains incremental text content.
@@ -112,8 +127,13 @@ func (e ErrorEvent) EventType() string { return "error" }
 
 // Error represents an error in streaming.
 type Error struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
+	Type          string `json:"type"`
+	Message       string `json:"message"`
+	Param         string `json:"param,omitempty"`
+	Code          string `json:"code,omitempty"`
+	RequestID     string `json:"request_id,omitempty"`
+	ProviderError any    `json:"provider_error,omitempty"`
+	RetryAfter    *int   `json:"retry_after,omitempty"`
 }
 
 // UnmarshalStreamEvent deserializes a stream event from JSON.
@@ -196,6 +216,13 @@ func UnmarshalStreamEvent(data []byte) (StreamEvent, error) {
 
 	case "ping":
 		var event PingEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
+	case "audio_chunk":
+		var event AudioChunkEvent
 		if err := json.Unmarshal(data, &event); err != nil {
 			return nil, err
 		}

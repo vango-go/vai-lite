@@ -17,6 +17,7 @@ func TestStreamEvent_Types(t *testing.T) {
 		{MessageDeltaEvent{Type: "message_delta"}, "message_delta"},
 		{MessageStopEvent{Type: "message_stop"}, "message_stop"},
 		{PingEvent{Type: "ping"}, "ping"},
+		{AudioChunkEvent{Type: "audio_chunk"}, "audio_chunk"},
 		{ErrorEvent{Type: "error"}, "error"},
 	}
 
@@ -164,6 +165,84 @@ func TestUnmarshalStreamEvent_MessageDelta(t *testing.T) {
 	}
 	if md.Usage.TotalTokens != 150 {
 		t.Errorf("TotalTokens = %d, want 150", md.Usage.TotalTokens)
+	}
+}
+
+func TestUnmarshalStreamEvent_AudioChunk(t *testing.T) {
+	jsonData := `{
+		"type": "audio_chunk",
+		"format": "pcm",
+		"audio": "AQID",
+		"sample_rate_hz": 24000,
+		"is_final": false
+	}`
+
+	event, err := UnmarshalStreamEvent([]byte(jsonData))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	ac, ok := event.(AudioChunkEvent)
+	if !ok {
+		t.Fatalf("Expected AudioChunkEvent, got %T", event)
+	}
+	if ac.Format != "pcm" {
+		t.Errorf("Format = %q, want %q", ac.Format, "pcm")
+	}
+	if ac.Audio != "AQID" {
+		t.Errorf("Audio = %q, want %q", ac.Audio, "AQID")
+	}
+	if ac.SampleRateHz != 24000 {
+		t.Errorf("SampleRateHz = %d, want %d", ac.SampleRateHz, 24000)
+	}
+	if ac.IsFinal {
+		t.Errorf("IsFinal = true, want false")
+	}
+}
+
+func TestUnmarshalStreamEvent_ErrorWithExtendedFields(t *testing.T) {
+	jsonData := `{
+		"type":"error",
+		"error":{
+			"type":"rate_limit_error",
+			"message":"too many requests",
+			"param":"model",
+			"code":"rl",
+			"request_id":"req_123",
+			"retry_after":10,
+			"provider_error":{"raw":"x"}
+		}
+	}`
+
+	event, err := UnmarshalStreamEvent([]byte(jsonData))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	ee, ok := event.(ErrorEvent)
+	if !ok {
+		t.Fatalf("Expected ErrorEvent, got %T", event)
+	}
+	if ee.Error.Type != "rate_limit_error" {
+		t.Errorf("Error.Type = %q, want %q", ee.Error.Type, "rate_limit_error")
+	}
+	if ee.Error.Param != "model" {
+		t.Errorf("Error.Param = %q, want %q", ee.Error.Param, "model")
+	}
+	if ee.Error.Code != "rl" {
+		t.Errorf("Error.Code = %q, want %q", ee.Error.Code, "rl")
+	}
+	if ee.Error.RequestID != "req_123" {
+		t.Errorf("Error.RequestID = %q, want %q", ee.Error.RequestID, "req_123")
+	}
+	if ee.Error.RetryAfter == nil || *ee.Error.RetryAfter != 10 {
+		if ee.Error.RetryAfter == nil {
+			t.Fatalf("Error.RetryAfter is nil, want 10")
+		}
+		t.Errorf("Error.RetryAfter = %d, want %d", *ee.Error.RetryAfter, 10)
+	}
+	if ee.Error.ProviderError == nil {
+		t.Fatalf("Error.ProviderError is nil, want object")
 	}
 }
 

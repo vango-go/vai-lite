@@ -116,10 +116,10 @@ func (p *Pipeline) SynthesizeResponse(ctx context.Context, text string, cfg *typ
 		return nil, nil
 	}
 
-	// Use configured sample rate or default to 44100 Hz
+	// Use configured sample rate or default to 24000 Hz (Cartesia sonic-3 baseline).
 	sampleRate := cfg.Output.SampleRate
 	if sampleRate == 0 {
-		sampleRate = 44100
+		sampleRate = 24000
 	}
 
 	synth, err := p.ttsProvider.Synthesize(ctx, text, tts.SynthesizeOptions{
@@ -255,6 +255,12 @@ func (p *Pipeline) NewStreamingTTSContext(ctx context.Context, cfg *types.VoiceC
 		Volume:  cfg.Output.Volume,
 		Emotion: cfg.Output.Emotion,
 		Format:  cfg.Output.Format,
+		SampleRate: func() int {
+			if cfg.Output.SampleRate > 0 {
+				return cfg.Output.SampleRate
+			}
+			return 24000
+		}(),
 	}
 
 	return p.ttsProvider.NewStreamingContext(ctx, opts)

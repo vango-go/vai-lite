@@ -1,7 +1,6 @@
 package vai
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -99,27 +98,18 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 	var response types.MessageResponse
 	var currentContent []types.ContentBlock
 	toolInputBuffers := make(map[int]string)
-	var voiceBuffer *voice.SentenceBuffer
-	var audioBytes bytes.Buffer
+	var ttsStream *voice.StreamingTTS
 	audioDone := make(chan struct{})
-	audioErr := make(chan error, 1)
 
 	if s.voiceOutput != nil {
-		voiceBuffer = voice.NewSentenceBuffer()
+		ttsStream = voice.NewStreamingTTS(s.voiceOutput.ttsCtx, voice.StreamingTTSOptions{BufferAudio: true})
 		go func() {
 			defer close(audioDone)
-			for chunk := range s.voiceOutput.ttsCtx.Audio() {
-				audioBytes.Write(chunk)
+			for chunk := range ttsStream.Audio() {
 				select {
 				case audioEvents <- AudioChunk{Data: chunk, Format: s.voiceOutput.format}:
 				case <-s.done:
 					return
-				}
-			}
-			if err := s.voiceOutput.ttsCtx.Err(); err != nil {
-				select {
-				case audioErr <- err:
-				default:
 				}
 			}
 		}()
@@ -194,15 +184,13 @@ streamLoop:
 
 			if s.voiceOutput != nil {
 				if textDelta, ok := e.Delta.(types.TextDelta); ok {
-					for _, sentence := range voiceBuffer.Add(textDelta.Text) {
-						if err := s.voiceOutput.ttsCtx.SendText(sentence, false); err != nil {
-							voiceAborted = true
-							if s.err == nil || errors.Is(s.err, io.EOF) {
-								s.err = fmt.Errorf("voice output stream send failed: %w", err)
-							}
-							_ = s.eventStream.Close()
-							break streamLoop
+					if err := ttsStream.OnTextDelta(textDelta.Text); err != nil {
+						voiceAborted = true
+						if s.err == nil || errors.Is(s.err, io.EOF) {
+							s.err = fmt.Errorf("voice output stream send failed: %w", err)
 						}
+						_ = s.eventStream.Close()
+						break streamLoop
 					}
 				}
 			}
@@ -238,25 +226,14 @@ streamLoop:
 
 	if s.voiceOutput != nil {
 		if !voiceAborted {
-			remaining := strings.TrimSpace(voiceBuffer.Flush())
-			var flushErr error
-			if remaining != "" {
-				flushErr = s.voiceOutput.ttsCtx.SendText(remaining, true)
-			} else {
-				flushErr = s.voiceOutput.ttsCtx.Flush()
-			}
-			if flushErr != nil && (s.err == nil || errors.Is(s.err, io.EOF)) {
+			if flushErr := ttsStream.Flush(); flushErr != nil && (s.err == nil || errors.Is(s.err, io.EOF)) {
 				s.err = fmt.Errorf("voice output flush failed: %w", flushErr)
 			}
 		}
-		_ = s.voiceOutput.ttsCtx.Close()
+		_ = ttsStream.Close()
 		<-audioDone
-		select {
-		case err := <-audioErr:
-			if err != nil && (s.err == nil || errors.Is(s.err, io.EOF)) {
-				s.err = fmt.Errorf("voice output stream failed: %w", err)
-			}
-		default:
+		if err := ttsStream.Err(); err != nil && (s.err == nil || errors.Is(s.err, io.EOF)) {
+			s.err = fmt.Errorf("voice output stream failed: %w", err)
 		}
 	}
 
@@ -273,17 +250,20 @@ streamLoop:
 		response.Metadata["user_transcript"] = s.userTranscript
 	}
 
-	if s.voiceOutput != nil && audioBytes.Len() > 0 {
-		transcript := strings.TrimSpace(response.TextContent())
-		response.Content = append(response.Content, types.AudioBlock{
-			Type: "audio",
-			Source: types.AudioSource{
-				Type:      "base64",
-				MediaType: mediaTypeForAudioFormat(s.voiceOutput.format),
-				Data:      base64.StdEncoding.EncodeToString(audioBytes.Bytes()),
-			},
-			Transcript: &transcript,
-		})
+	if s.voiceOutput != nil {
+		audioBytes := ttsStream.AudioBytes()
+		if len(audioBytes) > 0 {
+			transcript := strings.TrimSpace(response.TextContent())
+			response.Content = append(response.Content, types.AudioBlock{
+				Type: "audio",
+				Source: types.AudioSource{
+					Type:      "base64",
+					MediaType: mediaTypeForAudioFormat(s.voiceOutput.format),
+					Data:      base64.StdEncoding.EncodeToString(audioBytes),
+				},
+				Transcript: &transcript,
+			})
+		}
 	}
 
 	s.response = &response

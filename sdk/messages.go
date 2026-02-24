@@ -2,13 +2,13 @@ package vai
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
 
 	"github.com/vango-go/vai-lite/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/voice"
 )
 
 // MessagesService executes tool-loop runs.
@@ -210,14 +210,11 @@ func (s *MessagesService) preprocessVoiceInput(ctx context.Context, req *Message
 		return nil, "", err
 	}
 
-	processed, transcript, err := s.client.voicePipeline.ProcessInputAudio(ctx, req.Messages, req.Voice)
+	processedReq, transcript, err := voice.PreprocessMessageRequestInputAudio(ctx, s.client.voicePipeline, req)
 	if err != nil {
 		return nil, "", fmt.Errorf("transcribe input audio: %w", err)
 	}
-
-	reqCopy := *req
-	reqCopy.Messages = processed
-	return &reqCopy, transcript, nil
+	return processedReq, transcript, nil
 }
 
 func (s *MessagesService) appendVoiceOutput(ctx context.Context, req *MessageRequest, resp *types.MessageResponse) error {
@@ -228,29 +225,10 @@ func (s *MessagesService) appendVoiceOutput(ctx context.Context, req *MessageReq
 		return err
 	}
 
-	text := strings.TrimSpace(resp.TextContent())
-	if text == "" {
-		return nil
-	}
-
-	audioData, err := s.client.voicePipeline.SynthesizeResponse(ctx, text, req.Voice)
+	err := voice.AppendVoiceOutputToMessageResponse(ctx, s.client.voicePipeline, req.Voice, resp)
 	if err != nil {
 		return fmt.Errorf("synthesize voice output: %w", err)
 	}
-	if len(audioData) == 0 {
-		return nil
-	}
-
-	transcript := text
-	resp.Content = append(resp.Content, types.AudioBlock{
-		Type: "audio",
-		Source: types.AudioSource{
-			Type:      "base64",
-			MediaType: mediaTypeForAudioFormat(req.Voice.Output.Format),
-			Data:      base64.StdEncoding.EncodeToString(audioData),
-		},
-		Transcript: &transcript,
-	})
 	return nil
 }
 
