@@ -32,9 +32,10 @@ func FromError(err error, requestID string) (*core.Error, int) {
 	if errors.Is(err, context.Canceled) {
 		return &core.Error{
 			Type:      core.ErrAPI,
-			Message:   "request canceled",
+			Message:   "request cancelled",
+			Code:      "cancelled",
 			RequestID: requestID,
-		}, 499
+		}, http.StatusRequestTimeout
 	}
 
 	// Already canonical.
@@ -116,7 +117,7 @@ func statusFromType(t core.ErrorType) int {
 	case core.ErrRateLimit:
 		return http.StatusTooManyRequests
 	case core.ErrOverloaded:
-		return http.StatusServiceUnavailable
+		return 529
 	case core.ErrProvider:
 		return http.StatusBadGateway
 	case core.ErrAPI:

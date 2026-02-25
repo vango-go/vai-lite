@@ -6,13 +6,22 @@ import (
 
 // Error represents an API error.
 type Error struct {
-	Type          ErrorType `json:"type"`
-	Message       string    `json:"message"`
-	Param         string    `json:"param,omitempty"`
-	Code          string    `json:"code,omitempty"`
-	RequestID     string    `json:"request_id,omitempty"`
-	ProviderError any       `json:"provider_error,omitempty"`
-	RetryAfter    *int      `json:"retry_after,omitempty"`
+	Type          ErrorType            `json:"type"`
+	Message       string               `json:"message"`
+	Param         string               `json:"param,omitempty"`
+	Code          string               `json:"code,omitempty"`
+	RequestID     string               `json:"request_id,omitempty"`
+	ProviderError any                  `json:"provider_error,omitempty"`
+	RetryAfter    *int                 `json:"retry_after,omitempty"`
+	CompatIssues  []CompatibilityIssue `json:"compat_issues,omitempty"`
+}
+
+// CompatibilityIssue describes a provider/model compatibility problem.
+type CompatibilityIssue struct {
+	Severity string `json:"severity"`
+	Param    string `json:"param"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
 }
 
 // Error implements the error interface.

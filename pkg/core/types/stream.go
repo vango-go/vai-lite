@@ -178,13 +178,22 @@ func (e ErrorEvent) EventType() string { return "error" }
 
 // Error represents an error in streaming.
 type Error struct {
-	Type          string `json:"type"`
-	Message       string `json:"message"`
-	Param         string `json:"param,omitempty"`
-	Code          string `json:"code,omitempty"`
-	RequestID     string `json:"request_id,omitempty"`
-	ProviderError any    `json:"provider_error,omitempty"`
-	RetryAfter    *int   `json:"retry_after,omitempty"`
+	Type          string               `json:"type"`
+	Message       string               `json:"message"`
+	Param         string               `json:"param,omitempty"`
+	Code          string               `json:"code,omitempty"`
+	RequestID     string               `json:"request_id,omitempty"`
+	ProviderError any                  `json:"provider_error,omitempty"`
+	RetryAfter    *int                 `json:"retry_after,omitempty"`
+	CompatIssues  []CompatibilityIssue `json:"compat_issues,omitempty"`
+}
+
+// CompatibilityIssue describes a provider/model compatibility problem.
+type CompatibilityIssue struct {
+	Severity string `json:"severity"`
+	Param    string `json:"param"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
 }
 
 // UnmarshalStreamEvent deserializes a stream event from JSON.

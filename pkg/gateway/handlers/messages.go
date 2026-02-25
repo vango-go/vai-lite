@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,10 +20,12 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 	"github.com/vango-go/vai-lite/pkg/gateway/apierror"
-	"github.com/vango-go/vai-lite/pkg/gateway/auth"
+	"github.com/vango-go/vai-lite/pkg/gateway/compat"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
+	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
 	"github.com/vango-go/vai-lite/pkg/gateway/limits"
 	"github.com/vango-go/vai-lite/pkg/gateway/mw"
+	"github.com/vango-go/vai-lite/pkg/gateway/principal"
 	"github.com/vango-go/vai-lite/pkg/gateway/ratelimit"
 	"github.com/vango-go/vai-lite/pkg/gateway/sse"
 )
@@ -37,11 +40,18 @@ type MessagesHandler struct {
 	HTTPClient *http.Client
 	Logger     *slog.Logger
 	Limiter    *ratelimit.Limiter
+	Lifecycle  *lifecycle.Lifecycle
 }
 
 func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		reqID, _ := mw.RequestIDFrom(r.Context())
+		h.writeErrorJSON(w, reqID, &core.Error{
+			Type:      core.ErrInvalidRequest,
+			Message:   "method not allowed",
+			Code:      "method_not_allowed",
+			RequestID: reqID,
+		}, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -83,7 +93,7 @@ func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamKeyHeader, ok := providerKeyHeader(providerName)
+	upstreamKeyHeader, ok := compat.ProviderKeyHeader(providerName)
 	if !ok {
 		h.writeErrorJSON(w, reqID, core.NewInvalidRequestErrorWithParam("unsupported provider", "model"), http.StatusBadRequest)
 		return
@@ -94,8 +104,19 @@ func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Type:      core.ErrAuthentication,
 			Message:   "missing upstream provider api key header",
 			Param:     upstreamKeyHeader,
+			Code:      "provider_key_missing",
 			RequestID: reqID,
 		}, http.StatusUnauthorized)
+		return
+	}
+
+	if compatIssues := compat.ValidateMessageRequest(req, providerName, req.Model); len(compatIssues) > 0 {
+		h.writeErrorJSON(w, reqID, &core.Error{
+			Type:         core.ErrInvalidRequest,
+			Message:      fmt.Sprintf("Request is incompatible with provider %s and model %s", providerName, modelName),
+			CompatIssues: compatIssues,
+			RequestID:    reqID,
+		}, http.StatusBadRequest)
 		return
 	}
 
@@ -155,13 +176,20 @@ func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		principalKey := "anonymous"
-		if p, ok := auth.PrincipalFrom(r.Context()); ok {
-			principalKey = ratelimit.PrincipalKeyFromAPIKey(p.APIKey)
+		if h.Lifecycle != nil && h.Lifecycle.IsDraining() {
+			h.writeErrorJSON(w, reqID, &core.Error{
+				Type:      core.ErrOverloaded,
+				Message:   "gateway is draining",
+				Code:      "draining",
+				RequestID: reqID,
+			}, 529)
+			return
 		}
 
+		p := principal.Resolve(r, h.Config)
+
 		if h.Limiter != nil && h.Config.LimitMaxConcurrentStreams > 0 {
-			dec := h.Limiter.AcquireStream(principalKey, time.Now())
+			dec := h.Limiter.AcquireStream(p.Key, time.Now())
 			if !dec.Allowed {
 				if dec.RetryAfter > 0 {
 					w.Header().Set("Retry-After", itoa(dec.RetryAfter))
@@ -272,6 +300,9 @@ func (h MessagesHandler) serveStream(
 	var ttsCtx *tts.StreamingContext
 	var ttsStream *voice.StreamingTTS
 	audioDone := make(chan struct{})
+	audioBytesCh := make(chan []byte, 100)
+	audioUnavailableCh := make(chan types.AudioUnavailableEvent, 1)
+	audioStopped := false
 	sampleRateHz := 24000
 	if req.Voice != nil && req.Voice.Output != nil && req.Voice.Output.SampleRate > 0 {
 		sampleRateHz = req.Voice.Output.SampleRate
@@ -288,18 +319,46 @@ func (h MessagesHandler) serveStream(
 
 		go func() {
 			defer close(audioDone)
+			defer close(audioBytesCh)
+
+			dropped := false
 			for chunk := range ttsStream.Audio() {
-				ev := types.AudioChunkEvent{
-					Type:         "audio_chunk",
-					Format:       "pcm_s16le",
-					Audio:        base64.StdEncoding.EncodeToString(chunk),
-					SampleRateHz: sampleRateHz,
+				if len(chunk) == 0 {
+					continue
 				}
-				_ = send(ev.EventType(), ev)
+				if dropped {
+					continue
+				}
+				select {
+				case audioBytesCh <- chunk:
+				default:
+					dropped = true
+					// Best-effort: disable audio emission for this response.
+					select {
+					case audioUnavailableCh <- types.AudioUnavailableEvent{
+						Type:    "audio_unavailable",
+						Reason:  "backpressure",
+						Message: "TTS audio backpressure: client is too slow",
+					}:
+					default:
+					}
+				}
 			}
 		}()
 	} else {
+		close(audioBytesCh)
 		close(audioDone)
+	}
+
+	sendAudioChunk := func(chunk []byte, isFinal bool) error {
+		ev := types.AudioChunkEvent{
+			Type:         "audio_chunk",
+			Format:       "pcm_s16le",
+			Audio:        base64.StdEncoding.EncodeToString(chunk),
+			SampleRateHz: sampleRateHz,
+			IsFinal:      isFinal,
+		}
+		return send(ev.EventType(), ev)
 	}
 
 	type nextResult struct {
@@ -343,6 +402,58 @@ func (h MessagesHandler) serveStream(
 			}
 		}
 	}()
+
+	// Audio chunk lookahead buffer (so we can mark the final non-empty chunk).
+	var pendingAudio []byte
+	flushPendingAudio := func(final bool) error {
+		if audioStopped || len(pendingAudio) == 0 {
+			pendingAudio = nil
+			return nil
+		}
+		chunk := pendingAudio
+		pendingAudio = nil
+		return sendAudioChunk(chunk, final)
+	}
+
+	drainAudioNonBlocking := func(max int) error {
+		if audioStopped || ttsStream == nil {
+			return nil
+		}
+		for i := 0; i < max; i++ {
+			select {
+			case unavailable := <-audioUnavailableCh:
+				// Terminal for audio; no more audio chunks should be emitted.
+				audioStopped = true
+				pendingAudio = nil
+				if ttsStream != nil {
+					_ = ttsStream.Close()
+					ttsStream = nil
+				}
+				if ttsCtx != nil {
+					_ = ttsCtx.Close()
+				}
+				if err := send(unavailable.EventType(), unavailable); err != nil {
+					return err
+				}
+				return nil
+			case chunk, ok := <-audioBytesCh:
+				if !ok {
+					return nil
+				}
+				if len(chunk) == 0 {
+					continue
+				}
+				// Emit the previous chunk (non-final) and buffer the new one.
+				if err := flushPendingAudio(false); err != nil {
+					return err
+				}
+				pendingAudio = chunk
+			default:
+				return nil
+			}
+		}
+		return nil
+	}
 
 	for {
 		select {
@@ -403,6 +514,8 @@ func (h MessagesHandler) serveStream(
 									Reason:  "tts_failed",
 									Message: "TTS synthesis failed: " + sendErr.Error(),
 								}
+								audioStopped = true
+								pendingAudio = nil
 								if sendErr := send(audioUnavailable.EventType(), audioUnavailable); sendErr != nil {
 									_ = stream.Close()
 									if ttsCtx != nil {
@@ -416,6 +529,15 @@ func (h MessagesHandler) serveStream(
 				}
 
 				if sendErr := send(res.ev.EventType(), res.ev); sendErr != nil {
+					_ = stream.Close()
+					if ttsCtx != nil {
+						_ = ttsCtx.Close()
+					}
+					return
+				}
+
+				// After forwarding a provider event, opportunistically drain a few audio chunks.
+				if err := drainAudioNonBlocking(2); err != nil {
 					_ = stream.Close()
 					if ttsCtx != nil {
 						_ = ttsCtx.Close()
@@ -439,43 +561,61 @@ func (h MessagesHandler) serveStream(
 
 done:
 
-	if ttsStream != nil {
-		_ = ttsStream.Flush()
+	// If audio already failed due to backpressure, make sure the audio_unavailable event is emitted even if
+	// the provider stream ended before we had another chance to drain the channel.
+	select {
+	case unavailable := <-audioUnavailableCh:
+		audioStopped = true
+		pendingAudio = nil
+		if ttsStream != nil {
+			_ = ttsStream.Close()
+			ttsStream = nil
+		}
+		if ttsCtx != nil {
+			_ = ttsCtx.Close()
+		}
+		_ = send(unavailable.EventType(), unavailable)
+	default:
+	}
+
+	if ttsStream != nil && !audioStopped {
+		if err := ttsStream.Flush(); err != nil {
+			audioStopped = true
+			pendingAudio = nil
+			_ = send("audio_unavailable", types.AudioUnavailableEvent{
+				Type:    "audio_unavailable",
+				Reason:  "tts_failed",
+				Message: "TTS synthesis failed: " + err.Error(),
+			})
+		}
 		_ = ttsStream.Close()
 		<-audioDone
-		if err := ttsStream.Err(); err != nil {
-			h.writeErr(w, reqID, err, true)
-			return
+		if err := ttsStream.Err(); err != nil && !audioStopped {
+			audioStopped = true
+			pendingAudio = nil
+			_ = send("audio_unavailable", types.AudioUnavailableEvent{
+				Type:    "audio_unavailable",
+				Reason:  "tts_failed",
+				Message: "TTS synthesis failed: " + err.Error(),
+			})
 		}
-		// Emit a final marker.
-		_ = send("audio_chunk", types.AudioChunkEvent{
-			Type:         "audio_chunk",
-			Format:       "pcm_s16le",
-			Audio:        "",
-			SampleRateHz: sampleRateHz,
-			IsFinal:      true,
-		})
 	}
-}
 
-func providerKeyHeader(provider string) (string, bool) {
-	switch provider {
-	case "anthropic":
-		return "X-Provider-Key-Anthropic", true
-	case "openai":
-		return "X-Provider-Key-OpenAI", true
-	case "oai-resp":
-		return "X-Provider-Key-OpenAI", true
-	case "gemini":
-		return "X-Provider-Key-Gemini", true
-	case "groq":
-		return "X-Provider-Key-Groq", true
-	case "cerebras":
-		return "X-Provider-Key-Cerebras", true
-	case "openrouter":
-		return "X-Provider-Key-OpenRouter", true
-	default:
-		return "", false
+	// Drain any remaining audio bytes and emit the final chunk marker if applicable.
+	if ttsStream != nil && !audioStopped {
+		for chunk := range audioBytesCh {
+			if len(chunk) == 0 {
+				continue
+			}
+			if err := flushPendingAudio(false); err != nil {
+				return
+			}
+			pendingAudio = chunk
+		}
+		_ = flushPendingAudio(true)
+	} else {
+		for range audioBytesCh {
+		}
 	}
 }
 
@@ -500,6 +640,7 @@ func (h MessagesHandler) writeErr(w http.ResponseWriter, reqID string, err error
 					RequestID:     coreErr.RequestID,
 					ProviderError: coreErr.ProviderError,
 					RetryAfter:    coreErr.RetryAfter,
+					CompatIssues:  toTypesCompatIssues(coreErr.CompatIssues),
 				},
 			})
 		}
@@ -517,4 +658,20 @@ func (h MessagesHandler) writeErrorJSON(w http.ResponseWriter, reqID string, cor
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(apierror.Envelope{Error: coreErr})
+}
+
+func toTypesCompatIssues(issues []core.CompatibilityIssue) []types.CompatibilityIssue {
+	if len(issues) == 0 {
+		return nil
+	}
+	out := make([]types.CompatibilityIssue, len(issues))
+	for i := range issues {
+		out[i] = types.CompatibilityIssue{
+			Severity: issues[i].Severity,
+			Param:    issues[i].Param,
+			Code:     issues[i].Code,
+			Message:  issues[i].Message,
+		}
+	}
+	return out
 }

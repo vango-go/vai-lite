@@ -57,7 +57,7 @@ func TestCORS_Preflight_Allowed(t *testing.T) {
 	req := httptest.NewRequest(http.MethodOptions, "/v1/messages", nil)
 	req.Header.Set("Origin", "https://app.example.com")
 	req.Header.Set("Access-Control-Request-Method", "POST")
-	req.Header.Set("Access-Control-Request-Headers", "Authorization, Content-Type")
+	req.Header.Set("Access-Control-Request-Headers", "Authorization, Content-Type, X-VAI-Version, X-Bogus")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -73,8 +73,16 @@ func TestCORS_Preflight_Allowed(t *testing.T) {
 	}
 	if got := rr.Header().Get("Access-Control-Allow-Headers"); got == "" {
 		t.Fatalf("expected allow-headers header")
-	} else if !strings.Contains(got, "X-VAI-Version") {
-		t.Fatalf("expected X-VAI-Version in allow-headers, got %q", got)
+	} else {
+		if !strings.Contains(got, "X-VAI-Version") {
+			t.Fatalf("expected X-VAI-Version in allow-headers, got %q", got)
+		}
+		if strings.Contains(got, "X-Bogus") {
+			t.Fatalf("expected X-Bogus to be filtered from allow-headers, got %q", got)
+		}
+	}
+	if got := rr.Header().Get("Vary"); got != "Origin, Access-Control-Request-Headers" {
+		t.Fatalf("Vary=%q", got)
 	}
 }
 

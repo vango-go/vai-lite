@@ -22,6 +22,10 @@ type Config struct {
 	AuthMode AuthMode
 	APIKeys  map[string]struct{}
 
+	// If true, client identity may be derived from proxy headers like X-Forwarded-For.
+	// This should only be enabled when the gateway is deployed behind a trusted proxy/LB.
+	TrustProxyHeaders bool
+
 	MaxBodyBytes int64
 
 	// Request-shape limits (enforced after strict decode).
@@ -53,9 +57,10 @@ type Config struct {
 	LimitMaxConcurrentStreams  int
 
 	// Operational defaults
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	HandlerTimeout    time.Duration
+	ReadHeaderTimeout   time.Duration
+	ReadTimeout         time.Duration
+	HandlerTimeout      time.Duration
+	ShutdownGracePeriod time.Duration
 
 	// Upstream HTTP client defaults
 	UpstreamConnectTimeout        time.Duration
@@ -67,6 +72,7 @@ func LoadFromEnv() (Config, error) {
 		Addr:                          envOr("VAI_PROXY_ADDR", ":8080"),
 		AuthMode:                      AuthMode(envOr("VAI_PROXY_AUTH_MODE", string(AuthModeRequired))),
 		APIKeys:                       make(map[string]struct{}),
+		TrustProxyHeaders:             envBoolOr("VAI_PROXY_TRUST_PROXY_HEADERS", false),
 		MaxBodyBytes:                  envInt64Or("VAI_PROXY_MAX_BODY_BYTES", 8<<20), // 8 MiB
 		MaxMessages:                   envIntOr("VAI_PROXY_MAX_MESSAGES", 64),
 		MaxTools:                      envIntOr("VAI_PROXY_MAX_TOOLS", 64),
@@ -87,6 +93,7 @@ func LoadFromEnv() (Config, error) {
 		ReadHeaderTimeout:             envDurationOr("VAI_PROXY_READ_HEADER_TIMEOUT", 10*time.Second),
 		ReadTimeout:                   envDurationOr("VAI_PROXY_READ_TIMEOUT", 30*time.Second),
 		HandlerTimeout:                envDurationOr("VAI_PROXY_TOTAL_REQUEST_TIMEOUT", 2*time.Minute),
+		ShutdownGracePeriod:           envDurationOr("VAI_PROXY_SHUTDOWN_GRACE_PERIOD", 30*time.Second),
 		UpstreamConnectTimeout:        envDurationOr("VAI_PROXY_CONNECT_TIMEOUT", 5*time.Second),
 		UpstreamResponseHeaderTimeout: envDurationOr("VAI_PROXY_RESPONSE_HEADER_TIMEOUT", 30*time.Second),
 	}
@@ -154,6 +161,9 @@ func LoadFromEnv() (Config, error) {
 	}
 	if cfg.HandlerTimeout <= 0 {
 		return Config{}, fmt.Errorf("VAI_PROXY_TOTAL_REQUEST_TIMEOUT must be > 0")
+	}
+	if cfg.ShutdownGracePeriod <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_SHUTDOWN_GRACE_PERIOD must be > 0")
 	}
 	if cfg.UpstreamConnectTimeout <= 0 {
 		return Config{}, fmt.Errorf("VAI_PROXY_CONNECT_TIMEOUT must be > 0")
@@ -224,6 +234,21 @@ func envFloat64Or(key string, def float64) float64 {
 		return def
 	}
 	return n
+}
+
+func envBoolOr(key string, def bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	case "0", "false", "f", "no", "n", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 func envDurationOr(key string, def time.Duration) time.Duration {

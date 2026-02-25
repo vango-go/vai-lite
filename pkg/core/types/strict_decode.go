@@ -110,20 +110,37 @@ func UnmarshalContentBlockStrict(data []byte) (ContentBlock, error) {
 		}
 		return block, nil
 	case "tool_use":
-		var block ToolUseBlock
-		if err := json.Unmarshal(data, &block); err != nil {
+		var raw struct {
+			Type  string          `json:"type"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(block.ID) == "" {
+		if strings.TrimSpace(raw.ID) == "" {
 			return nil, strictErr("id", "tool_use.id is required")
 		}
-		if strings.TrimSpace(block.Name) == "" {
+		if strings.TrimSpace(raw.Name) == "" {
 			return nil, strictErr("name", "tool_use.name is required")
 		}
-		if block.Input == nil {
+		if isNullOrEmptyJSON(raw.Input) {
 			return nil, strictErr("input", "tool_use.input is required")
 		}
-		return block, nil
+		if len(bytes.TrimSpace(raw.Input)) == 0 || bytes.TrimSpace(raw.Input)[0] != '{' {
+			return nil, strictErr("input", "tool_use.input must be an object")
+		}
+		var input map[string]any
+		if err := json.Unmarshal(raw.Input, &input); err != nil {
+			return nil, strictErr("input", "tool_use.input must be an object")
+		}
+		return ToolUseBlock{
+			Type:  raw.Type,
+			ID:    raw.ID,
+			Name:  raw.Name,
+			Input: input,
+		}, nil
 	case "thinking":
 		var block ThinkingBlock
 		if err := json.Unmarshal(data, &block); err != nil {
@@ -131,20 +148,37 @@ func UnmarshalContentBlockStrict(data []byte) (ContentBlock, error) {
 		}
 		return block, nil
 	case "server_tool_use":
-		var block ServerToolUseBlock
-		if err := json.Unmarshal(data, &block); err != nil {
+		var raw struct {
+			Type  string          `json:"type"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(block.ID) == "" {
+		if strings.TrimSpace(raw.ID) == "" {
 			return nil, strictErr("id", "server_tool_use.id is required")
 		}
-		if strings.TrimSpace(block.Name) == "" {
+		if strings.TrimSpace(raw.Name) == "" {
 			return nil, strictErr("name", "server_tool_use.name is required")
 		}
-		if block.Input == nil {
+		if isNullOrEmptyJSON(raw.Input) {
 			return nil, strictErr("input", "server_tool_use.input is required")
 		}
-		return block, nil
+		if len(bytes.TrimSpace(raw.Input)) == 0 || bytes.TrimSpace(raw.Input)[0] != '{' {
+			return nil, strictErr("input", "server_tool_use.input must be an object")
+		}
+		var input map[string]any
+		if err := json.Unmarshal(raw.Input, &input); err != nil {
+			return nil, strictErr("input", "server_tool_use.input must be an object")
+		}
+		return ServerToolUseBlock{
+			Type:  raw.Type,
+			ID:    raw.ID,
+			Name:  raw.Name,
+			Input: input,
+		}, nil
 	case "web_search_tool_result":
 		// Provider-emitted block; accept for completeness (still strict on type).
 		var block WebSearchToolResultBlock

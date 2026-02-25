@@ -88,10 +88,15 @@ func Recover(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
+				reqID, _ := RequestIDFrom(r.Context())
 				if logger != nil {
-					logger.Error("panic", "panic", v)
+					logger.Error("panic", "panic", v, "request_id", reqID)
 				}
-				http.Error(w, "internal error", http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, &core.Error{
+					Type:      core.ErrAPI,
+					Message:   "internal error",
+					RequestID: reqID,
+				})
 			}
 		}()
 		next.ServeHTTP(w, r)

@@ -146,6 +146,22 @@ func TestUnmarshalMessageRequestStrict_ToolHistoryValidation(t *testing.T) {
 	})
 }
 
+func TestUnmarshalMessageRequestStrict_ToolUseInputMustBeObject(t *testing.T) {
+	_, err := UnmarshalMessageRequestStrict([]byte(`{
+		"model":"anthropic/claude",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"t","input":[]}]}
+		]
+	}`))
+	se := requireStrictDecodeError(t, err)
+	if se.Param != "messages[0].content[0].input" {
+		t.Fatalf("param=%q, want messages[0].content[0].input", se.Param)
+	}
+	if se.Message == "" {
+		t.Fatalf("expected message")
+	}
+}
+
 func TestUnmarshalMessageRequestStrict_RoleConstraints(t *testing.T) {
 	tests := []struct {
 		name      string

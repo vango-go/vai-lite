@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
+	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
 )
 
 type fakeFactory struct {
@@ -105,6 +107,69 @@ func TestMessagesHandler_NonStream(t *testing.T) {
 	}
 }
 
+func TestMessagesHandler_MethodNotAllowed_IsCanonicalJSON(t *testing.T) {
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/messages", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("content-type=%q", ct)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"type":"invalid_request_error"`) {
+		t.Fatalf("unexpected body: %q", body)
+	}
+	if !strings.Contains(body, `"code":"method_not_allowed"`) {
+		t.Fatalf("unexpected body: %q", body)
+	}
+}
+
+func TestMessagesHandler_Stream_DrainingRejected(t *testing.T) {
+	lc := &lifecycle.Lifecycle{}
+	lc.SetDraining(true)
+
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+		Lifecycle: lc,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"anthropic/test",
+		"stream":true,
+		"messages":[{"role":"user","content":"hello"}]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != 529 {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"type":"overloaded_error"`) {
+		t.Fatalf("unexpected body: %q", rr.Body.String())
+	}
+}
+
 func TestMessagesHandler_MissingUpstreamHeader(t *testing.T) {
 	h := MessagesHandler{
 		Config: config.Config{
@@ -128,6 +193,114 @@ func TestMessagesHandler_MissingUpstreamHeader(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	if !strings.Contains(rr.Body.String(), `"type":"authentication_error"`) {
+		t.Fatalf("unexpected body: %s", rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"provider_key_missing"`) {
+		t.Fatalf("unexpected body: %s", rr.Body.String())
+	}
+}
+
+func TestMessagesHandler_CompatibilityError_OpenAIVideo(t *testing.T) {
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"openai/gpt-4o",
+		"messages":[{"role":"user","content":[{"type":"video","source":{"type":"base64","media_type":"video/mp4","data":"Zm9v"}}]}]
+	}`)))
+	req.Header.Set("X-Provider-Key-OpenAI", "sk-test")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var envelope map[string]map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("json unmarshal: %v", err)
+	}
+	errObj := envelope["error"]
+	if errObj["type"] != "invalid_request_error" {
+		t.Fatalf("error.type=%v, want invalid_request_error", errObj["type"])
+	}
+	if _, ok := errObj["param"]; ok {
+		t.Fatalf("top-level param should be omitted when compat_issues present: %#v", errObj["param"])
+	}
+	issues, ok := errObj["compat_issues"].([]any)
+	if !ok || len(issues) == 0 {
+		t.Fatalf("compat_issues missing: %#v", errObj["compat_issues"])
+	}
+	first, ok := issues[0].(map[string]any)
+	if !ok {
+		t.Fatalf("compat_issues[0] wrong type: %T", issues[0])
+	}
+	if first["code"] != "unsupported_content_block" {
+		t.Fatalf("compat issue code=%v, want unsupported_content_block", first["code"])
+	}
+}
+
+func TestMessagesHandler_CompatibilityError_OpenAIToolType(t *testing.T) {
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"openai/gpt-4o",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"type":"web_search"}]
+	}`)))
+	req.Header.Set("X-Provider-Key-OpenAI", "sk-test")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"unsupported_tool_type"`) {
+		t.Fatalf("unexpected body: %s", rr.Body.String())
+	}
+}
+
+func TestMessagesHandler_CompatibilityError_UnsupportedThinking(t *testing.T) {
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"openai/gpt-4o",
+		"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"hidden"}]}]
+	}`)))
+	req.Header.Set("X-Provider-Key-OpenAI", "sk-test")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"unsupported_thinking"`) {
 		t.Fatalf("unexpected body: %s", rr.Body.String())
 	}
 }
@@ -289,6 +462,24 @@ func (p *delayedProvider) CreateMessage(ctx context.Context, req *types.MessageR
 
 func (p *delayedProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
 	return p.es, nil
+}
+
+type streamErrProvider struct {
+	err error
+}
+
+func (p *streamErrProvider) Name() string { return "anthropic" }
+
+func (p *streamErrProvider) Capabilities() core.ProviderCapabilities {
+	return core.ProviderCapabilities{Tools: true}
+}
+
+func (p *streamErrProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	return nil, p.err
+}
+
+func (p *streamErrProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	return nil, p.err
 }
 
 type fakeStreamingTTSProvider struct {
@@ -503,6 +694,52 @@ func TestMessagesHandler_Stream_ClientDisconnect_ClosesUpstream(t *testing.T) {
 		// ok
 	default:
 		t.Fatalf("expected upstream stream to be closed on client disconnect")
+	}
+}
+
+func TestMessagesHandler_Stream_ErrorEventIncludesCompatIssues(t *testing.T) {
+	compatErr := &core.Error{
+		Type:    core.ErrInvalidRequest,
+		Message: "compat failure",
+		CompatIssues: []core.CompatibilityIssue{
+			{
+				Severity: "error",
+				Param:    "messages[0].content[0]",
+				Code:     "unsupported_content_block",
+				Message:  "video blocks are not supported by anthropic",
+			},
+		},
+	}
+
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEPingInterval:      time.Second,
+			SSEMaxStreamDuration: time.Second,
+		},
+		Upstreams: fakeFactory{p: &streamErrProvider{err: compatErr}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"anthropic/test",
+		"stream":true,
+		"messages":[{"role":"user","content":"hello"}]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: error\n") {
+		t.Fatalf("missing stream error event: %q", body)
+	}
+	if !strings.Contains(body, `"compat_issues":[`) {
+		t.Fatalf("missing compat_issues in stream error event: %q", body)
+	}
+	if !strings.Contains(body, `"unsupported_content_block"`) {
+		t.Fatalf("missing compatibility issue code in stream error event: %q", body)
 	}
 }
 

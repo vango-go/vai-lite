@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/vango-go/vai-lite/pkg/core"
-	"github.com/vango-go/vai-lite/pkg/gateway/auth"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
+	"github.com/vango-go/vai-lite/pkg/gateway/principal"
 	"github.com/vango-go/vai-lite/pkg/gateway/ratelimit"
 )
 
@@ -26,12 +26,9 @@ func RateLimit(cfg config.Config, limiter *ratelimit.Limiter, next http.Handler)
 			return
 		}
 
-		principal := "anonymous"
-		if p, ok := auth.PrincipalFrom(r.Context()); ok {
-			principal = ratelimit.PrincipalKeyFromAPIKey(p.APIKey)
-		}
+		p := principal.Resolve(r, cfg)
 
-		dec := limiter.AcquireRequest(principal, time.Now())
+		dec := limiter.AcquireRequest(p.Key, time.Now())
 		if !dec.Allowed {
 			reqID, _ := RequestIDFrom(r.Context())
 			if dec.RetryAfter > 0 {

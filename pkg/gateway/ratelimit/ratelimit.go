@@ -65,6 +65,11 @@ func PrincipalKeyFromAPIKey(apiKey string) string {
 	return "k_" + hex.EncodeToString(sum[:16])
 }
 
+func PrincipalKeyFromIP(ip string) string {
+	sum := sha256.Sum256([]byte(ip))
+	return "ip_" + hex.EncodeToString(sum[:16])
+}
+
 type Permit struct {
 	release func()
 }

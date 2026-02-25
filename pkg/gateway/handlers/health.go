@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
+	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
 )
 
 type HealthHandler struct{}
@@ -16,7 +17,8 @@ func (h HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type ReadyHandler struct {
-	Config config.Config
+	Config    config.Config
+	Lifecycle *lifecycle.Lifecycle
 }
 
 func (h ReadyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -29,6 +31,10 @@ func (h ReadyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	issues := make([]string, 0, 4)
+
+	if h.Lifecycle != nil && h.Lifecycle.IsDraining() {
+		issues = append(issues, "gateway is draining")
+	}
 
 	switch h.Config.AuthMode {
 	case config.AuthModeRequired, config.AuthModeOptional, config.AuthModeDisabled:
@@ -75,6 +81,9 @@ func (h ReadyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Config.ReadHeaderTimeout <= 0 || h.Config.ReadTimeout <= 0 || h.Config.HandlerTimeout <= 0 {
 		issues = append(issues, "timeouts must be > 0")
 	}
+	if h.Config.ShutdownGracePeriod <= 0 {
+		issues = append(issues, "shutdown grace period must be > 0")
+	}
 	if h.Config.UpstreamConnectTimeout <= 0 || h.Config.UpstreamResponseHeaderTimeout <= 0 {
 		issues = append(issues, "upstream timeouts must be > 0")
 	}
@@ -87,7 +96,7 @@ func (h ReadyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ok := len(issues) == 0
 	status := http.StatusOK
 	if !ok {
-		status = http.StatusInternalServerError
+		status = http.StatusServiceUnavailable
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

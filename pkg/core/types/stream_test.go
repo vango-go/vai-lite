@@ -287,7 +287,10 @@ func TestUnmarshalStreamEvent_ErrorWithExtendedFields(t *testing.T) {
 			"code":"rl",
 			"request_id":"req_123",
 			"retry_after":10,
-			"provider_error":{"raw":"x"}
+			"provider_error":{"raw":"x"},
+			"compat_issues":[
+				{"severity":"error","param":"messages[0].content[0]","code":"unsupported_content_block","message":"video blocks are not supported"}
+			]
 		}
 	}`
 
@@ -320,6 +323,12 @@ func TestUnmarshalStreamEvent_ErrorWithExtendedFields(t *testing.T) {
 	}
 	if ee.Error.ProviderError == nil {
 		t.Fatalf("Error.ProviderError is nil, want object")
+	}
+	if len(ee.Error.CompatIssues) != 1 {
+		t.Fatalf("Error.CompatIssues len = %d, want 1", len(ee.Error.CompatIssues))
+	}
+	if ee.Error.CompatIssues[0].Code != "unsupported_content_block" {
+		t.Fatalf("Error.CompatIssues[0].Code = %q, want unsupported_content_block", ee.Error.CompatIssues[0].Code)
 	}
 }
 

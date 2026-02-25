@@ -10,6 +10,7 @@ var gatewayEnvKeys = []string{
 	"VAI_PROXY_ADDR",
 	"VAI_PROXY_AUTH_MODE",
 	"VAI_PROXY_API_KEYS",
+	"VAI_PROXY_TRUST_PROXY_HEADERS",
 	"VAI_PROXY_CORS_ORIGINS",
 	"VAI_PROXY_MAX_BODY_BYTES",
 	"VAI_PROXY_MAX_MESSAGES",
@@ -32,6 +33,7 @@ var gatewayEnvKeys = []string{
 	"VAI_PROXY_MAX_CONCURRENT_REQUESTS",
 	"VAI_PROXY_READ_HEADER_TIMEOUT",
 	"VAI_PROXY_READ_TIMEOUT",
+	"VAI_PROXY_SHUTDOWN_GRACE_PERIOD",
 	"VAI_GATEWAY_ADDR",
 	"VAI_AUTH_MODE",
 	"VAI_API_KEYS",
@@ -80,6 +82,9 @@ func TestLoadFromEnv_DefaultsMatchSpec(t *testing.T) {
 	if cfg.MaxBodyBytes != 8<<20 {
 		t.Fatalf("MaxBodyBytes = %d, want %d", cfg.MaxBodyBytes, int64(8<<20))
 	}
+	if cfg.TrustProxyHeaders != false {
+		t.Fatalf("TrustProxyHeaders = %v, want false", cfg.TrustProxyHeaders)
+	}
 	if cfg.MaxMessages != 64 {
 		t.Fatalf("MaxMessages = %d, want 64", cfg.MaxMessages)
 	}
@@ -122,6 +127,9 @@ func TestLoadFromEnv_DefaultsMatchSpec(t *testing.T) {
 	if cfg.HandlerTimeout != 2*time.Minute {
 		t.Fatalf("HandlerTimeout = %v, want 2m", cfg.HandlerTimeout)
 	}
+	if cfg.ShutdownGracePeriod != 30*time.Second {
+		t.Fatalf("ShutdownGracePeriod = %v, want 30s", cfg.ShutdownGracePeriod)
+	}
 }
 
 func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
@@ -129,6 +137,7 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	t.Setenv("VAI_PROXY_ADDR", ":9090")
 	t.Setenv("VAI_PROXY_AUTH_MODE", "optional")
 	t.Setenv("VAI_PROXY_API_KEYS", "k1,k2")
+	t.Setenv("VAI_PROXY_TRUST_PROXY_HEADERS", "true")
 	t.Setenv("VAI_PROXY_CORS_ORIGINS", "https://a.example,https://b.example")
 	t.Setenv("VAI_PROXY_MAX_BODY_BYTES", "12345")
 	t.Setenv("VAI_PROXY_MAX_MESSAGES", "11")
@@ -148,6 +157,7 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	t.Setenv("VAI_PROXY_READ_HEADER_TIMEOUT", "12s")
 	t.Setenv("VAI_PROXY_READ_TIMEOUT", "33s")
 	t.Setenv("VAI_PROXY_TOTAL_REQUEST_TIMEOUT", "90s")
+	t.Setenv("VAI_PROXY_SHUTDOWN_GRACE_PERIOD", "31s")
 	t.Setenv("VAI_PROXY_CONNECT_TIMEOUT", "7s")
 	t.Setenv("VAI_PROXY_RESPONSE_HEADER_TIMEOUT", "29s")
 	t.Setenv("VAI_PROXY_MODEL_ALLOWLIST", "anthropic/a,openai/b")
@@ -178,6 +188,9 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	if cfg.ReadHeaderTimeout != 12*time.Second || cfg.ReadTimeout != 33*time.Second || cfg.HandlerTimeout != 90*time.Second {
 		t.Fatalf("server timeouts mismatch: %v/%v/%v", cfg.ReadHeaderTimeout, cfg.ReadTimeout, cfg.HandlerTimeout)
 	}
+	if cfg.ShutdownGracePeriod != 31*time.Second {
+		t.Fatalf("ShutdownGracePeriod = %v, want 31s", cfg.ShutdownGracePeriod)
+	}
 	if cfg.UpstreamConnectTimeout != 7*time.Second || cfg.UpstreamResponseHeaderTimeout != 29*time.Second {
 		t.Fatalf("upstream timeouts mismatch: %v/%v", cfg.UpstreamConnectTimeout, cfg.UpstreamResponseHeaderTimeout)
 	}
@@ -192,6 +205,9 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	}
 	if len(cfg.ModelAllowlist) != 2 {
 		t.Fatalf("ModelAllowlist len=%d, want 2", len(cfg.ModelAllowlist))
+	}
+	if !cfg.TrustProxyHeaders {
+		t.Fatalf("TrustProxyHeaders = false, want true")
 	}
 }
 
@@ -281,6 +297,14 @@ func TestLoadFromEnv_InvalidDurationsAndBounds(t *testing.T) {
 				"VAI_PROXY_CONNECT_TIMEOUT": "0s",
 			},
 			errSubstr: "VAI_PROXY_CONNECT_TIMEOUT",
+		},
+		{
+			name: "invalid shutdown grace period",
+			env: map[string]string{
+				"VAI_PROXY_AUTH_MODE":             "optional",
+				"VAI_PROXY_SHUTDOWN_GRACE_PERIOD": "0s",
+			},
+			errSubstr: "VAI_PROXY_SHUTDOWN_GRACE_PERIOD",
 		},
 		{
 			name: "invalid ws sessions",
