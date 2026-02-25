@@ -3,6 +3,7 @@ package mw
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
@@ -72,6 +73,8 @@ func TestCORS_Preflight_Allowed(t *testing.T) {
 	}
 	if got := rr.Header().Get("Access-Control-Allow-Headers"); got == "" {
 		t.Fatalf("expected allow-headers header")
+	} else if !strings.Contains(got, "X-VAI-Version") {
+		t.Fatalf("expected X-VAI-Version in allow-headers, got %q", got)
 	}
 }
 

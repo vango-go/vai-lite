@@ -2,6 +2,7 @@ package types
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -18,6 +19,8 @@ func TestStreamEvent_Types(t *testing.T) {
 		{MessageStopEvent{Type: "message_stop"}, "message_stop"},
 		{PingEvent{Type: "ping"}, "ping"},
 		{AudioChunkEvent{Type: "audio_chunk"}, "audio_chunk"},
+		{AudioUnavailableEvent{Type: "audio_unavailable"}, "audio_unavailable"},
+		{UnknownStreamEvent{Type: "future_event"}, "future_event"},
 		{ErrorEvent{Type: "error"}, "error"},
 	}
 
@@ -38,6 +41,7 @@ func TestDelta_Types(t *testing.T) {
 		{TextDelta{Type: "text_delta"}, "text_delta"},
 		{InputJSONDelta{Type: "input_json_delta"}, "input_json_delta"},
 		{ThinkingDelta{Type: "thinking_delta"}, "thinking_delta"},
+		{UnknownDelta{Type: "future_delta"}, "future_delta"},
 	}
 
 	for _, tt := range tests {
@@ -171,7 +175,7 @@ func TestUnmarshalStreamEvent_MessageDelta(t *testing.T) {
 func TestUnmarshalStreamEvent_AudioChunk(t *testing.T) {
 	jsonData := `{
 		"type": "audio_chunk",
-		"format": "pcm",
+		"format": "pcm_s16le",
 		"audio": "AQID",
 		"sample_rate_hz": 24000,
 		"is_final": false
@@ -186,8 +190,8 @@ func TestUnmarshalStreamEvent_AudioChunk(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected AudioChunkEvent, got %T", event)
 	}
-	if ac.Format != "pcm" {
-		t.Errorf("Format = %q, want %q", ac.Format, "pcm")
+	if ac.Format != "pcm_s16le" {
+		t.Errorf("Format = %q, want %q", ac.Format, "pcm_s16le")
 	}
 	if ac.Audio != "AQID" {
 		t.Errorf("Audio = %q, want %q", ac.Audio, "AQID")
@@ -197,6 +201,79 @@ func TestUnmarshalStreamEvent_AudioChunk(t *testing.T) {
 	}
 	if ac.IsFinal {
 		t.Errorf("IsFinal = true, want false")
+	}
+}
+
+func TestUnmarshalStreamEvent_AudioUnavailable(t *testing.T) {
+	jsonData := `{
+		"type": "audio_unavailable",
+		"reason": "tts_failed",
+		"message": "TTS synthesis failed: connection reset"
+	}`
+
+	event, err := UnmarshalStreamEvent([]byte(jsonData))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	au, ok := event.(AudioUnavailableEvent)
+	if !ok {
+		t.Fatalf("Expected AudioUnavailableEvent, got %T", event)
+	}
+	if au.Reason != "tts_failed" {
+		t.Errorf("Reason = %q, want %q", au.Reason, "tts_failed")
+	}
+	if au.Message != "TTS synthesis failed: connection reset" {
+		t.Errorf("Message = %q, want %q", au.Message, "TTS synthesis failed: connection reset")
+	}
+}
+
+func TestUnmarshalStreamEvent_UnknownEventType_IsOpaque(t *testing.T) {
+	jsonData := `{
+		"type":"future_event",
+		"foo":"bar",
+		"nested":{"a":1}
+	}`
+
+	event, err := UnmarshalStreamEvent([]byte(jsonData))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	unknown, ok := event.(UnknownStreamEvent)
+	if !ok {
+		t.Fatalf("Expected UnknownStreamEvent, got %T", event)
+	}
+	if unknown.EventType() != "future_event" {
+		t.Fatalf("EventType()=%q, want future_event", unknown.EventType())
+	}
+	if len(unknown.Raw) == 0 {
+		t.Fatalf("Raw is empty for unknown event")
+	}
+}
+
+func TestUnmarshalStreamEvent_ContentBlockDelta_WithUnknownDelta(t *testing.T) {
+	jsonData := `{
+		"type":"content_block_delta",
+		"index":2,
+		"delta":{"type":"future_delta","x":1}
+	}`
+
+	event, err := UnmarshalStreamEvent([]byte(jsonData))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	cbd, ok := event.(ContentBlockDeltaEvent)
+	if !ok {
+		t.Fatalf("Expected ContentBlockDeltaEvent, got %T", event)
+	}
+	unknown, ok := cbd.Delta.(UnknownDelta)
+	if !ok {
+		t.Fatalf("Expected UnknownDelta, got %T", cbd.Delta)
+	}
+	if unknown.DeltaType() != "future_delta" {
+		t.Fatalf("DeltaType()=%q, want future_delta", unknown.DeltaType())
 	}
 }
 
@@ -282,6 +359,78 @@ func TestUnmarshalDelta(t *testing.T) {
 	}
 }
 
+func TestUnmarshalDelta_UnknownDeltaType_IsOpaque(t *testing.T) {
+	jsonData := `{"type":"future_delta","x":1,"extra":{"k":"v"}}`
+
+	delta, err := UnmarshalDelta([]byte(jsonData))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal unknown delta: %v", err)
+	}
+
+	unknown, ok := delta.(UnknownDelta)
+	if !ok {
+		t.Fatalf("Expected UnknownDelta, got %T", delta)
+	}
+	if unknown.DeltaType() != "future_delta" {
+		t.Fatalf("DeltaType()=%q, want future_delta", unknown.DeltaType())
+	}
+	if len(unknown.Raw) == 0 {
+		t.Fatalf("Raw is empty for unknown delta")
+	}
+}
+
+func TestUnknownOpaqueRoundTripPreservesPayload(t *testing.T) {
+	t.Run("unknown_event", func(t *testing.T) {
+		original := []byte(`{"type":"future_event","foo":"bar","nested":{"a":1}}`)
+		event, err := UnmarshalStreamEvent(original)
+		if err != nil {
+			t.Fatalf("UnmarshalStreamEvent() error = %v", err)
+		}
+		unknown, ok := event.(UnknownStreamEvent)
+		if !ok {
+			t.Fatalf("Expected UnknownStreamEvent, got %T", event)
+		}
+
+		marshaled, err := json.Marshal(unknown)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		assertJSONSemanticEqual(t, original, marshaled)
+	})
+
+	t.Run("unknown_delta", func(t *testing.T) {
+		original := []byte(`{"type":"future_delta","x":1,"arr":[1,2,3]}`)
+		delta, err := UnmarshalDelta(original)
+		if err != nil {
+			t.Fatalf("UnmarshalDelta() error = %v", err)
+		}
+		unknown, ok := delta.(UnknownDelta)
+		if !ok {
+			t.Fatalf("Expected UnknownDelta, got %T", delta)
+		}
+
+		marshaled, err := json.Marshal(unknown)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		assertJSONSemanticEqual(t, original, marshaled)
+	})
+
+	t.Run("content_block_delta_with_unknown_delta", func(t *testing.T) {
+		original := []byte(`{"type":"content_block_delta","index":3,"delta":{"type":"future_delta","x":1,"y":{"z":2}}}`)
+		event, err := UnmarshalStreamEvent(original)
+		if err != nil {
+			t.Fatalf("UnmarshalStreamEvent() error = %v", err)
+		}
+
+		marshaled, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		assertJSONSemanticEqual(t, original, marshaled)
+	})
+}
+
 func TestTextDelta_MarshalJSON(t *testing.T) {
 	delta := TextDelta{Type: "text_delta", Text: "Hello, world!"}
 	data, err := json.Marshal(delta)
@@ -296,5 +445,23 @@ func TestTextDelta_MarshalJSON(t *testing.T) {
 
 	if unmarshaled.Text != "Hello, world!" {
 		t.Errorf("Text = %q, want %q", unmarshaled.Text, "Hello, world!")
+	}
+}
+
+func assertJSONSemanticEqual(t *testing.T, left, right []byte) {
+	t.Helper()
+
+	var leftObj any
+	if err := json.Unmarshal(left, &leftObj); err != nil {
+		t.Fatalf("left JSON unmarshal error: %v", err)
+	}
+
+	var rightObj any
+	if err := json.Unmarshal(right, &rightObj); err != nil {
+		t.Fatalf("right JSON unmarshal error: %v", err)
+	}
+
+	if !reflect.DeepEqual(leftObj, rightObj) {
+		t.Fatalf("JSON mismatch:\nleft:  %s\nright: %s", string(left), string(right))
 	}
 }

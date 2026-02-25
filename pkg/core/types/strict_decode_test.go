@@ -145,3 +145,246 @@ func TestUnmarshalMessageRequestStrict_ToolHistoryValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestUnmarshalMessageRequestStrict_RoleConstraints(t *testing.T) {
+	tests := []struct {
+		name      string
+		payload   string
+		wantParam string
+	}{
+		{
+			name: "thinking in user rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":[{"type":"thinking","thinking":"x"}]}]
+			}`,
+			wantParam: "messages[0].content[0].type",
+		},
+		{
+			name: "tool_use in user rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":[{"type":"tool_use","id":"call_1","name":"t","input":{"q":"x"}}]}]
+			}`,
+			wantParam: "messages[0].content[0].type",
+		},
+		{
+			name: "tool_result in assistant rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"ok"}]}]}]
+			}`,
+			wantParam: "messages[0].content[0].type",
+		},
+		{
+			name: "server_tool_use in user rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":[{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"x"}}]}]
+			}`,
+			wantParam: "messages[0].content[0].type",
+		},
+		{
+			name: "web_search_tool_result in assistant rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"assistant","content":[{"type":"web_search_tool_result","tool_use_id":"srv_1","content":[]}]}]
+			}`,
+			wantParam: "messages[0].content[0].type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := UnmarshalMessageRequestStrict([]byte(tt.payload))
+			se := requireStrictDecodeError(t, err)
+			if se.Param != tt.wantParam {
+				t.Fatalf("param=%q, want %q", se.Param, tt.wantParam)
+			}
+		})
+	}
+}
+
+func TestUnmarshalMessageRequestStrict_RoleEnumEnforced(t *testing.T) {
+	_, err := UnmarshalMessageRequestStrict([]byte(`{
+		"model":"anthropic/claude",
+		"messages":[{"role":"system","content":"hello"}]
+	}`))
+	se := requireStrictDecodeError(t, err)
+	if se.Param != "messages[0].role" {
+		t.Fatalf("param=%q, want messages[0].role", se.Param)
+	}
+}
+
+func TestUnmarshalMessageRequestStrict_RoleConstraint_ValidPlacements(t *testing.T) {
+	_, err := UnmarshalMessageRequestStrict([]byte(`{
+		"model":"anthropic/claude",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"let me check"},
+				{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"latest"}},
+				{"type":"tool_use","id":"call_1","name":"my_tool","input":{"x":1}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"done"}]},
+				{"type":"web_search_tool_result","tool_use_id":"srv_1","content":[]}
+			]}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("expected valid placements to pass, got err=%v", err)
+	}
+}
+
+func TestUnmarshalMessageRequestStrict_FunctionToolDescriptionRequired(t *testing.T) {
+	_, err := UnmarshalMessageRequestStrict([]byte(`{
+		"model":"anthropic/claude",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","name":"lookup","input_schema":{"type":"object"}}]
+	}`))
+	se := requireStrictDecodeError(t, err)
+	if se.Param != "tools[0].description" {
+		t.Fatalf("param=%q, want tools[0].description", se.Param)
+	}
+}
+
+func TestUnmarshalMessageRequestStrict_FunctionToolDescriptionPresent(t *testing.T) {
+	_, err := UnmarshalMessageRequestStrict([]byte(`{
+		"model":"anthropic/claude",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","name":"lookup","description":"Lookup data","input_schema":{"type":"object"}}]
+	}`))
+	if err != nil {
+		t.Fatalf("expected valid function tool to pass, got err=%v", err)
+	}
+}
+
+func TestUnmarshalMessageRequestStrict_OutputFormatSemanticValidation(t *testing.T) {
+	t.Run("valid structured output passes", func(t *testing.T) {
+		_, err := UnmarshalMessageRequestStrict([]byte(`{
+			"model":"anthropic/claude",
+			"messages":[{"role":"user","content":"extract"}],
+			"output_format":{
+				"type":"json_schema",
+				"json_schema":{
+					"type":"object",
+					"properties":{
+						"name":{"type":"string"},
+						"items":{"type":"array","items":{"type":"integer"}}
+					},
+					"required":["name"]
+				}
+			}
+		}`))
+		if err != nil {
+			t.Fatalf("expected valid output_format to pass, got err=%v", err)
+		}
+	})
+
+	tests := []struct {
+		name      string
+		payload   string
+		wantParam string
+	}{
+		{
+			name: "missing output_format.type rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":"extract"}],
+				"output_format":{"json_schema":{"type":"object"}}
+			}`,
+			wantParam: "output_format.type",
+		},
+		{
+			name: "unsupported output_format.type rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":"extract"}],
+				"output_format":{"type":"xml_schema","json_schema":{"type":"object"}}
+			}`,
+			wantParam: "output_format.type",
+		},
+		{
+			name: "missing output_format.json_schema rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":"extract"}],
+				"output_format":{"type":"json_schema"}
+			}`,
+			wantParam: "output_format.json_schema",
+		},
+		{
+			name: "schema node missing type rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":"extract"}],
+				"output_format":{"type":"json_schema","json_schema":{}}
+			}`,
+			wantParam: "output_format.json_schema.type",
+		},
+		{
+			name: "array schema without items rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":"extract"}],
+				"output_format":{"type":"json_schema","json_schema":{"type":"array"}}
+			}`,
+			wantParam: "output_format.json_schema.items",
+		},
+		{
+			name: "required key not in properties rejected",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":"extract"}],
+				"output_format":{
+					"type":"json_schema",
+					"json_schema":{
+						"type":"object",
+						"properties":{"name":{"type":"string"}},
+						"required":["name","age"]
+					}
+				}
+			}`,
+			wantParam: "output_format.json_schema.required[1]",
+		},
+		{
+			name: "nested schema path is precise",
+			payload: `{
+				"model":"anthropic/claude",
+				"messages":[{"role":"user","content":"extract"}],
+				"output_format":{
+					"type":"json_schema",
+					"json_schema":{
+						"type":"object",
+						"properties":{
+							"data":{"type":"array","items":{"properties":{"name":{"type":"string"}}}}
+						}
+					}
+				}
+			}`,
+			wantParam: "output_format.json_schema.properties.data.items.type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := UnmarshalMessageRequestStrict([]byte(tt.payload))
+			se := requireStrictDecodeError(t, err)
+			if se.Param != tt.wantParam {
+				t.Fatalf("param=%q, want %q", se.Param, tt.wantParam)
+			}
+		})
+	}
+}
+
+func requireStrictDecodeError(t *testing.T, err error) *StrictDecodeError {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected StrictDecodeError, got nil")
+	}
+	se, ok := err.(*StrictDecodeError)
+	if !ok {
+		t.Fatalf("expected StrictDecodeError, got %T (%v)", err, err)
+	}
+	return se
+}

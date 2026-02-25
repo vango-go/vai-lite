@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // StreamEvent is the interface for all streaming event types.
@@ -13,6 +14,46 @@ type StreamEvent interface {
 // Delta is the interface for all delta types in streaming.
 type Delta interface {
 	DeltaType() string
+}
+
+// UnknownStreamEvent is an opaque stream event used for forward compatibility
+// when an event type is unknown to this SDK version.
+type UnknownStreamEvent struct {
+	Type string          `json:"type"`
+	Raw  json.RawMessage `json:"-"`
+}
+
+func (e UnknownStreamEvent) EventType() string { return e.Type }
+
+func (e UnknownStreamEvent) MarshalJSON() ([]byte, error) {
+	if len(e.Raw) > 0 {
+		return copiedRaw(e.Raw), nil
+	}
+	return json.Marshal(struct {
+		Type string `json:"type"`
+	}{
+		Type: e.Type,
+	})
+}
+
+// UnknownDelta is an opaque delta used for forward compatibility when a delta
+// type is unknown to this SDK version.
+type UnknownDelta struct {
+	Type string          `json:"type"`
+	Raw  json.RawMessage `json:"-"`
+}
+
+func (d UnknownDelta) DeltaType() string { return d.Type }
+
+func (d UnknownDelta) MarshalJSON() ([]byte, error) {
+	if len(d.Raw) > 0 {
+		return copiedRaw(d.Raw), nil
+	}
+	return json.Marshal(struct {
+		Type string `json:"type"`
+	}{
+		Type: d.Type,
+	})
 }
 
 // --- Stream Events (matching API spec section 9) ---
@@ -91,6 +132,16 @@ type AudioChunkEvent struct {
 
 func (e AudioChunkEvent) EventType() string { return "audio_chunk" }
 
+// AudioUnavailableEvent indicates that streaming text continues but voice audio
+// is no longer available for this response.
+type AudioUnavailableEvent struct {
+	Type    string `json:"type"` // "audio_unavailable"
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+func (e AudioUnavailableEvent) EventType() string { return "audio_unavailable" }
+
 // --- Delta Types ---
 
 // TextDelta contains incremental text content.
@@ -143,6 +194,9 @@ func UnmarshalStreamEvent(data []byte) (StreamEvent, error) {
 	}
 	if err := json.Unmarshal(data, &typeHolder); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(typeHolder.Type) == "" {
+		return nil, fmt.Errorf("missing stream event type")
 	}
 
 	switch typeHolder.Type {
@@ -228,6 +282,13 @@ func UnmarshalStreamEvent(data []byte) (StreamEvent, error) {
 		}
 		return event, nil
 
+	case "audio_unavailable":
+		var event AudioUnavailableEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
 	case "error":
 		var event ErrorEvent
 		if err := json.Unmarshal(data, &event); err != nil {
@@ -236,7 +297,10 @@ func UnmarshalStreamEvent(data []byte) (StreamEvent, error) {
 		return event, nil
 
 	default:
-		return nil, fmt.Errorf("unknown stream event type: %s", typeHolder.Type)
+		return UnknownStreamEvent{
+			Type: typeHolder.Type,
+			Raw:  copiedRaw(data),
+		}, nil
 	}
 }
 
@@ -247,6 +311,9 @@ func UnmarshalDelta(data []byte) (Delta, error) {
 	}
 	if err := json.Unmarshal(data, &typeHolder); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(typeHolder.Type) == "" {
+		return nil, fmt.Errorf("missing delta type")
 	}
 
 	switch typeHolder.Type {
@@ -272,6 +339,18 @@ func UnmarshalDelta(data []byte) (Delta, error) {
 		return delta, nil
 
 	default:
-		return nil, fmt.Errorf("unknown delta type: %s", typeHolder.Type)
+		return UnknownDelta{
+			Type: typeHolder.Type,
+			Raw:  copiedRaw(data),
+		}, nil
 	}
+}
+
+func copiedRaw(data []byte) json.RawMessage {
+	if len(data) == 0 {
+		return nil
+	}
+	copyBuf := make([]byte, len(data))
+	copy(copyBuf, data)
+	return json.RawMessage(copyBuf)
 }

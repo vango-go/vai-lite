@@ -28,6 +28,16 @@ func strictErr(param, msg string) error {
 	return &StrictDecodeError{Param: param, Message: msg}
 }
 
+var allowedJSONSchemaTypes = map[string]struct{}{
+	"object":  {},
+	"array":   {},
+	"string":  {},
+	"number":  {},
+	"integer": {},
+	"boolean": {},
+	"null":    {},
+}
+
 func isNullOrEmptyJSON(raw json.RawMessage) bool {
 	raw = bytes.TrimSpace(raw)
 	return len(raw) == 0 || bytes.Equal(raw, []byte("null"))
@@ -182,8 +192,12 @@ func unmarshalMessageStrict(data []byte, paramPrefix string) (Message, error) {
 	if strings.TrimSpace(raw.Role) == "" {
 		return Message{}, strictErr(paramPrefix+".role", "role is required")
 	}
+	role := strings.TrimSpace(raw.Role)
+	if role != "user" && role != "assistant" {
+		return Message{}, strictErr(paramPrefix+".role", "role must be one of: user, assistant")
+	}
 
-	msg := Message{Role: raw.Role}
+	msg := Message{Role: role}
 
 	// content: string or []ContentBlock
 	var str string
@@ -204,6 +218,9 @@ func unmarshalMessageStrict(data []byte, paramPrefix string) (Message, error) {
 				se.Param = fmt.Sprintf("%s.content[%d].%s", paramPrefix, i, se.Param)
 				return Message{}, se
 			}
+			return Message{}, err
+		}
+		if err := validateContentBlockRoleStrict(role, cb, fmt.Sprintf("%s.content[%d].type", paramPrefix, i)); err != nil {
 			return Message{}, err
 		}
 		blocks[i] = cb
@@ -291,6 +308,9 @@ func unmarshalToolStrict(data []byte, paramPrefix string) (Tool, error) {
 		}
 		if strings.TrimSpace(out.Name) == "" {
 			return Tool{}, strictErr(paramPrefix+".name", "function tool name is required")
+		}
+		if strings.TrimSpace(out.Description) == "" {
+			return Tool{}, strictErr(paramPrefix+".description", "function tool description is required")
 		}
 		if out.InputSchema == nil {
 			return Tool{}, strictErr(paramPrefix+".input_schema", "function tool input_schema is required")
@@ -438,9 +458,101 @@ func UnmarshalMessageRequestStrict(data []byte) (*MessageRequest, error) {
 		}
 	}
 
+	if err := validateOutputFormatStrict(out.OutputFormat); err != nil {
+		return nil, err
+	}
+
 	if err := validateToolHistoryStrict(out.Messages); err != nil {
 		return nil, err
 	}
 
 	return out, nil
+}
+
+func validateContentBlockRoleStrict(role string, block ContentBlock, param string) error {
+	switch block.(type) {
+	case ThinkingBlock, *ThinkingBlock:
+		if role != "assistant" {
+			return strictErr(param, "thinking blocks are only allowed in assistant messages")
+		}
+	case ToolUseBlock, *ToolUseBlock:
+		if role != "assistant" {
+			return strictErr(param, "tool_use blocks are only allowed in assistant messages")
+		}
+	case ServerToolUseBlock, *ServerToolUseBlock:
+		if role != "assistant" {
+			return strictErr(param, "server_tool_use blocks are only allowed in assistant messages")
+		}
+	case ToolResultBlock, *ToolResultBlock:
+		if role != "user" {
+			return strictErr(param, "tool_result blocks are only allowed in user messages")
+		}
+	case WebSearchToolResultBlock, *WebSearchToolResultBlock:
+		if role != "user" {
+			return strictErr(param, "web_search_tool_result blocks are only allowed in user messages")
+		}
+	}
+	return nil
+}
+
+func validateOutputFormatStrict(outputFormat *OutputFormat) error {
+	if outputFormat == nil {
+		return nil
+	}
+
+	formatType := strings.TrimSpace(outputFormat.Type)
+	if formatType == "" {
+		return strictErr("output_format.type", "output_format.type is required")
+	}
+	if formatType != "json_schema" {
+		return strictErr("output_format.type", `output_format.type must be "json_schema"`)
+	}
+	if outputFormat.JSONSchema == nil {
+		return strictErr("output_format.json_schema", `output_format.json_schema is required when output_format.type is "json_schema"`)
+	}
+
+	return validateJSONSchemaStrict(outputFormat.JSONSchema, "output_format.json_schema")
+}
+
+func validateJSONSchemaStrict(schema *JSONSchema, paramPrefix string) error {
+	if schema == nil {
+		return strictErr(paramPrefix, paramPrefix+" is required")
+	}
+
+	schemaType := strings.TrimSpace(schema.Type)
+	if schemaType == "" {
+		return strictErr(paramPrefix+".type", paramPrefix+".type is required")
+	}
+	if _, ok := allowedJSONSchemaTypes[schemaType]; !ok {
+		return strictErr(paramPrefix+".type", fmt.Sprintf(`%s.type must be one of: object, array, string, number, integer, boolean, null`, paramPrefix))
+	}
+
+	switch schemaType {
+	case "array":
+		if schema.Items == nil {
+			return strictErr(paramPrefix+".items", paramPrefix+`.items is required when `+paramPrefix+`.type is "array"`)
+		}
+		if err := validateJSONSchemaStrict(schema.Items, paramPrefix+".items"); err != nil {
+			return err
+		}
+
+	case "object":
+		for propertyName, propertySchema := range schema.Properties {
+			prop := propertySchema
+			if err := validateJSONSchemaStrict(&prop, paramPrefix+".properties."+propertyName); err != nil {
+				return err
+			}
+		}
+		for idx, requiredName := range schema.Required {
+			trimmed := strings.TrimSpace(requiredName)
+			if trimmed == "" {
+				return strictErr(fmt.Sprintf("%s.required[%d]", paramPrefix, idx), "required property name must be non-empty")
+			}
+			if _, ok := schema.Properties[trimmed]; !ok {
+				return strictErr(fmt.Sprintf("%s.required[%d]", paramPrefix, idx), fmt.Sprintf("%s.required[%d] references %q which is not defined in %s.properties", paramPrefix, idx, trimmed, paramPrefix))
+			}
+		}
+	}
+
+	return nil
 }

@@ -63,8 +63,20 @@ func (h ReadyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Config.SSEMaxStreamDuration <= 0 {
 		issues = append(issues, "sse max stream duration must be > 0")
 	}
+	if h.Config.StreamIdleTimeout <= 0 {
+		issues = append(issues, "stream idle timeout must be > 0")
+	}
+	if h.Config.WSMaxSessionDuration <= 0 {
+		issues = append(issues, "ws max session duration must be > 0")
+	}
+	if h.Config.WSMaxSessionsPerPrincipal <= 0 {
+		issues = append(issues, "ws max sessions per principal must be > 0")
+	}
 	if h.Config.ReadHeaderTimeout <= 0 || h.Config.ReadTimeout <= 0 || h.Config.HandlerTimeout <= 0 {
 		issues = append(issues, "timeouts must be > 0")
+	}
+	if h.Config.UpstreamConnectTimeout <= 0 || h.Config.UpstreamResponseHeaderTimeout <= 0 {
+		issues = append(issues, "upstream timeouts must be > 0")
 	}
 
 	allowlistEnabled := len(h.Config.ModelAllowlist) > 0

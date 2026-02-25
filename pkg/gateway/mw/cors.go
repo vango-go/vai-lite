@@ -12,6 +12,7 @@ var corsAllowedMethods = "GET, POST, OPTIONS"
 var corsAllowedHeaders = strings.Join([]string{
 	"Authorization",
 	"Content-Type",
+	"X-VAI-Version",
 	"X-Request-ID",
 	"Idempotency-Key",
 	"X-Provider-Key-Anthropic",

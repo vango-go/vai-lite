@@ -40,8 +40,11 @@ type Config struct {
 	CORSAllowedOrigins map[string]struct{} // empty => disabled
 
 	// SSE
-	SSEPingInterval      time.Duration
-	SSEMaxStreamDuration time.Duration
+	SSEPingInterval           time.Duration
+	SSEMaxStreamDuration      time.Duration
+	StreamIdleTimeout         time.Duration
+	WSMaxSessionDuration      time.Duration
+	WSMaxSessionsPerPrincipal int
 
 	// In-memory limits (per principal).
 	LimitRPS                   float64
@@ -55,108 +58,125 @@ type Config struct {
 	HandlerTimeout    time.Duration
 
 	// Upstream HTTP client defaults
+	UpstreamConnectTimeout        time.Duration
 	UpstreamResponseHeaderTimeout time.Duration
 }
 
 func LoadFromEnv() (Config, error) {
 	cfg := Config{
-		Addr:                          envOr("VAI_GATEWAY_ADDR", ":8080"),
-		AuthMode:                      AuthMode(envOr("VAI_AUTH_MODE", string(AuthModeRequired))),
+		Addr:                          envOr("VAI_PROXY_ADDR", ":8080"),
+		AuthMode:                      AuthMode(envOr("VAI_PROXY_AUTH_MODE", string(AuthModeRequired))),
 		APIKeys:                       make(map[string]struct{}),
-		MaxBodyBytes:                  envInt64Or("VAI_MAX_BODY_BYTES", 25<<20), // 25 MiB
-		MaxMessages:                   envIntOr("VAI_MAX_MESSAGES", 64),
-		MaxTools:                      envIntOr("VAI_MAX_TOOLS", 64),
-		MaxTotalTextBytes:             envInt64Or("VAI_MAX_TOTAL_TEXT_BYTES", 512<<10),  // 512 KiB
-		MaxB64BytesPerBlock:           envInt64Or("VAI_MAX_B64_BYTES_PER_BLOCK", 4<<20), // 4 MiB decoded
-		MaxB64BytesTotal:              envInt64Or("VAI_MAX_B64_BYTES_TOTAL", 12<<20),    // 12 MiB decoded
+		MaxBodyBytes:                  envInt64Or("VAI_PROXY_MAX_BODY_BYTES", 8<<20), // 8 MiB
+		MaxMessages:                   envIntOr("VAI_PROXY_MAX_MESSAGES", 64),
+		MaxTools:                      envIntOr("VAI_PROXY_MAX_TOOLS", 64),
+		MaxTotalTextBytes:             envInt64Or("VAI_PROXY_MAX_TOTAL_TEXT_BYTES", 512<<10), // 512 KiB
+		MaxB64BytesPerBlock:           envInt64Or("VAI_PROXY_MAX_B64_PER_BLOCK", 4<<20),      // 4 MiB decoded
+		MaxB64BytesTotal:              envInt64Or("VAI_PROXY_MAX_B64_TOTAL", 12<<20),         // 12 MiB decoded
 		ModelAllowlist:                make(map[string]struct{}),
 		CORSAllowedOrigins:            make(map[string]struct{}),
-		SSEPingInterval:               envDurationOr("VAI_SSE_PING_INTERVAL", 15*time.Second),
-		SSEMaxStreamDuration:          envDurationOr("VAI_SSE_MAX_STREAM_DURATION", 10*time.Minute),
-		LimitRPS:                      envFloat64Or("VAI_LIMIT_RPS", 2.0),
-		LimitBurst:                    envIntOr("VAI_LIMIT_BURST", 4),
-		LimitMaxConcurrentRequests:    envIntOr("VAI_LIMIT_MAX_CONCURRENT_REQUESTS", 20),
-		LimitMaxConcurrentStreams:     envIntOr("VAI_LIMIT_MAX_CONCURRENT_STREAMS", 4),
-		ReadHeaderTimeout:             envDurationOr("VAI_READ_HEADER_TIMEOUT", 10*time.Second),
-		ReadTimeout:                   envDurationOr("VAI_READ_TIMEOUT", 30*time.Second),
-		HandlerTimeout:                envDurationOr("VAI_HANDLER_TIMEOUT", 2*time.Minute),
-		UpstreamResponseHeaderTimeout: envDurationOr("VAI_UPSTREAM_RESPONSE_HEADER_TIMEOUT", 30*time.Second),
+		SSEPingInterval:               envDurationOr("VAI_PROXY_SSE_PING_INTERVAL", 15*time.Second),
+		SSEMaxStreamDuration:          envDurationOr("VAI_PROXY_SSE_MAX_DURATION", 5*time.Minute),
+		StreamIdleTimeout:             envDurationOr("VAI_PROXY_STREAM_IDLE_TIMEOUT", 60*time.Second),
+		WSMaxSessionDuration:          envDurationOr("VAI_PROXY_WS_MAX_DURATION", 2*time.Hour),
+		WSMaxSessionsPerPrincipal:     envIntOr("VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL", 2),
+		LimitRPS:                      envFloat64Or("VAI_PROXY_RATE_LIMIT_RPS", 2.0),
+		LimitBurst:                    envIntOr("VAI_PROXY_RATE_LIMIT_BURST", 4),
+		LimitMaxConcurrentRequests:    envIntOr("VAI_PROXY_MAX_CONCURRENT_REQUESTS", 20),
+		LimitMaxConcurrentStreams:     envIntOr("VAI_PROXY_MAX_STREAMS_PER_PRINCIPAL", 4),
+		ReadHeaderTimeout:             envDurationOr("VAI_PROXY_READ_HEADER_TIMEOUT", 10*time.Second),
+		ReadTimeout:                   envDurationOr("VAI_PROXY_READ_TIMEOUT", 30*time.Second),
+		HandlerTimeout:                envDurationOr("VAI_PROXY_TOTAL_REQUEST_TIMEOUT", 2*time.Minute),
+		UpstreamConnectTimeout:        envDurationOr("VAI_PROXY_CONNECT_TIMEOUT", 5*time.Second),
+		UpstreamResponseHeaderTimeout: envDurationOr("VAI_PROXY_RESPONSE_HEADER_TIMEOUT", 30*time.Second),
 	}
 
 	switch cfg.AuthMode {
 	case AuthModeRequired, AuthModeOptional, AuthModeDisabled:
 	default:
-		return Config{}, fmt.Errorf("VAI_AUTH_MODE must be one of required|optional|disabled")
+		return Config{}, fmt.Errorf("VAI_PROXY_AUTH_MODE must be one of required|optional|disabled")
 	}
 
-	for _, key := range splitCSV(os.Getenv("VAI_API_KEYS")) {
+	for _, key := range splitCSV(os.Getenv("VAI_PROXY_API_KEYS")) {
 		cfg.APIKeys[key] = struct{}{}
 	}
 
-	for _, m := range splitCSV(os.Getenv("VAI_MODEL_ALLOWLIST")) {
+	for _, m := range splitCSV(os.Getenv("VAI_PROXY_MODEL_ALLOWLIST")) {
 		cfg.ModelAllowlist[m] = struct{}{}
 	}
 
-	for _, origin := range splitCSV(os.Getenv("VAI_CORS_ALLOWED_ORIGINS")) {
+	for _, origin := range splitCSV(os.Getenv("VAI_PROXY_CORS_ORIGINS")) {
 		cfg.CORSAllowedOrigins[origin] = struct{}{}
 	}
 
 	if cfg.MaxBodyBytes <= 0 {
-		return Config{}, fmt.Errorf("VAI_MAX_BODY_BYTES must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_BODY_BYTES must be > 0")
 	}
 
 	if cfg.MaxMessages <= 0 {
-		return Config{}, fmt.Errorf("VAI_MAX_MESSAGES must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_MESSAGES must be > 0")
 	}
 	if cfg.MaxTools <= 0 {
-		return Config{}, fmt.Errorf("VAI_MAX_TOOLS must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_TOOLS must be > 0")
 	}
 	if cfg.MaxTotalTextBytes <= 0 {
-		return Config{}, fmt.Errorf("VAI_MAX_TOTAL_TEXT_BYTES must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_TOTAL_TEXT_BYTES must be > 0")
 	}
 	if cfg.MaxB64BytesPerBlock <= 0 {
-		return Config{}, fmt.Errorf("VAI_MAX_B64_BYTES_PER_BLOCK must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_B64_PER_BLOCK must be > 0")
 	}
 	if cfg.MaxB64BytesTotal <= 0 {
-		return Config{}, fmt.Errorf("VAI_MAX_B64_BYTES_TOTAL must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_B64_TOTAL must be > 0")
 	}
 	if cfg.MaxB64BytesPerBlock > cfg.MaxB64BytesTotal {
-		return Config{}, fmt.Errorf("VAI_MAX_B64_BYTES_PER_BLOCK must be <= VAI_MAX_B64_BYTES_TOTAL")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_B64_PER_BLOCK must be <= VAI_PROXY_MAX_B64_TOTAL")
 	}
 	if cfg.SSEPingInterval <= 0 {
-		return Config{}, fmt.Errorf("VAI_SSE_PING_INTERVAL must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_SSE_PING_INTERVAL must be > 0")
 	}
 	if cfg.SSEMaxStreamDuration <= 0 {
-		return Config{}, fmt.Errorf("VAI_SSE_MAX_STREAM_DURATION must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_SSE_MAX_DURATION must be > 0")
+	}
+	if cfg.StreamIdleTimeout <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_STREAM_IDLE_TIMEOUT must be > 0")
+	}
+	if cfg.WSMaxSessionDuration <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_WS_MAX_DURATION must be > 0")
+	}
+	if cfg.WSMaxSessionsPerPrincipal <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL must be > 0")
 	}
 	if cfg.ReadHeaderTimeout <= 0 {
-		return Config{}, fmt.Errorf("VAI_READ_HEADER_TIMEOUT must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_READ_HEADER_TIMEOUT must be > 0")
 	}
 	if cfg.ReadTimeout <= 0 {
-		return Config{}, fmt.Errorf("VAI_READ_TIMEOUT must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_READ_TIMEOUT must be > 0")
 	}
 	if cfg.HandlerTimeout <= 0 {
-		return Config{}, fmt.Errorf("VAI_HANDLER_TIMEOUT must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_TOTAL_REQUEST_TIMEOUT must be > 0")
+	}
+	if cfg.UpstreamConnectTimeout <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_CONNECT_TIMEOUT must be > 0")
 	}
 	if cfg.UpstreamResponseHeaderTimeout <= 0 {
-		return Config{}, fmt.Errorf("VAI_UPSTREAM_RESPONSE_HEADER_TIMEOUT must be > 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_RESPONSE_HEADER_TIMEOUT must be > 0")
 	}
 
 	if cfg.LimitRPS < 0 {
-		return Config{}, fmt.Errorf("VAI_LIMIT_RPS must be >= 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_RATE_LIMIT_RPS must be >= 0")
 	}
 	if cfg.LimitBurst < 0 {
-		return Config{}, fmt.Errorf("VAI_LIMIT_BURST must be >= 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_RATE_LIMIT_BURST must be >= 0")
 	}
 	if cfg.LimitMaxConcurrentRequests < 0 {
-		return Config{}, fmt.Errorf("VAI_LIMIT_MAX_CONCURRENT_REQUESTS must be >= 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_CONCURRENT_REQUESTS must be >= 0")
 	}
 	if cfg.LimitMaxConcurrentStreams < 0 {
-		return Config{}, fmt.Errorf("VAI_LIMIT_MAX_CONCURRENT_STREAMS must be >= 0")
+		return Config{}, fmt.Errorf("VAI_PROXY_MAX_STREAMS_PER_PRINCIPAL must be >= 0")
 	}
 
 	if cfg.AuthMode == AuthModeRequired && len(cfg.APIKeys) == 0 {
-		return Config{}, fmt.Errorf("VAI_API_KEYS must be set when VAI_AUTH_MODE=required")
+		return Config{}, fmt.Errorf("VAI_PROXY_API_KEYS must be set when VAI_PROXY_AUTH_MODE=required")
 	}
 
 	return cfg, nil

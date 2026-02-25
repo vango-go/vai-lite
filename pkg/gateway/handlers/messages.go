@@ -291,7 +291,7 @@ func (h MessagesHandler) serveStream(
 			for chunk := range ttsStream.Audio() {
 				ev := types.AudioChunkEvent{
 					Type:         "audio_chunk",
-					Format:       "pcm",
+					Format:       "pcm_s16le",
 					Audio:        base64.StdEncoding.EncodeToString(chunk),
 					SampleRateHz: sampleRateHz,
 				}
@@ -306,6 +306,28 @@ func (h MessagesHandler) serveStream(
 		ev  types.StreamEvent
 		err error
 	}
+
+	idleTimeout := h.Config.StreamIdleTimeout
+	var idleTimer *time.Timer
+	var idleTimerCh <-chan time.Time
+	if idleTimeout > 0 {
+		idleTimer = time.NewTimer(idleTimeout)
+		idleTimerCh = idleTimer.C
+		defer idleTimer.Stop()
+	}
+	resetIdleTimer := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleTimeout)
+	}
+
 	nextCh := make(chan nextResult, 1)
 	go func() {
 		defer close(nextCh)
@@ -335,19 +357,59 @@ func (h MessagesHandler) serveStream(
 			}
 			return
 
+		case <-idleTimerCh:
+			_ = stream.Close()
+			if ttsCtx != nil {
+				_ = ttsCtx.Close()
+			}
+			h.writeErr(w, reqID, core.NewAPIError("upstream stream idle timeout"), true)
+			return
+
 		case res, ok := <-nextCh:
 			if !ok {
 				goto done
 			}
+			resetIdleTimer()
 			if res.ev != nil {
+				if userTranscript != "" {
+					switch ev := res.ev.(type) {
+					case types.MessageStartEvent:
+						if ev.Message.Metadata == nil {
+							ev.Message.Metadata = make(map[string]any)
+						}
+						ev.Message.Metadata["user_transcript"] = userTranscript
+						res.ev = ev
+					case *types.MessageStartEvent:
+						if ev.Message.Metadata == nil {
+							ev.Message.Metadata = make(map[string]any)
+						}
+						ev.Message.Metadata["user_transcript"] = userTranscript
+					}
+				}
+
 				// Feed text deltas into TTS.
 				if ttsStream != nil {
 					if cbd, ok := res.ev.(types.ContentBlockDeltaEvent); ok {
 						if td, ok := cbd.Delta.(types.TextDelta); ok {
 							if sendErr := ttsStream.OnTextDelta(td.Text); sendErr != nil {
 								_ = ttsStream.Close()
-								h.writeErr(w, reqID, sendErr, true)
-								return
+								<-audioDone
+								ttsStream = nil
+								if ttsCtx != nil {
+									_ = ttsCtx.Close()
+								}
+								audioUnavailable := types.AudioUnavailableEvent{
+									Type:    "audio_unavailable",
+									Reason:  "tts_failed",
+									Message: "TTS synthesis failed: " + sendErr.Error(),
+								}
+								if sendErr := send(audioUnavailable.EventType(), audioUnavailable); sendErr != nil {
+									_ = stream.Close()
+									if ttsCtx != nil {
+										_ = ttsCtx.Close()
+									}
+									return
+								}
 							}
 						}
 					}
@@ -388,7 +450,7 @@ done:
 		// Emit a final marker.
 		_ = send("audio_chunk", types.AudioChunkEvent{
 			Type:         "audio_chunk",
-			Format:       "pcm",
+			Format:       "pcm_s16le",
 			Audio:        "",
 			SampleRateHz: sampleRateHz,
 			IsFinal:      true,

@@ -1,11 +1,13 @@
 package mw
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -96,21 +98,95 @@ func Recover(logger *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-type statusWriter struct {
+type loggingResponseWriter struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
+func (w *loggingResponseWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
+	}
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+type loggingResponseWriterFlusher struct {
+	*loggingResponseWriter
+	flusher http.Flusher
+}
+
+func (w *loggingResponseWriterFlusher) Flush() {
+	w.flusher.Flush()
+}
+
+type loggingResponseWriterHijacker struct {
+	*loggingResponseWriter
+	hijacker http.Hijacker
+}
+
+func (w *loggingResponseWriterHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.hijacker.Hijack()
+}
+
+type loggingResponseWriterFlusherHijacker struct {
+	*loggingResponseWriter
+	flusher  http.Flusher
+	hijacker http.Hijacker
+}
+
+func (w *loggingResponseWriterFlusherHijacker) Flush() {
+	w.flusher.Flush()
+}
+
+func (w *loggingResponseWriterFlusherHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.hijacker.Hijack()
+}
+
+func wrapLoggingResponseWriter(w http.ResponseWriter) (http.ResponseWriter, *loggingResponseWriter) {
+	base := &loggingResponseWriter{
+		ResponseWriter: w,
+		status:         http.StatusOK,
+	}
+
+	flusher, hasFlusher := w.(http.Flusher)
+	hijacker, hasHijacker := w.(http.Hijacker)
+
+	switch {
+	case hasFlusher && hasHijacker:
+		return &loggingResponseWriterFlusherHijacker{
+			loggingResponseWriter: base,
+			flusher:               flusher,
+			hijacker:              hijacker,
+		}, base
+	case hasFlusher:
+		return &loggingResponseWriterFlusher{
+			loggingResponseWriter: base,
+			flusher:               flusher,
+		}, base
+	case hasHijacker:
+		return &loggingResponseWriterHijacker{
+			loggingResponseWriter: base,
+			hijacker:              hijacker,
+		}, base
+	default:
+		return base, base
+	}
 }
 
 func AccessLog(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: 200}
-		next.ServeHTTP(sw, r)
+		wrapped, state := wrapLoggingResponseWriter(w)
+		next.ServeHTTP(wrapped, r)
 		if logger == nil {
 			return
 		}
@@ -119,7 +195,7 @@ func AccessLog(logger *slog.Logger, next http.Handler) http.Handler {
 			"request_id", reqID,
 			"method", r.Method,
 			"path", r.URL.Path,
-			"status", sw.status,
+			"status", state.status,
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})

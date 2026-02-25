@@ -32,7 +32,7 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
-				Timeout: 10 * time.Second,
+				Timeout: cfg.UpstreamConnectTimeout,
 			}).DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
@@ -80,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	var h http.Handler = s.mux
 	h = mw.RateLimit(s.cfg, s.limiter, h)
 	h = mw.Auth(s.cfg, h)
+	h = mw.APIVersion(h)
 	h = mw.CORS(s.cfg, h)
 	h = mw.Recover(s.logger, h)
 	h = mw.AccessLog(s.logger, h)
