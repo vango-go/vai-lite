@@ -1,10 +1,12 @@
 package safety
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -32,8 +34,12 @@ func ValidateTargetURL(ctx context.Context, rawURL string) (*url.URL, error) {
 	if len(rawURL) > MaxURLLength {
 		return nil, fmt.Errorf("url exceeds maximum length %d", MaxURLLength)
 	}
+	decodedURL, err := decodeURLForValidation(rawURL)
+	if err != nil {
+		return nil, err
+	}
 
-	u, err := url.Parse(rawURL)
+	u, err := url.Parse(decodedURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid url: %w", err)
 	}
@@ -43,23 +49,30 @@ func ValidateTargetURL(ctx context.Context, rawURL string) (*url.URL, error) {
 	if u.User != nil {
 		return nil, fmt.Errorf("url credentials are not allowed")
 	}
-	if strings.TrimSpace(u.Host) == "" {
+	host := strings.TrimSpace(u.Hostname())
+	port := strings.TrimSpace(u.Port())
+	if host == "" {
 		return nil, fmt.Errorf("url host is required")
 	}
-
-	host, port, err := net.SplitHostPort(u.Host)
-	if err != nil {
-		host = u.Host
-		port = ""
+	if !isASCII(host) {
+		// Conservative policy for SSRF safety: reject non-ASCII hosts unless
+		// an explicit IDNA normalization layer is introduced.
+		return nil, fmt.Errorf("url host must be ascii")
 	}
-	if strings.TrimSpace(host) == "" {
-		return nil, fmt.Errorf("url host is required")
+	if port != "" {
+		if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+			return nil, fmt.Errorf("invalid port")
+		}
 	}
 
-	normalizedHost := strings.ToLower(strings.TrimSpace(host))
+	normalizedHost := strings.ToLower(host)
 	if normalizedHost == "" {
 		return nil, fmt.Errorf("invalid hostname")
 	}
+	if strings.Contains(normalizedHost, "%") {
+		return nil, fmt.Errorf("invalid hostname")
+	}
+
 	if port != "" {
 		u.Host = net.JoinHostPort(normalizedHost, port)
 	} else {
@@ -108,6 +121,9 @@ func validateIP(ip net.IP) error {
 	if ip == nil {
 		return fmt.Errorf("invalid ip")
 	}
+	if isIPv4MappedIPv6(ip) {
+		ip = ip.To4()
+	}
 	if ip4 := ip.To4(); ip4 != nil {
 		ip = ip4
 	}
@@ -133,4 +149,32 @@ func mustParseCIDRs(values []string) []*net.IPNet {
 		out = append(out, cidr)
 	}
 	return out
+}
+
+func decodeURLForValidation(rawURL string) (string, error) {
+	decoded := rawURL
+	for i := 0; i < 3; i++ {
+		next, err := url.PathUnescape(decoded)
+		if err != nil {
+			return "", fmt.Errorf("invalid percent-encoding in url")
+		}
+		if next == decoded {
+			break
+		}
+		decoded = next
+	}
+	return decoded, nil
+}
+
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func isIPv4MappedIPv6(ip net.IP) bool {
+	return len(ip) == net.IPv6len && bytes.Equal(ip[:12], []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff})
 }

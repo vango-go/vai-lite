@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
+
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/safety"
 )
 
 const defaultBaseURL = "https://api.firecrawl.dev"
@@ -74,7 +75,7 @@ func (c *Client) Fetch(ctx context.Context, targetURL string) (*Result, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		b, _ := safety.ReadResponseBodyLimited(resp, 8192)
 		return nil, fmt.Errorf("firecrawl error (status %d): %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
@@ -90,7 +91,7 @@ func (c *Client) Fetch(ctx context.Context, targetURL string) (*Result, error) {
 			} `json:"metadata"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := safety.DecodeJSONBodyLimited(resp, safety.MaxDownloadedBytesV1, &decoded); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	if !decoded.Success {

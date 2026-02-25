@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
+
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/safety"
 )
 
 const defaultBaseURL = "https://api.tavily.com"
@@ -77,7 +78,7 @@ func (c *Client) Search(ctx context.Context, query string, maxResults int) ([]Hi
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		b, _ := safety.ReadResponseBodyLimited(resp, 8192)
 		return nil, fmt.Errorf("tavily error (status %d): %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
@@ -89,7 +90,7 @@ func (c *Client) Search(ctx context.Context, query string, maxResults int) ([]Hi
 			RawContent string `json:"raw_content"`
 		} `json:"results"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := safety.DecodeJSONBodyLimited(resp, safety.MaxDownloadedBytesV1, &decoded); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 

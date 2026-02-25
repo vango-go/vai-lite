@@ -148,11 +148,12 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 		}
 		if err != nil {
 			result.StopReason = types.RunStopReasonError
+			_, isContextStop := stopReasonFromContext(err)
 			if stopReason, done := stopReasonFromContext(err); done {
 				result.StopReason = stopReason
 			}
 			result.Messages = snapshotHistory()
-			if emit != nil {
+			if emit != nil && !isContextStop {
 				_ = emit(types.RunErrorEvent{Type: "error", Error: toTypesError(err, c.RequestID)})
 			}
 			return result, err
@@ -167,6 +168,7 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 
 		result.Usage = result.Usage.Add(resp.Usage)
 		result.TurnCount++
+		maxTokensExceeded := runCfg.MaxTokens > 0 && result.Usage.TotalTokens >= runCfg.MaxTokens
 
 		step := types.RunStep{Index: stepIndex, Response: resp, DurationMS: time.Since(stepStart).Milliseconds()}
 
@@ -185,7 +187,25 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 			history = append(history, types.Message{Role: "assistant", Content: resp.Content})
 			result.Response = resp
 			result.Steps = append(result.Steps, step)
-			result.StopReason = types.RunStopReasonEndTurn
+			if maxTokensExceeded {
+				result.StopReason = types.RunStopReasonMaxTokens
+			} else {
+				result.StopReason = types.RunStopReasonEndTurn
+			}
+			result.Messages = snapshotHistory()
+			if emit != nil {
+				_ = emit(types.RunStepCompleteEvent{Type: "step_complete", Index: stepIndex, Response: resp})
+				expectedLen := len(history) - 1
+				_ = emit(types.RunHistoryDeltaEvent{Type: "history_delta", ExpectedLen: expectedLen, Append: []types.Message{{Role: "assistant", Content: resp.Content}}})
+				_ = emit(types.RunCompleteEvent{Type: "run_complete", Result: result})
+			}
+			return result, nil
+		}
+		if maxTokensExceeded {
+			history = append(history, types.Message{Role: "assistant", Content: resp.Content})
+			result.Response = resp
+			result.Steps = append(result.Steps, step)
+			result.StopReason = types.RunStopReasonMaxTokens
 			result.Messages = snapshotHistory()
 			if emit != nil {
 				_ = emit(types.RunStepCompleteEvent{Type: "step_complete", Index: stepIndex, Response: resp})

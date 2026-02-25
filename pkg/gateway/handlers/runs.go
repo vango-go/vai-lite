@@ -28,6 +28,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/firecrawl"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/tavily"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/builtins"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/safety"
 )
 
 // RunsHandler handles /v1/runs and /v1/runs:stream requests.
@@ -90,17 +91,6 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if compatIssues := compat.ValidateMessageRequest(&runReq.Request, providerName, runReq.Request.Model); len(compatIssues) > 0 {
-		writeCoreErrorJSON(w, reqID, &core.Error{Type: core.ErrInvalidRequest, Message: fmt.Sprintf("Request is incompatible with provider %s and model %s", providerName, modelName), CompatIssues: compatIssues, RequestID: reqID}, http.StatusBadRequest)
-		return
-	}
-
-	provider, err := h.Upstreams.New(providerName, upstreamKey)
-	if err != nil {
-		h.writeErr(w, reqID, err, false)
-		return
-	}
-
 	workingReq := *runReq
 	workingReq.Request.Model = modelName
 
@@ -117,6 +107,17 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workingReq.Request.Tools = injectedTools
+
+	if compatIssues := compat.ValidateMessageRequest(&workingReq.Request, providerName, runReq.Request.Model); len(compatIssues) > 0 {
+		writeCoreErrorJSON(w, reqID, &core.Error{Type: core.ErrInvalidRequest, Message: fmt.Sprintf("Request is incompatible with provider %s and model %s", providerName, modelName), CompatIssues: compatIssues, RequestID: reqID}, http.StatusBadRequest)
+		return
+	}
+
+	provider, err := h.Upstreams.New(providerName, upstreamKey)
+	if err != nil {
+		h.writeErr(w, reqID, err, false)
+		return
+	}
 
 	if h.Stream {
 		h.serveStream(w, r, reqID, runReq.Request.Model, provider, &workingReq, voicePipeline, registry)
@@ -228,15 +229,13 @@ func (h RunsHandler) serveStream(
 		if result == nil {
 			result = &types.RunResult{StopReason: types.RunStopReasonCancelled, Steps: []types.RunStep{}}
 		}
-		if result.StopReason == "" {
-			result.StopReason = types.RunStopReasonCancelled
+		result.StopReason = types.RunStopReasonCancelled
+		if result.Steps == nil {
+			result.Steps = []types.RunStep{}
 		}
 		_ = sw.Send("run_complete", types.RunCompleteEvent{Type: "run_complete", Result: result})
 		return
 	}
-
-	coreErr, _ := coreErrorFrom(err, reqID)
-	_ = sw.Send("error", types.RunErrorEvent{Type: "error", Error: toTypesError(coreErr)})
 }
 
 func (h RunsHandler) resolveVoicePipeline(r *http.Request) *voice.Pipeline {
@@ -255,8 +254,9 @@ func (h RunsHandler) resolveVoicePipeline(r *http.Request) *voice.Pipeline {
 }
 
 func (h RunsHandler) newBuiltinsRegistry() *builtins.Registry {
-	searchClient := tavily.NewClient(h.Config.TavilyAPIKey, h.Config.TavilyBaseURL, h.HTTPClient)
-	fetchClient := firecrawl.NewClient(h.Config.FirecrawlAPIKey, h.Config.FirecrawlBaseURL, h.HTTPClient)
+	toolHTTPClient := safety.NewRestrictedHTTPClient(h.HTTPClient)
+	searchClient := tavily.NewClient(h.Config.TavilyAPIKey, h.Config.TavilyBaseURL, toolHTTPClient)
+	fetchClient := firecrawl.NewClient(h.Config.FirecrawlAPIKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
 	return builtins.NewRegistry(
 		builtins.NewWebSearchBuiltin(searchClient),
 		builtins.NewWebFetchBuiltin(fetchClient),

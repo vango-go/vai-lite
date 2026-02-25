@@ -19,6 +19,7 @@ import (
 type fakeRunProvider struct {
 	createResp   *types.MessageResponse
 	streamEvents []types.StreamEvent
+	stream       core.EventStream
 }
 
 func (p *fakeRunProvider) Name() string { return "anthropic" }
@@ -32,8 +33,27 @@ func (p *fakeRunProvider) CreateMessage(ctx context.Context, req *types.MessageR
 	return &types.MessageResponse{Type: "message", Role: "assistant", Model: req.Model, StopReason: types.StopReasonEndTurn, Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}}}, nil
 }
 func (p *fakeRunProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	if p.stream != nil {
+		return p.stream, nil
+	}
 	return &fakeEventStream{events: p.streamEvents}, nil
 }
+
+type delayedEOFStream struct {
+	delay time.Duration
+	once  bool
+}
+
+func (s *delayedEOFStream) Next() (types.StreamEvent, error) {
+	if s.once {
+		return nil, io.EOF
+	}
+	s.once = true
+	time.Sleep(s.delay)
+	return nil, io.EOF
+}
+
+func (s *delayedEOFStream) Close() error { return nil }
 
 func baseRunsConfig() config.Config {
 	return config.Config{
@@ -93,6 +113,41 @@ func TestRunsHandler_BuiltinMissingConfigFailFast(t *testing.T) {
 	}
 }
 
+func TestRunsHandler_ModelAllowlistDenied(t *testing.T) {
+	cfg := baseRunsConfig()
+	cfg.ModelAllowlist = map[string]struct{}{"anthropic/allowed": {}}
+	h := RunsHandler{Config: cfg, Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRunsHandler_CompatibilityErrorsIncludeCompatIssues(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{
+			"model":"openai/gpt-4o",
+			"messages":[{"role":"user","content":[{"type":"video","source":{"type":"base64","media_type":"video/mp4","data":"Zm9v"}}]}]
+		}
+	}`)))
+	req.Header.Set("X-Provider-Key-OpenAI", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"compat_issues"`) || !strings.Contains(body, `"unsupported_content_block"`) {
+		t.Fatalf("body=%s", body)
+	}
+}
+
 func TestRunsHandler_BlockingSuccess(t *testing.T) {
 	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
 	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
@@ -135,9 +190,93 @@ func TestRunsHandler_StreamSSE(t *testing.T) {
 	if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Fatalf("content-type=%q", ct)
 	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("cache-control=%q", got)
+	}
+	if got := rr.Header().Get("Connection"); got != "keep-alive" {
+		t.Fatalf("connection=%q", got)
+	}
+	if got := rr.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("x-accel-buffering=%q", got)
+	}
 	body := rr.Body.String()
 	if !strings.Contains(body, "event: run_start") || !strings.Contains(body, "event: step_start") || !strings.Contains(body, "event: stream_event") || !strings.Contains(body, "event: run_complete") {
 		t.Fatalf("body=%s", body)
+	}
+}
+
+func TestRunsHandler_Stream_EmitsPing(t *testing.T) {
+	cfg := baseRunsConfig()
+	cfg.SSEPingInterval = 5 * time.Millisecond
+	cfg.StreamIdleTimeout = 250 * time.Millisecond
+	h := RunsHandler{
+		Config:    cfg,
+		Upstreams: fakeFactory{p: &fakeRunProvider{stream: &delayedEOFStream{delay: 40 * time.Millisecond}}},
+		Stream:    true,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs:stream", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "event: ping") {
+		t.Fatalf("expected ping in body: %s", rr.Body.String())
+	}
+}
+
+func TestRunsHandler_Stream_IdleTimeout(t *testing.T) {
+	cfg := baseRunsConfig()
+	cfg.SSEPingInterval = 5 * time.Millisecond
+	cfg.StreamIdleTimeout = 15 * time.Millisecond
+	h := RunsHandler{
+		Config:    cfg,
+		Upstreams: fakeFactory{p: &fakeRunProvider{stream: &delayedEOFStream{delay: 150 * time.Millisecond}}},
+		Stream:    true,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs:stream", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "upstream stream idle timeout") {
+		t.Fatalf("body=%s", body)
+	}
+}
+
+func TestRunsHandler_Stream_RunTimeoutEmitsCancelledRunComplete(t *testing.T) {
+	cfg := baseRunsConfig()
+	cfg.SSEPingInterval = 5 * time.Millisecond
+	cfg.StreamIdleTimeout = 5 * time.Second
+	h := RunsHandler{
+		Config:    cfg,
+		Upstreams: fakeFactory{p: &fakeRunProvider{stream: &delayedEOFStream{delay: 2500 * time.Millisecond}}},
+		Stream:    true,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs:stream", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"run":{"timeout_ms":1000}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: run_complete") || !strings.Contains(body, `"stop_reason":"cancelled"`) {
+		t.Fatalf("body=%s", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("unexpected error event for run timeout: %s", body)
 	}
 }
 

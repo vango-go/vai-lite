@@ -29,6 +29,47 @@ func (f fakeExecutor) Execute(ctx context.Context, input map[string]any) ([]type
 	return []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}}, nil
 }
 
+type trackingExecutor struct {
+	name  string
+	delay time.Duration
+
+	mu            sync.Mutex
+	inFlight      int
+	maxInFlight   int
+	invocationCnt int
+}
+
+func (f *trackingExecutor) Name() string { return f.name }
+func (f *trackingExecutor) Definition() types.Tool {
+	return types.Tool{Type: types.ToolTypeFunction, Name: f.name, Description: "d", InputSchema: &types.JSONSchema{Type: "object"}}
+}
+func (f *trackingExecutor) Configured() bool { return true }
+func (f *trackingExecutor) Execute(ctx context.Context, input map[string]any) ([]types.ContentBlock, *types.Error) {
+	f.mu.Lock()
+	f.invocationCnt++
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
+	f.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(f.delay):
+	}
+
+	f.mu.Lock()
+	f.inFlight--
+	f.mu.Unlock()
+	return []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}}, nil
+}
+
+func (f *trackingExecutor) MaxInFlight() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxInFlight
+}
+
 type scriptedProvider struct {
 	name string
 
@@ -36,6 +77,20 @@ type scriptedProvider struct {
 	calls   int
 	resps   []*types.MessageResponse
 	streams [][]streamItem
+}
+
+type timeoutProvider struct{}
+
+func (p *timeoutProvider) Name() string { return "test" }
+func (p *timeoutProvider) Capabilities() core.ProviderCapabilities {
+	return core.ProviderCapabilities{Tools: true}
+}
+func (p *timeoutProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (p *timeoutProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	return nil, io.EOF
 }
 
 type streamItem struct {
@@ -231,5 +286,153 @@ func TestRunBlocking_VoiceOutputAppended(t *testing.T) {
 	}
 	if audio := result.Response.AudioContent(); audio == nil {
 		t.Fatalf("expected audio content in response: %+v", result.Response.Content)
+	}
+}
+
+func TestRunBlocking_StopReasonMaxTurns(t *testing.T) {
+	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{{
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "m",
+		StopReason: types.StopReasonToolUse,
+		Content: []types.ContentBlock{types.ToolUseBlock{
+			Type:  "tool_use",
+			ID:    "call_1",
+			Name:  builtins.BuiltinWebSearch,
+			Input: map[string]any{"query": "q"},
+		}},
+	}}}
+
+	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
+		Run:     types.RunConfig{MaxTurns: 1, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if result.StopReason != types.RunStopReasonMaxTurns {
+		t.Fatalf("stop_reason=%q", result.StopReason)
+	}
+	if result.TurnCount != 1 {
+		t.Fatalf("turn_count=%d", result.TurnCount)
+	}
+}
+
+func TestRunBlocking_StopReasonMaxToolCalls(t *testing.T) {
+	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{{
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "m",
+		StopReason: types.StopReasonToolUse,
+		Content: []types.ContentBlock{
+			types.ToolUseBlock{Type: "tool_use", ID: "call_1", Name: builtins.BuiltinWebSearch, Input: map[string]any{"query": "a"}},
+			types.ToolUseBlock{Type: "tool_use", ID: "call_2", Name: builtins.BuiltinWebSearch, Input: map[string]any{"query": "b"}},
+		},
+	}}}
+
+	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
+		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 1, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if result.StopReason != types.RunStopReasonMaxToolCalls {
+		t.Fatalf("stop_reason=%q", result.StopReason)
+	}
+}
+
+func TestRunBlocking_StopReasonMaxTokens(t *testing.T) {
+	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{{
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "m",
+		StopReason: types.StopReasonEndTurn,
+		Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "done"}},
+		Usage:      types.Usage{InputTokens: 4, OutputTokens: 6, TotalTokens: 10},
+	}}}
+
+	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
+		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, MaxTokens: 10, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if result.StopReason != types.RunStopReasonMaxTokens {
+		t.Fatalf("stop_reason=%q", result.StopReason)
+	}
+}
+
+func TestRunBlocking_Timeout(t *testing.T) {
+	controller := &Controller{Provider: &timeoutProvider{}, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
+		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 20, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if result == nil || result.StopReason != types.RunStopReasonTimeout {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestRunBlocking_ParallelVsSequentialToolExecution(t *testing.T) {
+	newProvider := func() *scriptedProvider {
+		return &scriptedProvider{name: "test", resps: []*types.MessageResponse{
+			{
+				Type:       "message",
+				Role:       "assistant",
+				Model:      "m",
+				StopReason: types.StopReasonToolUse,
+				Content: []types.ContentBlock{
+					types.ToolUseBlock{Type: "tool_use", ID: "call_1", Name: builtins.BuiltinWebSearch, Input: map[string]any{"query": "a"}},
+					types.ToolUseBlock{Type: "tool_use", ID: "call_2", Name: builtins.BuiltinWebSearch, Input: map[string]any{"query": "b"}},
+				},
+			},
+			{
+				Type:       "message",
+				Role:       "assistant",
+				Model:      "m",
+				StopReason: types.StopReasonEndTurn,
+				Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "done"}},
+			},
+		}}
+	}
+
+	parallelExec := &trackingExecutor{name: builtins.BuiltinWebSearch, delay: 20 * time.Millisecond}
+	parallelController := &Controller{Provider: newProvider(), Builtins: builtins.NewRegistry(parallelExec)}
+	parallelResult, err := parallelController.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
+		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("parallel err=%v", err)
+	}
+	if parallelResult.StopReason != types.RunStopReasonEndTurn {
+		t.Fatalf("parallel stop_reason=%q", parallelResult.StopReason)
+	}
+	if parallelExec.MaxInFlight() < 2 {
+		t.Fatalf("parallel max_in_flight=%d, expected concurrent execution", parallelExec.MaxInFlight())
+	}
+
+	seqExec := &trackingExecutor{name: builtins.BuiltinWebSearch, delay: 20 * time.Millisecond}
+	seqController := &Controller{Provider: newProvider(), Builtins: builtins.NewRegistry(seqExec)}
+	seqResult, err := seqController.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
+		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: false, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("sequential err=%v", err)
+	}
+	if seqResult.StopReason != types.RunStopReasonEndTurn {
+		t.Fatalf("sequential stop_reason=%q", seqResult.StopReason)
+	}
+	if seqExec.MaxInFlight() != 1 {
+		t.Fatalf("sequential max_in_flight=%d, expected sequential execution", seqExec.MaxInFlight())
 	}
 }
