@@ -39,6 +39,10 @@ func (f Factory) New(providerName, apiKey string) (core.Provider, error) {
 		return &openrouterAdapter{provider: openrouter.New(apiKey, openrouter.WithHTTPClient(client))}, nil
 	case "gemini":
 		return &geminiAdapter{provider: gemini.New(apiKey, gemini.WithHTTPClient(client))}, nil
+	case "gemini-oauth":
+		// Gateway proxy mode uses a BYOK header contract; route gemini-oauth
+		// through the Gemini API-key adapter for parity with gemini/* requests.
+		return &geminiAdapter{provider: gemini.New(apiKey, gemini.WithHTTPClient(client))}, nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", providerName)
 	}

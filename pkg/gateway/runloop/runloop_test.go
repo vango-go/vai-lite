@@ -29,6 +29,19 @@ func (f fakeExecutor) Execute(ctx context.Context, input map[string]any) ([]type
 	return []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}}, nil
 }
 
+type failingExecutor struct {
+	name string
+}
+
+func (f failingExecutor) Name() string { return f.name }
+func (f failingExecutor) Definition() types.Tool {
+	return types.Tool{Type: types.ToolTypeFunction, Name: f.name, Description: "d", InputSchema: &types.JSONSchema{Type: "object"}}
+}
+func (f failingExecutor) Configured() bool { return true }
+func (f failingExecutor) Execute(ctx context.Context, input map[string]any) ([]types.ContentBlock, *types.Error) {
+	return nil, &types.Error{Type: "api_error", Message: "tool exploded"}
+}
+
 type trackingExecutor struct {
 	name  string
 	delay time.Duration
@@ -211,6 +224,59 @@ func TestRunBlocking_ToolLoop(t *testing.T) {
 	}
 }
 
+func TestRunBlocking_ToolErrorAddsNonEmptyContent(t *testing.T) {
+	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{
+		{
+			Type:       "message",
+			Role:       "assistant",
+			Model:      "m",
+			StopReason: types.StopReasonToolUse,
+			Content: []types.ContentBlock{types.ToolUseBlock{
+				Type:  "tool_use",
+				ID:    "call_1",
+				Name:  builtins.BuiltinWebSearch,
+				Input: map[string]any{"query": "q"},
+			}},
+		},
+		{
+			Type:       "message",
+			Role:       "assistant",
+			Model:      "m",
+			StopReason: types.StopReasonEndTurn,
+			Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "final"}},
+		},
+	}}
+
+	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(failingExecutor{name: builtins.BuiltinWebSearch})}
+	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
+		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(result.Steps) < 1 || len(result.Steps[0].ToolResults) != 1 {
+		t.Fatalf("unexpected tool results: %+v", result.Steps)
+	}
+	toolResult := result.Steps[0].ToolResults[0]
+	if !toolResult.IsError {
+		t.Fatalf("expected tool error result: %+v", toolResult)
+	}
+	if toolResult.Error == nil || toolResult.Error.Message != "tool exploded" {
+		t.Fatalf("unexpected error payload: %+v", toolResult.Error)
+	}
+	if len(toolResult.Content) != 1 {
+		t.Fatalf("content len=%d", len(toolResult.Content))
+	}
+	text, ok := toolResult.Content[0].(types.TextBlock)
+	if !ok {
+		t.Fatalf("content[0]=%T, want types.TextBlock", toolResult.Content[0])
+	}
+	if text.Text != "tool exploded" {
+		t.Fatalf("text=%q, want tool exploded", text.Text)
+	}
+}
+
 func TestRunStream_OrderingAndEOFTerminal(t *testing.T) {
 	delta := types.MessageDeltaEvent{Type: "message_delta"}
 	delta.Delta.StopReason = types.StopReasonEndTurn
@@ -239,6 +305,61 @@ func TestRunStream_OrderingAndEOFTerminal(t *testing.T) {
 	}
 }
 
+func TestRunStream_VoiceEventsAreTopLevelRunEvents(t *testing.T) {
+	delta := types.MessageDeltaEvent{Type: "message_delta"}
+	delta.Delta.StopReason = types.StopReasonEndTurn
+	provider := &scriptedProvider{name: "test", streams: [][]streamItem{{
+		{event: types.MessageStartEvent{Type: "message_start", Message: types.MessageResponse{Type: "message", Role: "assistant", Model: "m"}}},
+		{event: types.ContentBlockStartEvent{Type: "content_block_start", Index: 0, ContentBlock: types.TextBlock{Type: "text", Text: ""}}},
+		{event: types.ContentBlockDeltaEvent{Type: "content_block_delta", Index: 0, Delta: types.TextDelta{Type: "text_delta", Text: "hello."}}},
+		{event: delta, err: io.EOF},
+	}}}
+
+	pipeline := voice.NewPipelineWithProviders(nil, &fakeTTSProvider{})
+	controller := &Controller{
+		Provider:          provider,
+		Builtins:          builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}),
+		VoicePipeline:     pipeline,
+		StreamIdleTimeout: time.Second,
+		PublicModel:       "anthropic/test",
+		RequestID:         "req_1",
+	}
+	seen := make([]types.RunStreamEvent, 0, 16)
+	_, err := controller.RunStream(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model:    "m",
+			Messages: []types.Message{{Role: "user", Content: "hi"}},
+			Voice:    &types.VoiceConfig{Output: &types.VoiceOutputConfig{Voice: "v", Format: "pcm"}},
+		},
+		Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	}, func(ev types.RunStreamEvent) error {
+		seen = append(seen, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+
+	sawAudioChunk := false
+	sawWrappedAudio := false
+	for _, ev := range seen {
+		switch e := ev.(type) {
+		case types.AudioChunkEvent:
+			sawAudioChunk = true
+		case types.RunStreamEventWrapper:
+			if _, ok := e.Event.(types.AudioChunkEvent); ok {
+				sawWrappedAudio = true
+			}
+		}
+	}
+	if !sawAudioChunk {
+		t.Fatalf("expected top-level audio_chunk event, saw=%v", seen)
+	}
+	if sawWrappedAudio {
+		t.Fatalf("audio_chunk should not be wrapped inside stream_event: %+v", seen)
+	}
+}
+
 type fakeTTSProvider struct{}
 
 func (f *fakeTTSProvider) Name() string { return "fake" }
@@ -263,7 +384,6 @@ func (f *fakeTTSProvider) NewStreamingContext(ctx context.Context, opts tts.Stre
 		return nil
 	}
 	sc.CloseFunc = func() error {
-		sc.FinishAudio()
 		return nil
 	}
 	return sc, nil

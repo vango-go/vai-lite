@@ -55,6 +55,20 @@ func (s *delayedEOFStream) Next() (types.StreamEvent, error) {
 
 func (s *delayedEOFStream) Close() error { return nil }
 
+type timeoutRunProvider struct{}
+
+func (p *timeoutRunProvider) Name() string { return "anthropic" }
+func (p *timeoutRunProvider) Capabilities() core.ProviderCapabilities {
+	return core.ProviderCapabilities{Tools: true}
+}
+func (p *timeoutRunProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (p *timeoutRunProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	return &delayedEOFStream{delay: time.Second}, nil
+}
+
 func baseRunsConfig() config.Config {
 	return config.Config{
 		MaxBodyBytes:              1 << 20,
@@ -161,6 +175,43 @@ func TestRunsHandler_BlockingSuccess(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), `"result"`) || !strings.Contains(rr.Body.String(), `"stop_reason":"end_turn"`) {
 		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestRunsHandler_GeminiOAuthProviderAccepted(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"gemini-oauth/test","messages":[{"role":"user","content":"hi"}]}
+	}`)))
+	req.Header.Set("X-Provider-Key-Gemini", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), `"unsupported provider"`) {
+		t.Fatalf("unexpected unsupported provider error: %s", rr.Body.String())
+	}
+}
+
+func TestRunsHandler_BlockingRunTimeoutReturnsResult(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &timeoutRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"run":{"timeout_ms":1000}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"result"`) || !strings.Contains(body, `"stop_reason":"timeout"`) {
+		t.Fatalf("body=%s", body)
+	}
+	if strings.Contains(body, `"error"`) {
+		t.Fatalf("expected result envelope, got error body=%s", body)
 	}
 }
 
@@ -277,6 +328,42 @@ func TestRunsHandler_Stream_RunTimeoutEmitsCancelledRunComplete(t *testing.T) {
 	}
 	if strings.Contains(body, "event: error") {
 		t.Fatalf("unexpected error event for run timeout: %s", body)
+	}
+}
+
+func TestRunsHandler_Stream_UsesMinOfRunTimeoutAndSSEMaxDuration(t *testing.T) {
+	cfg := baseRunsConfig()
+	cfg.SSEPingInterval = 5 * time.Millisecond
+	cfg.SSEMaxStreamDuration = 80 * time.Millisecond
+	cfg.StreamIdleTimeout = 5 * time.Second
+	h := RunsHandler{
+		Config:    cfg,
+		Upstreams: fakeFactory{p: &fakeRunProvider{stream: &delayedEOFStream{delay: 2 * time.Second}}},
+		Stream:    true,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs:stream", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"run":{"timeout_ms":300000}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+
+	start := time.Now()
+	h.ServeHTTP(rr, req)
+	elapsed := time.Since(start)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if elapsed > 600*time.Millisecond {
+		t.Fatalf("stream should have been capped by SSE max duration, elapsed=%v", elapsed)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: run_complete") || !strings.Contains(body, `"stop_reason":"cancelled"`) {
+		t.Fatalf("body=%s", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("unexpected error event when duration limit reached: %s", body)
 	}
 }
 

@@ -54,6 +54,17 @@ var providerPolicies = map[string]providerPolicy{
 		Thinking:     SupportSupported,
 		OutputFormat: SupportSupported,
 	},
+	"gemini-oauth": {
+		UnsupportedBlocks: setOf("server_tool_use", "web_search_tool_result"),
+		UnsupportedTools: setOf(
+			types.ToolTypeWebFetch,
+			types.ToolTypeFileSearch,
+			types.ToolTypeComputerUse,
+			types.ToolTypeTextEditor,
+		),
+		Thinking:     SupportSupported,
+		OutputFormat: SupportSupported,
+	},
 	"groq": {
 		UnsupportedBlocks: setOf("video", "document", "thinking", "server_tool_use", "web_search_tool_result"),
 		UnsupportedTools: setOf(

@@ -1,4 +1,4 @@
-# Developer Guide (vai-lite) — WIP (Live Audio Mode)
+# Developer Guide (vai-lite) — WIP (Live Audio Mode & Proxy/Gateway)
 
 `vai-lite` is a trimmed-down, **direct-mode only** Go SDK for running tool-using LLM agents.
 

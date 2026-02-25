@@ -29,6 +29,10 @@ func NewRestrictedHTTPClient(base *http.Client) *http.Client {
 
 	if tr, ok := out.Transport.(*http.Transport); ok {
 		clone := tr.Clone()
+		clone.Proxy = nil
+		clone.ProxyConnectHeader = nil
+		clone.GetProxyConnectHeader = nil
+		clone.DialTLSContext = nil
 		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 		clone.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(address)
@@ -38,34 +42,9 @@ func NewRestrictedHTTPClient(base *http.Client) *http.Client {
 			if _, err := strconv.Atoi(port); err != nil {
 				return nil, fmt.Errorf("invalid port")
 			}
-			u := "https://" + host
-			if _, err := ValidateTargetURL(ctx, u); err != nil {
-				return nil, err
-			}
-			if ip := net.ParseIP(host); ip != nil {
-				if err := validateIP(ip); err != nil {
-					return nil, err
-				}
-				return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			selected, err := validateDialTarget(ctx, host)
 			if err != nil {
 				return nil, err
-			}
-			if len(ips) == 0 {
-				return nil, fmt.Errorf("dns resolution returned no records")
-			}
-			for _, rec := range ips {
-				if err := validateIP(rec.IP); err != nil {
-					return nil, err
-				}
-			}
-			selected := ips[0].IP
-			for _, rec := range ips {
-				if rec.IP != nil {
-					selected = rec.IP
-					break
-				}
 			}
 			return dialer.DialContext(ctx, network, net.JoinHostPort(selected.String(), port))
 		}
@@ -85,6 +64,43 @@ func NewRestrictedHTTPClient(base *http.Client) *http.Client {
 	}
 
 	return &out
+}
+
+func validateDialTarget(ctx context.Context, host string) (net.IP, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil, fmt.Errorf("invalid host")
+	}
+	if strings.Contains(host, "%") {
+		return nil, fmt.Errorf("invalid host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if err := validateIP(ip); err != nil {
+			return nil, err
+		}
+		return ip, nil
+	}
+	if !isASCII(host) {
+		return nil, fmt.Errorf("invalid host")
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("dns resolution returned no records")
+	}
+	for _, rec := range ips {
+		if err := validateIP(rec.IP); err != nil {
+			return nil, err
+		}
+	}
+	for _, rec := range ips {
+		if rec.IP != nil {
+			return rec.IP, nil
+		}
+	}
+	return nil, fmt.Errorf("dns resolution returned no records")
 }
 
 func ReadResponseBodyLimited(resp *http.Response, limit int64) ([]byte, error) {

@@ -134,8 +134,14 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := controller.RunBlocking(r.Context(), &workingReq)
 	if err != nil {
-		h.writeErr(w, reqID, err, false)
-		return
+		// /v1/runs run timeout is modeled as a successful terminal result.
+		if !(errors.Is(err, context.DeadlineExceeded) &&
+			r.Context().Err() == nil &&
+			result != nil &&
+			result.StopReason == types.RunStopReasonTimeout) {
+			h.writeErr(w, reqID, err, false)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -184,9 +190,10 @@ func (h RunsHandler) serveStream(
 	}
 
 	ctx := r.Context()
-	if runReq.Run.TimeoutMS > 0 {
+	effectiveTimeout := effectiveRunStreamTimeout(runReq.Run.TimeoutMS, h.Config.SSEMaxStreamDuration)
+	if effectiveTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(runReq.Run.TimeoutMS)*time.Millisecond)
+		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		defer cancel()
 	}
 
@@ -235,6 +242,23 @@ func (h RunsHandler) serveStream(
 		}
 		_ = sw.Send("run_complete", types.RunCompleteEvent{Type: "run_complete", Result: result})
 		return
+	}
+}
+
+func effectiveRunStreamTimeout(runTimeoutMS int, sseMaxDuration time.Duration) time.Duration {
+	var runTimeout time.Duration
+	if runTimeoutMS > 0 {
+		runTimeout = time.Duration(runTimeoutMS) * time.Millisecond
+	}
+	switch {
+	case runTimeout > 0 && sseMaxDuration > 0 && runTimeout < sseMaxDuration:
+		return runTimeout
+	case runTimeout > 0 && sseMaxDuration > 0:
+		return sseMaxDuration
+	case runTimeout > 0:
+		return runTimeout
+	default:
+		return sseMaxDuration
 	}
 }
 

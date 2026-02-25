@@ -276,17 +276,21 @@ func (c *Controller) executeTools(ctx context.Context, uses []types.ToolUseBlock
 		}
 
 		content, toolErr := c.Builtins.Execute(toolCtx, tu.Name, tu.Input)
-		if len(content) == 0 {
-			content = []types.ContentBlock{types.TextBlock{Type: "text", Text: ""}}
-		}
-		res := types.RunToolResult{ToolUseID: tu.ID, Content: content}
+		res := types.RunToolResult{ToolUseID: tu.ID}
 		if toolErr != nil {
 			res.IsError = true
 			res.Error = toolErr
 			if len(content) == 0 {
-				res.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: toolErr.Message}}
+				msg := toolErr.Message
+				if msg == "" {
+					msg = "tool execution failed"
+				}
+				content = []types.ContentBlock{types.TextBlock{Type: "text", Text: msg}}
 			}
+		} else if len(content) == 0 {
+			content = []types.ContentBlock{types.TextBlock{Type: "text", Text: ""}}
 		}
+		res.Content = content
 		results[i] = toolExecResult{call: types.RunToolCall{ID: tu.ID, Name: tu.Name, Input: tu.Input}, result: res}
 
 		if emit != nil {
@@ -342,7 +346,7 @@ func (c *Controller) streamTurn(ctx context.Context, req *types.MessageRequest, 
 	}
 
 	emitAudio := func(chunk []byte, isFinal bool) error {
-		return emit(types.RunStreamEventWrapper{Type: "stream_event", Event: types.AudioChunkEvent{Type: "audio_chunk", Format: "pcm_s16le", Audio: base64.StdEncoding.EncodeToString(chunk), SampleRateHz: sampleRate, IsFinal: isFinal}})
+		return emit(types.AudioChunkEvent{Type: "audio_chunk", Format: "pcm_s16le", Audio: base64.StdEncoding.EncodeToString(chunk), SampleRateHz: sampleRate, IsFinal: isFinal})
 	}
 
 	type next struct {
@@ -411,7 +415,7 @@ func (c *Controller) streamTurn(ctx context.Context, req *types.MessageRequest, 
 					if cbd, ok := n.ev.(types.ContentBlockDeltaEvent); ok {
 						if td, ok := cbd.Delta.(types.TextDelta); ok {
 							if err := ttsStream.OnTextDelta(td.Text); err != nil {
-								_ = emit(types.RunStreamEventWrapper{Type: "stream_event", Event: types.AudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "TTS synthesis failed: " + err.Error()}})
+								_ = emit(types.AudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "TTS synthesis failed: " + err.Error()})
 								ttsStream = nil
 							}
 						}
@@ -450,7 +454,7 @@ func (c *Controller) streamTurn(ctx context.Context, req *types.MessageRequest, 
 done:
 	if ttsStream != nil {
 		if err := ttsStream.Flush(); err != nil {
-			_ = emit(types.RunStreamEventWrapper{Type: "stream_event", Event: types.AudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "TTS synthesis failed: " + err.Error()}})
+			_ = emit(types.AudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "TTS synthesis failed: " + err.Error()})
 		}
 		_ = ttsStream.Close()
 
@@ -473,7 +477,7 @@ done:
 		}
 
 		if err := ttsStream.Err(); err != nil {
-			_ = emit(types.RunStreamEventWrapper{Type: "stream_event", Event: types.AudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "TTS synthesis failed: " + err.Error()}})
+			_ = emit(types.AudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "TTS synthesis failed: " + err.Error()})
 		}
 	}
 

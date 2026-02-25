@@ -223,6 +223,8 @@ func ProviderKeyHeader(provider string) (string, bool) {
 		return "X-Provider-Key-OpenAI", true
 	case "gemini":
 		return "X-Provider-Key-Gemini", true
+	case "gemini-oauth":
+		return "X-Provider-Key-Gemini", true
 	case "groq":
 		return "X-Provider-Key-Groq", true
 	case "cerebras":

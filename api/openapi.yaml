@@ -1,0 +1,1632 @@
+openapi: 3.1.0
+info:
+  title: VAI Gateway API
+  version: "1"
+  description: |
+    Provider-agnostic HTTP + SSE (and WebSocket) API for VAI Gateway.
+
+    Design principles:
+    - Strict-on-ingress: request bodies are strictly decoded and unknown fields are rejected.
+    - Lenient-on-egress: response objects may include new fields over time; clients must ignore unknown fields.
+
+servers:
+  - url: http://localhost:8080
+    description: Local/dev default
+
+tags:
+  - name: Messages
+    description: Single-turn messages API (JSON + SSE).
+  - name: Runs
+    description: Server-side tool-loop orchestration (blocking + SSE).
+  - name: Models
+    description: Model discovery and capability metadata.
+  - name: Live
+    description: Live Audio Mode (WebSocket).
+  - name: Health
+    description: Operational endpoints.
+
+paths:
+  /v1/messages:
+    post:
+      tags: [Messages]
+      summary: Create a message (JSON) or stream it (SSE)
+      description: |
+        Single-turn model execution routed by `model` (`provider/model-name`).
+
+        - For non-streaming: omit `stream` or set `stream=false` and receive a JSON `MessageResponse`.
+        - For streaming: set `stream=true` and receive an SSE stream of `StreamEvent` objects.
+
+        Authentication:
+        - Gateway auth is configured server-side (`auth_mode=required|optional|disabled`).
+        - Upstream provider auth is BYOK-first via `X-Provider-Key-*` headers, determined by `model` provider.
+        - If `voice` is set, `X-Provider-Key-Cartesia` is required.
+      operationId: postV1Messages
+      parameters:
+        - $ref: "#/components/parameters/XVAIversion"
+        - $ref: "#/components/parameters/XRequestID"
+        - $ref: "#/components/parameters/Authorization"
+        - $ref: "#/components/parameters/XProviderKeyAnthropic"
+        - $ref: "#/components/parameters/XProviderKeyOpenAI"
+        - $ref: "#/components/parameters/XProviderKeyGemini"
+        - $ref: "#/components/parameters/XProviderKeyGroq"
+        - $ref: "#/components/parameters/XProviderKeyCerebras"
+        - $ref: "#/components/parameters/XProviderKeyOpenRouter"
+        - $ref: "#/components/parameters/XProviderKeyCartesia"
+        - $ref: "#/components/parameters/XProviderKeyElevenLabs"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageRequest"
+            examples:
+              basic:
+                summary: Basic text request
+                value:
+                  model: anthropic/claude-sonnet-4
+                  max_tokens: 256
+                  messages:
+                    - role: user
+                      content:
+                        - type: text
+                          text: "Hello"
+              streaming:
+                summary: SSE streaming request
+                value:
+                  model: anthropic/claude-sonnet-4
+                  max_tokens: 256
+                  stream: true
+                  messages:
+                    - role: user
+                      content: "Stream please"
+      responses:
+        "200":
+          description: |
+            Success.
+
+            - `application/json` is returned when `stream=false` (or omitted).
+            - `text/event-stream` is returned when `stream=true`.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+            Cache-Control:
+              schema: { type: string, example: "no-cache" }
+              description: Present for SSE responses.
+            Connection:
+              schema: { type: string, example: "keep-alive" }
+              description: Present for SSE responses.
+            X-Accel-Buffering:
+              schema: { type: string, example: "no" }
+              description: Present for SSE responses (nginx buffering disable).
+            X-Model:
+              schema: { type: string }
+              description: Normalized model id returned by the upstream adapter.
+            X-Input-Tokens:
+              schema: { type: integer, minimum: 0 }
+            X-Output-Tokens:
+              schema: { type: integer, minimum: 0 }
+            X-Total-Tokens:
+              schema: { type: integer, minimum: 0 }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/MessageStreamEvent"
+              examples:
+                sse-message-start:
+                  summary: SSE frame (data payload)
+                  value:
+                    type: message_start
+                    message:
+                      id: msg_123
+                      type: message
+                      role: assistant
+                      model: anthropic/claude-sonnet-4
+                      content: []
+                      stop_reason: end_turn
+                      usage:
+                        input_tokens: 1
+                        output_tokens: 1
+                        total_tokens: 2
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "504":
+          $ref: "#/components/responses/GatewayTimeout"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "529":
+          $ref: "#/components/responses/Overloaded"
+
+  /v1/runs:
+    post:
+      tags: [Runs]
+      summary: Run a server-side tool loop (blocking)
+      description: |
+        Runs a server-side tool loop and returns a final terminal result.
+
+        Notes:
+        - `request.stream` must be false or omitted.
+        - Gateway-managed builtins are referenced by name via `builtins` and injected into `request.tools`.
+        - Client-executed function tools are not supported on `/v1/runs` (use `/v1/messages` for client-side tool execution).
+      operationId: postV1Runs
+      parameters:
+        - $ref: "#/components/parameters/XVAIversion"
+        - $ref: "#/components/parameters/XRequestID"
+        - $ref: "#/components/parameters/Authorization"
+        - $ref: "#/components/parameters/XProviderKeyAnthropic"
+        - $ref: "#/components/parameters/XProviderKeyOpenAI"
+        - $ref: "#/components/parameters/XProviderKeyGemini"
+        - $ref: "#/components/parameters/XProviderKeyGroq"
+        - $ref: "#/components/parameters/XProviderKeyCerebras"
+        - $ref: "#/components/parameters/XProviderKeyOpenRouter"
+        - $ref: "#/components/parameters/XProviderKeyCartesia"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunRequest"
+            examples:
+              basic:
+                summary: Blocking run
+                value:
+                  request:
+                    model: anthropic/claude-sonnet-4
+                    max_tokens: 1024
+                    messages:
+                      - role: user
+                        content: "Search the web for the latest Go release."
+                  run:
+                    max_turns: 8
+                    max_tool_calls: 20
+                    timeout_ms: 60000
+                    parallel_tools: true
+                    tool_timeout_ms: 30000
+                  builtins: ["vai_web_search"]
+      responses:
+        "200":
+          description: Success
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunResultEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "504":
+          $ref: "#/components/responses/GatewayTimeout"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "529":
+          $ref: "#/components/responses/Overloaded"
+
+  "/v1/runs:stream":
+    post:
+      tags: [Runs]
+      summary: Run a server-side tool loop (SSE)
+      description: |
+        Runs a server-side tool loop and streams lifecycle/tool events via SSE.
+
+        Each SSE frame contains a JSON object with a top-level `type`:
+        - `run_start`, `step_start`
+        - `stream_event` (wraps a `StreamEvent` from the underlying model stream)
+        - `tool_call_start`, `tool_result`
+        - `step_complete`, `history_delta`
+        - terminal: `run_complete` or `error`
+      operationId: postV1RunsStream
+      parameters:
+        - $ref: "#/components/parameters/XVAIversion"
+        - $ref: "#/components/parameters/XRequestID"
+        - $ref: "#/components/parameters/Authorization"
+        - $ref: "#/components/parameters/XProviderKeyAnthropic"
+        - $ref: "#/components/parameters/XProviderKeyOpenAI"
+        - $ref: "#/components/parameters/XProviderKeyGemini"
+        - $ref: "#/components/parameters/XProviderKeyGroq"
+        - $ref: "#/components/parameters/XProviderKeyCerebras"
+        - $ref: "#/components/parameters/XProviderKeyOpenRouter"
+        - $ref: "#/components/parameters/XProviderKeyCartesia"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunRequest"
+      responses:
+        "200":
+          description: SSE stream
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+            Cache-Control:
+              schema: { type: string, example: "no-cache" }
+            Connection:
+              schema: { type: string, example: "keep-alive" }
+            X-Accel-Buffering:
+              schema: { type: string, example: "no" }
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/RunStreamEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "504":
+          $ref: "#/components/responses/GatewayTimeout"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "529":
+          $ref: "#/components/responses/Overloaded"
+
+  /v1/models:
+    get:
+      tags: [Models]
+      summary: List models and capability metadata
+      description: |
+        Returns a catalog-derived model list (not live provider discovery).
+
+        Caching:
+        - If model allowlisting is enabled server-side, the response uses `Cache-Control: private, max-age=300`.
+        - Otherwise `Cache-Control: public, max-age=300`.
+      operationId: getV1Models
+      parameters:
+        - $ref: "#/components/parameters/XVAIversion"
+        - $ref: "#/components/parameters/XRequestID"
+        - $ref: "#/components/parameters/Authorization"
+      responses:
+        "200":
+          description: Success
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+            Cache-Control:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "529":
+          $ref: "#/components/responses/Overloaded"
+
+  /v1/live:
+    get:
+      tags: [Live]
+      summary: Live Audio Mode WebSocket endpoint (upgrade)
+      description: |
+        WebSocket upgrade endpoint for Live Audio Mode.
+
+        OpenAPI cannot fully model WebSocket message flows; see `LIVE_AUDIO_MODE_DESIGN.md`
+        for the normative protocol (`hello`/`hello_ack`, audio framing, playback marks, etc.).
+
+        This endpoint is reserved in the v1 API surface even if not enabled in a given build/deployment.
+      operationId: getV1Live
+      parameters:
+        - $ref: "#/components/parameters/XVAIversion"
+        - $ref: "#/components/parameters/XRequestID"
+        - $ref: "#/components/parameters/Authorization"
+      responses:
+        "101":
+          description: Switching Protocols (WebSocket)
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "529":
+          $ref: "#/components/responses/Overloaded"
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      operationId: getHealthz
+      parameters:
+        - $ref: "#/components/parameters/XRequestID"
+      responses:
+        "200":
+          description: Process is running
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            text/plain:
+              schema: { type: string, example: "ok\n" }
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      operationId: getReadyz
+      parameters:
+        - $ref: "#/components/parameters/XRequestID"
+      responses:
+        "200":
+          description: Ready
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: Not ready
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics (optional)
+      description: |
+        Optional Prometheus-format metrics endpoint.
+        Implementations may disable or omit this route in some builds/deployments.
+      operationId: getMetrics
+      parameters:
+        - $ref: "#/components/parameters/XRequestID"
+      responses:
+        "200":
+          description: Prometheus metrics
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    GatewayBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: VAI Gateway API key (vai_sk_...)
+
+  parameters:
+    XVAIversion:
+      name: X-VAI-Version
+      in: header
+      required: false
+      schema:
+        type: string
+        enum: ["1"]
+      description: |
+        API version negotiation. If absent, version 1 is assumed.
+        If present and unsupported, returns `400` with `code="unsupported_version"`.
+
+    XRequestID:
+      name: X-Request-ID
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Optional client-provided request id. If absent, the gateway generates one.
+
+    Authorization:
+      name: Authorization
+      in: header
+      required: false
+      schema:
+        type: string
+        examples:
+          bearer:
+            value: Bearer vai_sk_...
+      description: |
+        Gateway API key (required when `auth_mode=required`).
+        Format: `Bearer <key>`.
+
+    XProviderKeyAnthropic:
+      name: X-Provider-Key-Anthropic
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for `anthropic/*` models.
+
+    XProviderKeyOpenAI:
+      name: X-Provider-Key-OpenAI
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for `openai/*` and `oai-resp/*` models.
+
+    XProviderKeyGemini:
+      name: X-Provider-Key-Gemini
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for `gemini/*` and `gemini-oauth/*` models.
+
+    XProviderKeyGroq:
+      name: X-Provider-Key-Groq
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for `groq/*` models.
+
+    XProviderKeyCerebras:
+      name: X-Provider-Key-Cerebras
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for `cerebras/*` models.
+
+    XProviderKeyOpenRouter:
+      name: X-Provider-Key-OpenRouter
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for `openrouter/*` models.
+
+    XProviderKeyCartesia:
+      name: X-Provider-Key-Cartesia
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for voice STT/TTS (Cartesia). Required when `voice` is set.
+
+    XProviderKeyElevenLabs:
+      name: X-Provider-Key-ElevenLabs
+      in: header
+      required: false
+      schema: { type: string }
+      description: BYOK header for live-mode TTS (ElevenLabs) when enabled.
+
+  headers:
+    XRequestID:
+      schema: { type: string }
+      description: Request id for correlation.
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Unauthorized:
+      description: Authentication required or invalid
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Forbidden:
+      description: Permission denied
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    TooManyRequests:
+      description: Rate limited or concurrency limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 0 }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    RequestTimeout:
+      description: Request timed out or was cancelled
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    GatewayTimeout:
+      description: Gateway or upstream timeout
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Overloaded:
+      description: Overloaded (non-standard 529)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    InternalError:
+      description: Internal error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+  schemas:
+    # --- Errors ---
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/Error"
+
+    Error:
+      type: object
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum:
+            - invalid_request_error
+            - authentication_error
+            - permission_error
+            - not_found_error
+            - rate_limit_error
+            - api_error
+            - overloaded_error
+            - provider_error
+        message:
+          type: string
+        param:
+          type: string
+        code:
+          type: string
+        request_id:
+          type: string
+        retry_after:
+          type: integer
+          minimum: 0
+        provider_error: {}
+        compat_issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompatibilityIssue"
+
+    CompatibilityIssue:
+      type: object
+      required: [severity, param, code, message]
+      properties:
+        severity:
+          type: string
+          enum: [error]
+        param:
+          type: string
+          description: Dot-bracket path (e.g., `messages[0].content[2]`).
+        code:
+          type: string
+        message:
+          type: string
+
+    # --- Messages ---
+    MessageRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: Model identifier in `provider/model-name` form (split on the first `/`).
+          examples: ["anthropic/claude-sonnet-4", "openai/gpt-4o", "openrouter/openai/gpt-4o"]
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/Message"
+        max_tokens:
+          type: integer
+          minimum: 0
+        system:
+          description: |
+            Union: either a string or an array of content blocks.
+            Invalid shapes are rejected.
+          anyOf:
+            - type: string
+            - type: array
+              items:
+                $ref: "#/components/schemas/ContentBlock"
+        temperature:
+          type: number
+        top_p:
+          type: number
+        top_k:
+          type: integer
+        stop_sequences:
+          type: array
+          items: { type: string }
+        tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tool"
+        tool_choice:
+          $ref: "#/components/schemas/ToolChoice"
+        stream:
+          type: boolean
+          default: false
+        output_format:
+          $ref: "#/components/schemas/OutputFormat"
+        output:
+          $ref: "#/components/schemas/OutputConfig"
+        voice:
+          $ref: "#/components/schemas/VoiceConfig"
+        extensions:
+          type: object
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
+
+    Message:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          description: "Union: either a string or an array of content blocks."
+          anyOf:
+            - type: string
+            - type: array
+              items:
+                $ref: "#/components/schemas/ContentBlock"
+
+    MessageResponse:
+      type: object
+      required: [id, type, role, model, content, stop_reason, usage]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          const: message
+        role:
+          type: string
+          const: assistant
+        model:
+          type: string
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentBlock"
+        stop_reason:
+          $ref: "#/components/schemas/StopReason"
+        stop_sequence:
+          anyOf:
+            - type: string
+            - type: "null"
+        usage:
+          $ref: "#/components/schemas/Usage"
+        metadata:
+          type: object
+          additionalProperties: true
+
+    StopReason:
+      type: string
+      enum: [end_turn, max_tokens, stop_sequence, tool_use]
+
+    Usage:
+      type: object
+      required: [input_tokens, output_tokens, total_tokens]
+      properties:
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+        cache_read_tokens:
+          type: integer
+          minimum: 0
+        cache_write_tokens:
+          type: integer
+          minimum: 0
+        cost_usd:
+          type: number
+          minimum: 0
+
+    # --- Content blocks ---
+    ContentBlock:
+      description: Typed content block with a `type` discriminator.
+      oneOf:
+        - $ref: "#/components/schemas/TextBlock"
+        - $ref: "#/components/schemas/ImageBlock"
+        - $ref: "#/components/schemas/AudioBlock"
+        - $ref: "#/components/schemas/VideoBlock"
+        - $ref: "#/components/schemas/DocumentBlock"
+        - $ref: "#/components/schemas/ToolUseBlock"
+        - $ref: "#/components/schemas/ToolResultBlock"
+        - $ref: "#/components/schemas/ThinkingBlock"
+        - $ref: "#/components/schemas/ServerToolUseBlock"
+        - $ref: "#/components/schemas/WebSearchToolResultBlock"
+
+    TextBlock:
+      type: object
+      required: [type, text]
+      properties:
+        type: { type: string, const: text }
+        text: { type: string }
+
+    ImageBlock:
+      type: object
+      required: [type, source]
+      properties:
+        type: { type: string, const: image }
+        source:
+          $ref: "#/components/schemas/ImageSource"
+
+    ImageSource:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [base64, url]
+        media_type:
+          type: string
+          description: Media type (required for `base64`).
+        data:
+          type: string
+          description: Base64-encoded bytes (required for `base64`).
+        url:
+          type: string
+          format: uri
+          description: URL reference (required for `url`).
+
+    AudioBlock:
+      type: object
+      required: [type, source]
+      properties:
+        type: { type: string, const: audio }
+        source:
+          $ref: "#/components/schemas/AudioSource"
+        transcript:
+          type: string
+          description: Optional transcript for output audio blocks.
+
+    AudioSource:
+      type: object
+      required: [type, media_type, data]
+      properties:
+        type:
+          type: string
+          const: base64
+        media_type:
+          type: string
+          examples: ["audio/wav", "audio/mpeg", "audio/mp3", "audio/pcm"]
+        data:
+          type: string
+          description: Base64-encoded bytes.
+
+    VideoBlock:
+      type: object
+      required: [type, source]
+      properties:
+        type: { type: string, const: video }
+        source:
+          $ref: "#/components/schemas/VideoSource"
+
+    VideoSource:
+      type: object
+      required: [type, media_type, data]
+      properties:
+        type:
+          type: string
+          const: base64
+        media_type:
+          type: string
+          examples: ["video/mp4"]
+        data:
+          type: string
+
+    DocumentBlock:
+      type: object
+      required: [type, source]
+      properties:
+        type: { type: string, const: document }
+        source:
+          $ref: "#/components/schemas/DocumentSource"
+        filename:
+          type: string
+
+    DocumentSource:
+      type: object
+      required: [type, media_type, data]
+      properties:
+        type:
+          type: string
+          const: base64
+        media_type:
+          type: string
+          examples: ["application/pdf"]
+        data:
+          type: string
+
+    ToolUseBlock:
+      type: object
+      required: [type, id, name, input]
+      properties:
+        type: { type: string, const: tool_use }
+        id: { type: string }
+        name: { type: string }
+        input:
+          type: object
+          additionalProperties: true
+
+    ToolResultBlock:
+      type: object
+      required: [type, tool_use_id]
+      properties:
+        type: { type: string, const: tool_result }
+        tool_use_id: { type: string }
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentBlock"
+        is_error:
+          type: boolean
+
+    ThinkingBlock:
+      type: object
+      required: [type, thinking]
+      properties:
+        type: { type: string, const: thinking }
+        thinking: { type: string }
+        summary:
+          type: string
+
+    ServerToolUseBlock:
+      type: object
+      required: [type, id, name, input]
+      properties:
+        type: { type: string, const: server_tool_use }
+        id: { type: string }
+        name: { type: string }
+        input:
+          type: object
+          additionalProperties: true
+
+    WebSearchToolResultBlock:
+      type: object
+      required: [type, tool_use_id, content]
+      properties:
+        type: { type: string, const: web_search_tool_result }
+        tool_use_id: { type: string }
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebSearchResultEntry"
+
+    WebSearchResultEntry:
+      type: object
+      required: [type, url, title]
+      properties:
+        type: { type: string, const: web_search_result }
+        url: { type: string, format: uri }
+        title: { type: string }
+        encrypted_content: { type: string }
+        page_age: { type: string }
+
+    # --- Tools ---
+    Tool:
+      description: |
+        Tool definition. For `type="function"`, the tool is user-defined for `/v1/messages`.
+        For `/v1/runs`, function tools are gateway-managed builtins injected by the gateway.
+      oneOf:
+        - $ref: "#/components/schemas/FunctionTool"
+        - $ref: "#/components/schemas/WebSearchTool"
+        - $ref: "#/components/schemas/WebFetchTool"
+        - $ref: "#/components/schemas/CodeExecutionTool"
+        - $ref: "#/components/schemas/FileSearchTool"
+        - $ref: "#/components/schemas/ComputerUseTool"
+        - $ref: "#/components/schemas/TextEditorTool"
+
+    FunctionTool:
+      type: object
+      required: [type, name, description, input_schema]
+      properties:
+        type: { type: string, const: function }
+        name: { type: string }
+        description: { type: string }
+        input_schema:
+          $ref: "#/components/schemas/JSONSchema"
+        config:
+          anyOf:
+            - type: "null"
+            - type: object
+              maxProperties: 0
+          description: Must be null or omitted for function tools.
+
+    WebSearchTool:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: web_search }
+        config:
+          $ref: "#/components/schemas/WebSearchConfig"
+
+    WebSearchConfig:
+      type: object
+      properties:
+        max_uses: { type: integer, minimum: 0 }
+        allowed_domains:
+          type: array
+          items: { type: string }
+        blocked_domains:
+          type: array
+          items: { type: string }
+        user_location:
+          $ref: "#/components/schemas/UserLocation"
+
+    UserLocation:
+      type: object
+      properties:
+        city: { type: string }
+        region: { type: string }
+        country: { type: string }
+        timezone: { type: string }
+
+    WebFetchTool:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: web_fetch }
+        config:
+          $ref: "#/components/schemas/WebFetchConfig"
+
+    WebFetchConfig:
+      type: object
+      properties:
+        max_uses: { type: integer, minimum: 0 }
+        allowed_domains:
+          type: array
+          items: { type: string }
+        blocked_domains:
+          type: array
+          items: { type: string }
+
+    CodeExecutionTool:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: code_execution }
+        config:
+          $ref: "#/components/schemas/CodeExecutionConfig"
+
+    CodeExecutionConfig:
+      type: object
+      properties:
+        languages:
+          type: array
+          items: { type: string }
+        timeout_seconds:
+          type: integer
+          minimum: 0
+
+    FileSearchTool:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: file_search }
+        config:
+          $ref: "#/components/schemas/FileSearchConfig"
+
+    FileSearchConfig:
+      type: object
+      properties:
+        max_results:
+          type: integer
+          minimum: 0
+
+    ComputerUseTool:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: computer_use }
+        config:
+          $ref: "#/components/schemas/ComputerUseConfig"
+
+    ComputerUseConfig:
+      type: object
+      required: [display_width, display_height]
+      properties:
+        display_width: { type: integer, minimum: 1 }
+        display_height: { type: integer, minimum: 1 }
+
+    TextEditorTool:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: text_editor }
+        config:
+          anyOf:
+            - type: "null"
+            - type: object
+              additionalProperties: false
+
+    ToolChoice:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [auto, any, none, tool]
+        name:
+          type: string
+          description: Required when `type="tool"`.
+
+    # --- Structured output / output config ---
+    OutputFormat:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [json_schema]
+        json_schema:
+          $ref: "#/components/schemas/JSONSchema"
+
+    OutputConfig:
+      type: object
+      properties:
+        modalities:
+          type: array
+          items:
+            type: string
+            enum: [text, image, audio]
+        image:
+          $ref: "#/components/schemas/ImageConfig"
+
+    ImageConfig:
+      type: object
+      properties:
+        size:
+          type: string
+          examples: ["1024x1024"]
+
+    JSONSchema:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string }
+        properties:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/JSONSchema"
+        required:
+          type: array
+          items: { type: string }
+        description:
+          type: string
+        enum:
+          type: array
+          items: { type: string }
+        items:
+          $ref: "#/components/schemas/JSONSchema"
+        additionalProperties:
+          type: boolean
+
+    # --- Voice ---
+    VoiceConfig:
+      type: object
+      properties:
+        input:
+          $ref: "#/components/schemas/VoiceInputConfig"
+        output:
+          $ref: "#/components/schemas/VoiceOutputConfig"
+
+    VoiceInputConfig:
+      type: object
+      properties:
+        model:
+          type: string
+          example: ink-whisper
+        language:
+          type: string
+          example: en
+
+    VoiceOutputConfig:
+      type: object
+      required: [voice]
+      properties:
+        voice:
+          type: string
+          description: Cartesia voice id.
+        speed:
+          type: number
+        volume:
+          type: number
+        emotion:
+          type: string
+        format:
+          type: string
+          enum: [wav, mp3, pcm]
+        sample_rate:
+          type: integer
+          minimum: 8000
+
+    # --- Streaming (SSE) ---
+    MessageStreamEvent:
+      description: JSON payload of a `/v1/messages` SSE frame (one per `data:` line).
+      oneOf:
+        - $ref: "#/components/schemas/MessageStartEvent"
+        - $ref: "#/components/schemas/ContentBlockStartEvent"
+        - $ref: "#/components/schemas/ContentBlockDeltaEvent"
+        - $ref: "#/components/schemas/ContentBlockStopEvent"
+        - $ref: "#/components/schemas/MessageDeltaEvent"
+        - $ref: "#/components/schemas/MessageStopEvent"
+        - $ref: "#/components/schemas/PingEvent"
+        - $ref: "#/components/schemas/AudioChunkEvent"
+        - $ref: "#/components/schemas/AudioUnavailableEvent"
+        - $ref: "#/components/schemas/ErrorEvent"
+
+    StreamEvent:
+      description: Provider-normalized stream event (identical schema to `MessageStreamEvent`).
+      allOf:
+        - $ref: "#/components/schemas/MessageStreamEvent"
+
+    MessageStartEvent:
+      type: object
+      required: [type, message]
+      properties:
+        type: { type: string, const: message_start }
+        message: { $ref: "#/components/schemas/MessageResponse" }
+
+    ContentBlockStartEvent:
+      type: object
+      required: [type, index, content_block]
+      properties:
+        type: { type: string, const: content_block_start }
+        index: { type: integer, minimum: 0 }
+        content_block: { $ref: "#/components/schemas/ContentBlock" }
+
+    ContentBlockDeltaEvent:
+      type: object
+      required: [type, index, delta]
+      properties:
+        type: { type: string, const: content_block_delta }
+        index: { type: integer, minimum: 0 }
+        delta: { $ref: "#/components/schemas/Delta" }
+
+    Delta:
+      description: Stream delta (text, tool input json, thinking).
+      oneOf:
+        - $ref: "#/components/schemas/TextDelta"
+        - $ref: "#/components/schemas/InputJSONDelta"
+        - $ref: "#/components/schemas/ThinkingDelta"
+
+    TextDelta:
+      type: object
+      required: [type, text]
+      properties:
+        type: { type: string, const: text_delta }
+        text: { type: string }
+
+    InputJSONDelta:
+      type: object
+      required: [type, partial_json]
+      properties:
+        type: { type: string, const: input_json_delta }
+        partial_json: { type: string }
+
+    ThinkingDelta:
+      type: object
+      required: [type, thinking]
+      properties:
+        type: { type: string, const: thinking_delta }
+        thinking: { type: string }
+
+    ContentBlockStopEvent:
+      type: object
+      required: [type, index]
+      properties:
+        type: { type: string, const: content_block_stop }
+        index: { type: integer, minimum: 0 }
+
+    MessageDeltaEvent:
+      type: object
+      required: [type, delta, usage]
+      properties:
+        type: { type: string, const: message_delta }
+        delta:
+          type: object
+          properties:
+            stop_reason:
+              $ref: "#/components/schemas/StopReason"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    MessageStopEvent:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: message_stop }
+
+    PingEvent:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: ping }
+
+    AudioChunkEvent:
+      type: object
+      required: [type, format, audio]
+      properties:
+        type: { type: string, const: audio_chunk }
+        format:
+          type: string
+          description: Output audio encoding (e.g., `pcm_s16le`).
+        audio:
+          type: string
+          description: Base64-encoded audio bytes.
+        sample_rate_hz:
+          type: integer
+          minimum: 8000
+        is_final:
+          type: boolean
+
+    AudioUnavailableEvent:
+      type: object
+      required: [type, reason, message]
+      properties:
+        type: { type: string, const: audio_unavailable }
+        reason: { type: string }
+        message: { type: string }
+
+    ErrorEvent:
+      type: object
+      required: [type, error]
+      properties:
+        type: { type: string, const: error }
+        error:
+          $ref: "#/components/schemas/Error"
+
+    # --- Runs ---
+    RunRequest:
+      type: object
+      required: [request]
+      properties:
+        request:
+          $ref: "#/components/schemas/MessageRequest"
+        run:
+          $ref: "#/components/schemas/RunConfig"
+        builtins:
+          type: array
+          items:
+            type: string
+            enum: [vai_web_search, vai_web_fetch]
+          description: Gateway-managed builtin tool names.
+
+    RunConfig:
+      type: object
+      properties:
+        max_turns:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 8
+        max_tool_calls:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 20
+        max_tokens:
+          type: integer
+          minimum: 0
+          default: 0
+        timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 300000
+          default: 60000
+        parallel_tools:
+          type: boolean
+          default: true
+        tool_timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 60000
+          default: 30000
+
+    RunResultEnvelope:
+      type: object
+      required: [result]
+      properties:
+        result:
+          anyOf:
+            - $ref: "#/components/schemas/RunResult"
+            - type: "null"
+
+    RunResult:
+      type: object
+      required: [steps, tool_call_count, turn_count, usage, stop_reason]
+      properties:
+        response:
+          anyOf:
+            - $ref: "#/components/schemas/MessageResponse"
+            - type: "null"
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/RunStep"
+        tool_call_count:
+          type: integer
+          minimum: 0
+        turn_count:
+          type: integer
+          minimum: 0
+        usage:
+          $ref: "#/components/schemas/Usage"
+        stop_reason:
+          type: string
+          enum: [end_turn, max_tool_calls, max_turns, max_tokens, timeout, cancelled, error, custom]
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Message"
+
+    RunStep:
+      type: object
+      required: [index, duration_ms]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        response:
+          anyOf:
+            - $ref: "#/components/schemas/MessageResponse"
+            - type: "null"
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/RunToolCall"
+        tool_results:
+          type: array
+          items:
+            $ref: "#/components/schemas/RunToolResult"
+        duration_ms:
+          type: integer
+          minimum: 0
+
+    RunToolCall:
+      type: object
+      required: [id, name, input]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        input:
+          type: object
+          additionalProperties: true
+
+    RunToolResult:
+      type: object
+      required: [tool_use_id, content]
+      properties:
+        tool_use_id: { type: string }
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentBlock"
+        is_error:
+          type: boolean
+        error:
+          anyOf:
+            - $ref: "#/components/schemas/Error"
+            - type: "null"
+
+    RunStreamEvent:
+      description: JSON payload of a `/v1/runs:stream` SSE frame.
+      oneOf:
+        - $ref: "#/components/schemas/RunStartEvent"
+        - $ref: "#/components/schemas/RunStepStartEvent"
+        - $ref: "#/components/schemas/RunStreamEventWrapper"
+        - $ref: "#/components/schemas/RunToolCallStartEvent"
+        - $ref: "#/components/schemas/RunToolResultEvent"
+        - $ref: "#/components/schemas/RunStepCompleteEvent"
+        - $ref: "#/components/schemas/RunHistoryDeltaEvent"
+        - $ref: "#/components/schemas/RunCompleteEvent"
+        - $ref: "#/components/schemas/RunPingEvent"
+        - $ref: "#/components/schemas/RunErrorEvent"
+
+    RunStartEvent:
+      type: object
+      required: [type, model]
+      properties:
+        type: { type: string, const: run_start }
+        request_id: { type: string }
+        model: { type: string }
+        protocol_version: { type: string }
+
+    RunStepStartEvent:
+      type: object
+      required: [type, index]
+      properties:
+        type: { type: string, const: step_start }
+        index: { type: integer, minimum: 0 }
+
+    RunStreamEventWrapper:
+      type: object
+      required: [type, event]
+      properties:
+        type: { type: string, const: stream_event }
+        event:
+          $ref: "#/components/schemas/StreamEvent"
+
+    RunToolCallStartEvent:
+      type: object
+      required: [type, id, name, input]
+      properties:
+        type: { type: string, const: tool_call_start }
+        id: { type: string }
+        name: { type: string }
+        input:
+          type: object
+          additionalProperties: true
+
+    RunToolResultEvent:
+      type: object
+      required: [type, id, name, content]
+      properties:
+        type: { type: string, const: tool_result }
+        id: { type: string }
+        name: { type: string }
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentBlock"
+        is_error:
+          type: boolean
+        error:
+          anyOf:
+            - $ref: "#/components/schemas/Error"
+            - type: "null"
+
+    RunStepCompleteEvent:
+      type: object
+      required: [type, index]
+      properties:
+        type: { type: string, const: step_complete }
+        index: { type: integer, minimum: 0 }
+        response:
+          anyOf:
+            - $ref: "#/components/schemas/MessageResponse"
+            - type: "null"
+
+    RunHistoryDeltaEvent:
+      type: object
+      required: [type, expected_len, append]
+      properties:
+        type: { type: string, const: history_delta }
+        expected_len: { type: integer, minimum: 0 }
+        append:
+          type: array
+          items:
+            $ref: "#/components/schemas/Message"
+
+    RunCompleteEvent:
+      type: object
+      required: [type, result]
+      properties:
+        type: { type: string, const: run_complete }
+        result:
+          anyOf:
+            - $ref: "#/components/schemas/RunResult"
+            - type: "null"
+
+    RunPingEvent:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: ping }
+
+    RunErrorEvent:
+      type: object
+      required: [type, error]
+      properties:
+        type: { type: string, const: error }
+        error:
+          $ref: "#/components/schemas/Error"
+
+    # --- Models ---
+    ModelsResponse:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelInfo"
+
+    ModelInfo:
+      type: object
+      required: [id, provider, name]
+      properties:
+        id: { type: string }
+        provider: { type: string }
+        name: { type: string }
+        auth:
+          $ref: "#/components/schemas/ModelAuth"
+        capabilities:
+          $ref: "#/components/schemas/ModelCapabilities"
+
+    ModelAuth:
+      type: object
+      properties:
+        requires_byok_header:
+          type: string
+
+    ModelCapabilities:
+      type: object
+      properties:
+        streaming: { type: boolean }
+        tools: { type: boolean }
+        native_web_search: { type: boolean }
+        native_code_execution: { type: boolean }
+        vision: { type: boolean }
+        documents: { type: boolean }
+        structured_output: { type: boolean }
+        thinking: { type: boolean }
+
+    # --- Readiness ---
+    ReadyResponse:
+      type: object
+      required: [ok, auth_mode, allowlist_enabled, limits_enabled]
+      properties:
+        ok: { type: boolean }
+        auth_mode:
+          type: string
+          enum: [required, optional, disabled]
+        allowlist_enabled: { type: boolean }
+        limits_enabled: { type: boolean }
+        issues:
+          type: array
+          items: { type: string }
