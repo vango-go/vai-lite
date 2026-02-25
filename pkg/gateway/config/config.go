@@ -65,6 +65,12 @@ type Config struct {
 	// Upstream HTTP client defaults
 	UpstreamConnectTimeout        time.Duration
 	UpstreamResponseHeaderTimeout time.Duration
+
+	// Gateway-managed builtin backends.
+	TavilyAPIKey     string
+	TavilyBaseURL    string
+	FirecrawlAPIKey  string
+	FirecrawlBaseURL string
 }
 
 func LoadFromEnv() (Config, error) {
@@ -96,6 +102,10 @@ func LoadFromEnv() (Config, error) {
 		ShutdownGracePeriod:           envDurationOr("VAI_PROXY_SHUTDOWN_GRACE_PERIOD", 30*time.Second),
 		UpstreamConnectTimeout:        envDurationOr("VAI_PROXY_CONNECT_TIMEOUT", 5*time.Second),
 		UpstreamResponseHeaderTimeout: envDurationOr("VAI_PROXY_RESPONSE_HEADER_TIMEOUT", 30*time.Second),
+		TavilyAPIKey:                  strings.TrimSpace(os.Getenv("VAI_PROXY_TAVILY_API_KEY")),
+		TavilyBaseURL:                 envOr("VAI_PROXY_TAVILY_BASE_URL", "https://api.tavily.com"),
+		FirecrawlAPIKey:               strings.TrimSpace(os.Getenv("VAI_PROXY_FIRECRAWL_API_KEY")),
+		FirecrawlBaseURL:              envOr("VAI_PROXY_FIRECRAWL_BASE_URL", "https://api.firecrawl.dev"),
 	}
 
 	switch cfg.AuthMode {
@@ -170,6 +180,12 @@ func LoadFromEnv() (Config, error) {
 	}
 	if cfg.UpstreamResponseHeaderTimeout <= 0 {
 		return Config{}, fmt.Errorf("VAI_PROXY_RESPONSE_HEADER_TIMEOUT must be > 0")
+	}
+	if strings.TrimSpace(cfg.TavilyBaseURL) == "" {
+		return Config{}, fmt.Errorf("VAI_PROXY_TAVILY_BASE_URL must not be empty")
+	}
+	if strings.TrimSpace(cfg.FirecrawlBaseURL) == "" {
+		return Config{}, fmt.Errorf("VAI_PROXY_FIRECRAWL_BASE_URL must not be empty")
 	}
 
 	if cfg.LimitRPS < 0 {

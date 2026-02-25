@@ -19,7 +19,6 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
-	"github.com/vango-go/vai-lite/pkg/gateway/apierror"
 	"github.com/vango-go/vai-lite/pkg/gateway/compat"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
@@ -624,54 +623,24 @@ func itoa(n int) string {
 }
 
 func (h MessagesHandler) writeErr(w http.ResponseWriter, reqID string, err error, isStream bool) {
-	coreErr, status := apierror.FromError(err, reqID)
+	coreErr, status := coreErrorFrom(err, reqID)
 
 	if isStream {
 		// If headers already started, best-effort send SSE error event.
 		sw, sseErr := sse.New(w)
 		if sseErr == nil {
 			_ = sw.Send("error", types.ErrorEvent{
-				Type: "error",
-				Error: types.Error{
-					Type:          string(coreErr.Type),
-					Message:       coreErr.Message,
-					Param:         coreErr.Param,
-					Code:          coreErr.Code,
-					RequestID:     coreErr.RequestID,
-					ProviderError: coreErr.ProviderError,
-					RetryAfter:    coreErr.RetryAfter,
-					CompatIssues:  toTypesCompatIssues(coreErr.CompatIssues),
-				},
+				Type:  "error",
+				Error: toTypesError(coreErr),
 			})
 		}
 		_ = status
 		return
 	}
 
-	h.writeErrorJSON(w, reqID, coreErr, status)
+	writeCoreErrorJSON(w, reqID, coreErr, status)
 }
 
 func (h MessagesHandler) writeErrorJSON(w http.ResponseWriter, reqID string, coreErr *core.Error, status int) {
-	if coreErr != nil && coreErr.RequestID == "" {
-		coreErr.RequestID = reqID
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(apierror.Envelope{Error: coreErr})
-}
-
-func toTypesCompatIssues(issues []core.CompatibilityIssue) []types.CompatibilityIssue {
-	if len(issues) == 0 {
-		return nil
-	}
-	out := make([]types.CompatibilityIssue, len(issues))
-	for i := range issues {
-		out[i] = types.CompatibilityIssue{
-			Severity: issues[i].Severity,
-			Param:    issues[i].Param,
-			Code:     issues[i].Code,
-			Message:  issues[i].Message,
-		}
-	}
-	return out
+	writeCoreErrorJSON(w, reqID, coreErr, status)
 }

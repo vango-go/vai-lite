@@ -67,3 +67,29 @@ func TestServer_ModelsRoute_Reachable(t *testing.T) {
 		t.Fatalf("unexpected body: %q", rr.Body.String())
 	}
 }
+
+func TestServer_RunsRoutes_Reachable(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	s := New(config.Config{
+		AuthMode: config.AuthModeDisabled,
+		APIKeys:  map[string]struct{}{},
+
+		CORSAllowedOrigins:            map[string]struct{}{},
+		ModelAllowlist:                map[string]struct{}{},
+		UpstreamConnectTimeout:        time.Second,
+		UpstreamResponseHeaderTimeout: time.Second,
+		TavilyBaseURL:                 "https://api.tavily.com",
+		FirecrawlBaseURL:              "https://api.firecrawl.dev",
+	}, logger)
+
+	for _, path := range []string{"/v1/runs", "/v1/runs:stream"} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]}}`))
+		req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code == http.StatusNotFound {
+			t.Fatalf("path %s unexpectedly returned 404", path)
+		}
+	}
+}

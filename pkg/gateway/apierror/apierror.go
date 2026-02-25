@@ -121,7 +121,7 @@ func statusFromType(t core.ErrorType) int {
 	case core.ErrProvider:
 		return http.StatusBadGateway
 	case core.ErrAPI:
-		return http.StatusBadGateway
+		return http.StatusInternalServerError
 	default:
 		return http.StatusInternalServerError
 	}

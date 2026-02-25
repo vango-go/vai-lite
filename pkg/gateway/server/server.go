@@ -78,6 +78,24 @@ func (s *Server) routes() {
 		Limiter:    s.limiter,
 		Lifecycle:  s.lifecycle,
 	})
+	s.mux.Handle("/v1/runs", handlers.RunsHandler{
+		Config:     s.cfg,
+		Upstreams:  s.upstreams,
+		HTTPClient: s.httpClient,
+		Logger:     s.logger,
+		Limiter:    s.limiter,
+		Lifecycle:  s.lifecycle,
+		Stream:     false,
+	})
+	s.mux.Handle("/v1/runs:stream", handlers.RunsHandler{
+		Config:     s.cfg,
+		Upstreams:  s.upstreams,
+		HTTPClient: s.httpClient,
+		Logger:     s.logger,
+		Limiter:    s.limiter,
+		Lifecycle:  s.lifecycle,
+		Stream:     true,
+	})
 	s.mux.Handle("/v1/models", handlers.ModelsHandler{Config: s.cfg})
 
 	// Catch-all JSON 404s for unknown paths.
