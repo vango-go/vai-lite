@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	"github.com/vango-go/vai-lite/pkg/gateway/handlers"
 	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
+	"github.com/vango-go/vai-lite/pkg/gateway/live/sessions"
 	"github.com/vango-go/vai-lite/pkg/gateway/mw"
 	"github.com/vango-go/vai-lite/pkg/gateway/ratelimit"
 	"github.com/vango-go/vai-lite/pkg/gateway/upstream"
@@ -23,6 +25,8 @@ type Server struct {
 	httpClient *http.Client
 	limiter    *ratelimit.Limiter
 	lifecycle  *lifecycle.Lifecycle
+
+	liveSessions *sessions.Tracker
 }
 
 func New(cfg config.Config, logger *slog.Logger) *Server {
@@ -54,12 +58,14 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 		},
 		httpClient: httpClient,
 		limiter: ratelimit.New(ratelimit.Config{
-			RPS:                   cfg.LimitRPS,
-			Burst:                 cfg.LimitBurst,
-			MaxConcurrentRequests: cfg.LimitMaxConcurrentRequests,
-			MaxConcurrentStreams:  cfg.LimitMaxConcurrentStreams,
+			RPS:                     cfg.LimitRPS,
+			Burst:                   cfg.LimitBurst,
+			MaxConcurrentRequests:   cfg.LimitMaxConcurrentRequests,
+			MaxConcurrentStreams:    cfg.LimitMaxConcurrentStreams,
+			MaxConcurrentWSSessions: cfg.WSMaxSessionsPerPrincipal,
 		}),
-		lifecycle: &lifecycle.Lifecycle{},
+		lifecycle:    &lifecycle.Lifecycle{},
+		liveSessions: sessions.NewTracker(),
 	}
 
 	s.routes()
@@ -97,6 +103,15 @@ func (s *Server) routes() {
 		Stream:     true,
 	})
 	s.mux.Handle("/v1/models", handlers.ModelsHandler{Config: s.cfg})
+	s.mux.Handle("/v1/live", handlers.LiveHandler{
+		Config:       s.cfg,
+		Upstreams:    s.upstreams,
+		HTTPClient:   s.httpClient,
+		Logger:       s.logger,
+		Limiter:      s.limiter,
+		Lifecycle:    s.lifecycle,
+		LiveSessions: s.liveSessions,
+	})
 
 	// Catch-all JSON 404s for unknown paths.
 	s.mux.Handle("/", handlers.NotFoundHandler{})
@@ -119,4 +134,32 @@ func (s *Server) SetDraining() {
 		return
 	}
 	s.lifecycle.SetDraining(true)
+}
+
+func (s *Server) LiveSessionCount() int {
+	if s == nil || s.liveSessions == nil {
+		return 0
+	}
+	return s.liveSessions.Count()
+}
+
+func (s *Server) WarnLiveSessionsDraining() {
+	if s == nil || s.liveSessions == nil {
+		return
+	}
+	_ = s.liveSessions.WarnAll("draining", "gateway is draining; session may close soon")
+}
+
+func (s *Server) WaitLiveSessions(ctx context.Context) bool {
+	if s == nil || s.liveSessions == nil {
+		return true
+	}
+	return s.liveSessions.Wait(ctx)
+}
+
+func (s *Server) CancelLiveSessions() {
+	if s == nil || s.liveSessions == nil {
+		return
+	}
+	_ = s.liveSessions.CancelAll()
 }

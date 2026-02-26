@@ -2288,6 +2288,9 @@ Implementation approach (recommended):
 Implement as constants *and* env-configurable values (minimal set):
 - `VAI_PROXY_LIVE_MAX_AUDIO_FRAME_BYTES` default `8192`
 - `VAI_PROXY_LIVE_MAX_JSON_MESSAGE_BYTES` default `65536`
+- `VAI_PROXY_LIVE_MAX_AUDIO_FPS` default `120`
+- `VAI_PROXY_LIVE_MAX_AUDIO_BPS` default `131072` (128 KiB/s)
+- `VAI_PROXY_LIVE_INBOUND_BURST_SECONDS` default `2`
 - `VAI_PROXY_LIVE_SILENCE_COMMIT_MS` default `600`
 - `VAI_PROXY_LIVE_GRACE_MS` default `5000`
 - `VAI_PROXY_LIVE_WS_PING_INTERVAL` default `20s`
@@ -2676,6 +2679,18 @@ All configuration is loaded from environment variables with sensible defaults.
 | `VAI_PROXY_MAX_STREAMS_PER_PRINCIPAL` | `4` | Max concurrent SSE streams per API key |
 | `VAI_PROXY_WS_MAX_DURATION` | `2h` | Max WebSocket session duration |
 | `VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL` | `2` | Max concurrent WS sessions per API key |
+| `VAI_PROXY_LIVE_MAX_AUDIO_FRAME_BYTES` | `8192` | Max decoded mic audio bytes per frame |
+| `VAI_PROXY_LIVE_MAX_JSON_MESSAGE_BYTES` | `65536` | Max client JSON frame bytes (after websocket frame decode) |
+| `VAI_PROXY_LIVE_MAX_AUDIO_FPS` | `120` | Max inbound mic frames per second per session (0 disables) |
+| `VAI_PROXY_LIVE_MAX_AUDIO_BPS` | `131072` | Max inbound decoded mic audio bytes per second per session (0 disables) |
+| `VAI_PROXY_LIVE_INBOUND_BURST_SECONDS` | `2` | Inbound audio limiter burst window seconds |
+| `VAI_PROXY_LIVE_SILENCE_COMMIT_MS` | `600ms` | Endpointing: commit after silence |
+| `VAI_PROXY_LIVE_GRACE_MS` | `5s` | Grace window for barge-in cancellation |
+| `VAI_PROXY_LIVE_WS_PING_INTERVAL` | `20s` | WebSocket ping interval |
+| `VAI_PROXY_LIVE_WS_WRITE_TIMEOUT` | `5s` | WebSocket per-write deadline |
+| `VAI_PROXY_LIVE_WS_READ_TIMEOUT` | `0` | WebSocket read deadline (0 disables) |
+| `VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT` | `5s` | Handshake (hello) deadline |
+| `VAI_PROXY_LIVE_TURN_TIMEOUT` | `30s` | Per-turn LLM stream timeout (0 disables) |
 | `VAI_PROXY_CONNECT_TIMEOUT` | `5s` | Upstream connect timeout |
 | `VAI_PROXY_RESPONSE_HEADER_TIMEOUT` | `30s` | Upstream response header timeout |
 | `VAI_PROXY_TOTAL_REQUEST_TIMEOUT` | `2m` | Non-streaming request timeout |

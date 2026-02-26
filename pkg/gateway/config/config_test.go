@@ -24,6 +24,18 @@ var gatewayEnvKeys = []string{
 	"VAI_PROXY_MAX_STREAMS_PER_PRINCIPAL",
 	"VAI_PROXY_WS_MAX_DURATION",
 	"VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL",
+	"VAI_PROXY_LIVE_MAX_AUDIO_FRAME_BYTES",
+	"VAI_PROXY_LIVE_MAX_JSON_MESSAGE_BYTES",
+	"VAI_PROXY_LIVE_MAX_AUDIO_FPS",
+	"VAI_PROXY_LIVE_MAX_AUDIO_BPS",
+	"VAI_PROXY_LIVE_INBOUND_BURST_SECONDS",
+	"VAI_PROXY_LIVE_SILENCE_COMMIT_MS",
+	"VAI_PROXY_LIVE_GRACE_MS",
+	"VAI_PROXY_LIVE_WS_PING_INTERVAL",
+	"VAI_PROXY_LIVE_WS_WRITE_TIMEOUT",
+	"VAI_PROXY_LIVE_WS_READ_TIMEOUT",
+	"VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT",
+	"VAI_PROXY_LIVE_TURN_TIMEOUT",
 	"VAI_PROXY_CONNECT_TIMEOUT",
 	"VAI_PROXY_RESPONSE_HEADER_TIMEOUT",
 	"VAI_PROXY_TAVILY_API_KEY",
@@ -122,6 +134,42 @@ func TestLoadFromEnv_DefaultsMatchSpec(t *testing.T) {
 	if cfg.WSMaxSessionsPerPrincipal != 2 {
 		t.Fatalf("WSMaxSessionsPerPrincipal = %d, want 2", cfg.WSMaxSessionsPerPrincipal)
 	}
+	if cfg.LiveMaxAudioFrameBytes != 8192 {
+		t.Fatalf("LiveMaxAudioFrameBytes = %d, want 8192", cfg.LiveMaxAudioFrameBytes)
+	}
+	if cfg.LiveMaxJSONMessageBytes != 64*1024 {
+		t.Fatalf("LiveMaxJSONMessageBytes = %d, want 65536", cfg.LiveMaxJSONMessageBytes)
+	}
+	if cfg.LiveMaxAudioFPS != 120 {
+		t.Fatalf("LiveMaxAudioFPS = %d, want 120", cfg.LiveMaxAudioFPS)
+	}
+	if cfg.LiveMaxAudioBytesPerSecond != 128*1024 {
+		t.Fatalf("LiveMaxAudioBytesPerSecond = %d, want %d", cfg.LiveMaxAudioBytesPerSecond, int64(128*1024))
+	}
+	if cfg.LiveInboundBurstSeconds != 2 {
+		t.Fatalf("LiveInboundBurstSeconds = %d, want 2", cfg.LiveInboundBurstSeconds)
+	}
+	if cfg.LiveSilenceCommitDuration != 600*time.Millisecond {
+		t.Fatalf("LiveSilenceCommitDuration = %v, want 600ms", cfg.LiveSilenceCommitDuration)
+	}
+	if cfg.LiveGraceDuration != 5*time.Second {
+		t.Fatalf("LiveGraceDuration = %v, want 5s", cfg.LiveGraceDuration)
+	}
+	if cfg.LiveWSPingInterval != 20*time.Second {
+		t.Fatalf("LiveWSPingInterval = %v, want 20s", cfg.LiveWSPingInterval)
+	}
+	if cfg.LiveWSWriteTimeout != 5*time.Second {
+		t.Fatalf("LiveWSWriteTimeout = %v, want 5s", cfg.LiveWSWriteTimeout)
+	}
+	if cfg.LiveWSReadTimeout != 0 {
+		t.Fatalf("LiveWSReadTimeout = %v, want 0", cfg.LiveWSReadTimeout)
+	}
+	if cfg.LiveHandshakeTimeout != 5*time.Second {
+		t.Fatalf("LiveHandshakeTimeout = %v, want 5s", cfg.LiveHandshakeTimeout)
+	}
+	if cfg.LiveTurnTimeout != 30*time.Second {
+		t.Fatalf("LiveTurnTimeout = %v, want 30s", cfg.LiveTurnTimeout)
+	}
 	if cfg.UpstreamConnectTimeout != 5*time.Second {
 		t.Fatalf("UpstreamConnectTimeout = %v, want 5s", cfg.UpstreamConnectTimeout)
 	}
@@ -166,6 +214,18 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	t.Setenv("VAI_PROXY_STREAM_IDLE_TIMEOUT", "31s")
 	t.Setenv("VAI_PROXY_WS_MAX_DURATION", "95m")
 	t.Setenv("VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL", "5")
+	t.Setenv("VAI_PROXY_LIVE_MAX_AUDIO_FRAME_BYTES", "1234")
+	t.Setenv("VAI_PROXY_LIVE_MAX_JSON_MESSAGE_BYTES", "77777")
+	t.Setenv("VAI_PROXY_LIVE_MAX_AUDIO_FPS", "55")
+	t.Setenv("VAI_PROXY_LIVE_MAX_AUDIO_BPS", "222222")
+	t.Setenv("VAI_PROXY_LIVE_INBOUND_BURST_SECONDS", "3")
+	t.Setenv("VAI_PROXY_LIVE_SILENCE_COMMIT_MS", "450ms")
+	t.Setenv("VAI_PROXY_LIVE_GRACE_MS", "7s")
+	t.Setenv("VAI_PROXY_LIVE_WS_PING_INTERVAL", "9s")
+	t.Setenv("VAI_PROXY_LIVE_WS_WRITE_TIMEOUT", "3s")
+	t.Setenv("VAI_PROXY_LIVE_WS_READ_TIMEOUT", "4s")
+	t.Setenv("VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT", "6s")
+	t.Setenv("VAI_PROXY_LIVE_TURN_TIMEOUT", "31s")
 	t.Setenv("VAI_PROXY_RATE_LIMIT_RPS", "3.5")
 	t.Setenv("VAI_PROXY_RATE_LIMIT_BURST", "8")
 	t.Setenv("VAI_PROXY_MAX_CONCURRENT_REQUESTS", "44")
@@ -201,6 +261,21 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	}
 	if cfg.WSMaxSessionDuration != 95*time.Minute || cfg.WSMaxSessionsPerPrincipal != 5 {
 		t.Fatalf("ws limits mismatch: %v/%d", cfg.WSMaxSessionDuration, cfg.WSMaxSessionsPerPrincipal)
+	}
+	if cfg.LiveMaxAudioFrameBytes != 1234 || cfg.LiveMaxJSONMessageBytes != 77777 {
+		t.Fatalf("live size limits mismatch: %d/%d", cfg.LiveMaxAudioFrameBytes, cfg.LiveMaxJSONMessageBytes)
+	}
+	if cfg.LiveMaxAudioFPS != 55 || cfg.LiveMaxAudioBytesPerSecond != 222222 || cfg.LiveInboundBurstSeconds != 3 {
+		t.Fatalf("live inbound limits mismatch: %d/%d/%d", cfg.LiveMaxAudioFPS, cfg.LiveMaxAudioBytesPerSecond, cfg.LiveInboundBurstSeconds)
+	}
+	if cfg.LiveSilenceCommitDuration != 450*time.Millisecond || cfg.LiveGraceDuration != 7*time.Second {
+		t.Fatalf("live timing mismatch: %v/%v", cfg.LiveSilenceCommitDuration, cfg.LiveGraceDuration)
+	}
+	if cfg.LiveWSPingInterval != 9*time.Second || cfg.LiveWSWriteTimeout != 3*time.Second || cfg.LiveWSReadTimeout != 4*time.Second || cfg.LiveHandshakeTimeout != 6*time.Second {
+		t.Fatalf("live ws timeout mismatch: %v/%v/%v/%v", cfg.LiveWSPingInterval, cfg.LiveWSWriteTimeout, cfg.LiveWSReadTimeout, cfg.LiveHandshakeTimeout)
+	}
+	if cfg.LiveTurnTimeout != 31*time.Second {
+		t.Fatalf("LiveTurnTimeout=%v, want 31s", cfg.LiveTurnTimeout)
 	}
 	if cfg.LimitRPS != 3.5 || cfg.LimitBurst != 8 || cfg.LimitMaxConcurrentRequests != 44 || cfg.LimitMaxConcurrentStreams != 6 {
 		t.Fatalf("rate/concurrency mismatch: %v/%d/%d/%d", cfg.LimitRPS, cfg.LimitBurst, cfg.LimitMaxConcurrentRequests, cfg.LimitMaxConcurrentStreams)
@@ -348,6 +423,39 @@ func TestLoadFromEnv_InvalidDurationsAndBounds(t *testing.T) {
 				"VAI_PROXY_MAX_B64_TOTAL":     "99",
 			},
 			errSubstr: "VAI_PROXY_MAX_B64_PER_BLOCK must be <=",
+		},
+		{
+			name: "invalid live turn timeout",
+			env: map[string]string{
+				"VAI_PROXY_AUTH_MODE":         "optional",
+				"VAI_PROXY_LIVE_TURN_TIMEOUT": "-1s",
+			},
+			errSubstr: "VAI_PROXY_LIVE_TURN_TIMEOUT",
+		},
+		{
+			name: "invalid live max audio fps",
+			env: map[string]string{
+				"VAI_PROXY_AUTH_MODE":          "optional",
+				"VAI_PROXY_LIVE_MAX_AUDIO_FPS": "-1",
+			},
+			errSubstr: "VAI_PROXY_LIVE_MAX_AUDIO_FPS",
+		},
+		{
+			name: "invalid live max audio bps",
+			env: map[string]string{
+				"VAI_PROXY_AUTH_MODE":          "optional",
+				"VAI_PROXY_LIVE_MAX_AUDIO_BPS": "-1",
+			},
+			errSubstr: "VAI_PROXY_LIVE_MAX_AUDIO_BPS",
+		},
+		{
+			name: "invalid live inbound burst seconds when enabled",
+			env: map[string]string{
+				"VAI_PROXY_AUTH_MODE":                  "optional",
+				"VAI_PROXY_LIVE_MAX_AUDIO_FPS":         "10",
+				"VAI_PROXY_LIVE_INBOUND_BURST_SECONDS": "0",
+			},
+			errSubstr: "VAI_PROXY_LIVE_INBOUND_BURST_SECONDS",
 		},
 	}
 

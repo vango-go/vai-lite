@@ -197,11 +197,16 @@ Normative v1 guidance:
   "client": {"name": "vai-js", "version": "0.1.0", "platform": "web"},
   "auth": {"mode": "api_key", "gateway_api_key": "vai_sk_..."},
   "byok": {
-    "anthropic": "sk-ant-...",
-    "openai": "sk-...",
-    "gemini": "sk-...",
     "cartesia": "sk-car-...",
-    "elevenlabs": "sk-11l-..."
+    "elevenlabs": "sk-11l-...",
+    "keys": {
+      "anthropic": "sk-ant-...",
+      "openai": "sk-...",
+      "gemini": "sk-...",
+      "groq": "sk-groq-...",
+      "cerebras": "sk-cbr-...",
+      "openrouter": "sk-or-..."
+    }
   },
   "audio_in": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
   "audio_out": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
@@ -214,6 +219,11 @@ Normative v1 guidance:
   }
 }
 ```
+
+Notes:
+- `byok.keys` is the recommended future-proof shape: a map from provider id (the model prefix before the first `/`) to that provider’s API key.
+- Alias behavior: `oai-resp/*` uses the `openai` key by default (override with `byok.keys["oai-resp"]`). `gemini-oauth/*` uses the `gemini` key by default (override with `byok.keys["gemini-oauth"]`).
+- Legacy typed `byok.<provider>` fields may still be accepted for compatibility.
 
 #### `audio_frame` (JSON variant)
 ```json

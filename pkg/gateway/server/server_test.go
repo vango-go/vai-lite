@@ -93,3 +93,32 @@ func TestServer_RunsRoutes_Reachable(t *testing.T) {
 		}
 	}
 }
+
+func TestServer_LiveRoute_Reachable(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	s := New(config.Config{
+		AuthMode:                      config.AuthModeDisabled,
+		APIKeys:                       map[string]struct{}{},
+		CORSAllowedOrigins:            map[string]struct{}{},
+		ModelAllowlist:                map[string]struct{}{},
+		UpstreamConnectTimeout:        time.Second,
+		UpstreamResponseHeaderTimeout: time.Second,
+		WSMaxSessionDuration:          time.Minute,
+		WSMaxSessionsPerPrincipal:     1,
+		LiveMaxAudioFrameBytes:        8192,
+		LiveMaxJSONMessageBytes:       64 * 1024,
+		LiveSilenceCommitDuration:     600 * time.Millisecond,
+		LiveGraceDuration:             5 * time.Second,
+		LiveWSPingInterval:            20 * time.Second,
+		LiveWSWriteTimeout:            5 * time.Second,
+		LiveHandshakeTimeout:          5 * time.Second,
+	}, logger)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/live", nil)
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code == http.StatusNotFound {
+		t.Fatalf("/v1/live unexpectedly returned 404")
+	}
+}

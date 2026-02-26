@@ -147,6 +147,35 @@ func TestRateLimit_TrustProxyHeaders_UsesXForwardedFor(t *testing.T) {
 	}
 }
 
+func TestRateLimit_LiveWebSocketUpgradeBypass(t *testing.T) {
+	lim := ratelimit.New(ratelimit.Config{
+		RPS:   1,
+		Burst: 1,
+	})
+
+	h := RateLimit(config.Config{}, lim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/live", nil)
+	req1.Header.Set("Connection", "Upgrade")
+	req1.Header.Set("Upgrade", "websocket")
+	rr1 := httptest.NewRecorder()
+	h.ServeHTTP(rr1, req1)
+	if rr1.Code != http.StatusNoContent {
+		t.Fatalf("first status=%d body=%q", rr1.Code, rr1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/live", nil)
+	req2.Header.Set("Connection", "Upgrade")
+	req2.Header.Set("Upgrade", "websocket")
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusNoContent {
+		t.Fatalf("second status=%d body=%q", rr2.Code, rr2.Body.String())
+	}
+}
+
 func ratelimitConfigNoRPS(maxConcurrent int, maxStreams int) ratelimit.Config {
 	return ratelimit.Config{
 		RPS:                   0,

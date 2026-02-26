@@ -12,8 +12,9 @@ type Config struct {
 	RPS   float64
 	Burst int
 
-	MaxConcurrentRequests int
-	MaxConcurrentStreams  int
+	MaxConcurrentRequests   int
+	MaxConcurrentStreams    int
+	MaxConcurrentWSSessions int
 
 	// Operational bounds for the in-memory map (single-process only).
 	MaxEntries int
@@ -34,6 +35,7 @@ type principalLimiter struct {
 
 	reqSem    chan struct{}
 	streamSem chan struct{}
+	wsSem     chan struct{}
 
 	lastSeen time.Time
 }
@@ -143,6 +145,29 @@ func (l *Limiter) AcquireStream(principal string, now time.Time) Decision {
 	return Decision{Allowed: true, Permit: &Permit{release: func() {}}}
 }
 
+func (l *Limiter) AcquireWSSession(principal string, now time.Time) Decision {
+	if principal == "" {
+		principal = "anonymous"
+	}
+
+	pl := l.getOrCreate(principal, now)
+	pl.touch(now)
+
+	if l.cfg.MaxConcurrentWSSessions > 0 {
+		select {
+		case pl.wsSem <- struct{}{}:
+			return Decision{
+				Allowed: true,
+				Permit:  &Permit{release: func() { <-pl.wsSem }},
+			}
+		default:
+			return Decision{Allowed: false, RetryAfter: 1}
+		}
+	}
+
+	return Decision{Allowed: true, Permit: &Permit{release: func() {}}}
+}
+
 func (l *Limiter) getOrCreate(principal string, now time.Time) *principalLimiter {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -164,6 +189,7 @@ func (l *Limiter) getOrCreate(principal string, now time.Time) *principalLimiter
 	pl := &principalLimiter{
 		reqSem:    make(chan struct{}, max(1, l.cfg.MaxConcurrentRequests)),
 		streamSem: make(chan struct{}, max(1, l.cfg.MaxConcurrentStreams)),
+		wsSem:     make(chan struct{}, max(1, l.cfg.MaxConcurrentWSSessions)),
 		lastSeen:  now,
 	}
 	l.m[principal] = pl

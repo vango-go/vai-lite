@@ -25,6 +25,10 @@ func RateLimit(cfg config.Config, limiter *ratelimit.Limiter, next http.Handler)
 			next.ServeHTTP(w, r)
 			return
 		}
+		if isLiveWebSocketUpgrade(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		p := principal.Resolve(r, cfg)
 

@@ -50,6 +50,20 @@ type Config struct {
 	WSMaxSessionDuration      time.Duration
 	WSMaxSessionsPerPrincipal int
 
+	// Live WebSocket mode (/v1/live).
+	LiveMaxAudioFrameBytes     int
+	LiveMaxJSONMessageBytes    int64
+	LiveMaxAudioFPS            int
+	LiveMaxAudioBytesPerSecond int64
+	LiveInboundBurstSeconds    int
+	LiveSilenceCommitDuration  time.Duration
+	LiveGraceDuration          time.Duration
+	LiveWSPingInterval         time.Duration
+	LiveWSWriteTimeout         time.Duration
+	LiveWSReadTimeout          time.Duration
+	LiveHandshakeTimeout       time.Duration
+	LiveTurnTimeout            time.Duration
+
 	// In-memory limits (per principal).
 	LimitRPS                   float64
 	LimitBurst                 int
@@ -92,6 +106,18 @@ func LoadFromEnv() (Config, error) {
 		StreamIdleTimeout:             envDurationOr("VAI_PROXY_STREAM_IDLE_TIMEOUT", 60*time.Second),
 		WSMaxSessionDuration:          envDurationOr("VAI_PROXY_WS_MAX_DURATION", 2*time.Hour),
 		WSMaxSessionsPerPrincipal:     envIntOr("VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL", 2),
+		LiveMaxAudioFrameBytes:        envIntOr("VAI_PROXY_LIVE_MAX_AUDIO_FRAME_BYTES", 8192),
+		LiveMaxJSONMessageBytes:       envInt64Or("VAI_PROXY_LIVE_MAX_JSON_MESSAGE_BYTES", 64*1024),
+		LiveMaxAudioFPS:               envIntOr("VAI_PROXY_LIVE_MAX_AUDIO_FPS", 120),
+		LiveMaxAudioBytesPerSecond:    envInt64Or("VAI_PROXY_LIVE_MAX_AUDIO_BPS", 128*1024),
+		LiveInboundBurstSeconds:       envIntOr("VAI_PROXY_LIVE_INBOUND_BURST_SECONDS", 2),
+		LiveSilenceCommitDuration:     envDurationOr("VAI_PROXY_LIVE_SILENCE_COMMIT_MS", 600*time.Millisecond),
+		LiveGraceDuration:             envDurationOr("VAI_PROXY_LIVE_GRACE_MS", 5*time.Second),
+		LiveWSPingInterval:            envDurationOr("VAI_PROXY_LIVE_WS_PING_INTERVAL", 20*time.Second),
+		LiveWSWriteTimeout:            envDurationOr("VAI_PROXY_LIVE_WS_WRITE_TIMEOUT", 5*time.Second),
+		LiveWSReadTimeout:             envDurationOr("VAI_PROXY_LIVE_WS_READ_TIMEOUT", 0),
+		LiveHandshakeTimeout:          envDurationOr("VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT", 5*time.Second),
+		LiveTurnTimeout:               envDurationOr("VAI_PROXY_LIVE_TURN_TIMEOUT", 30*time.Second),
 		LimitRPS:                      envFloat64Or("VAI_PROXY_RATE_LIMIT_RPS", 2.0),
 		LimitBurst:                    envIntOr("VAI_PROXY_RATE_LIMIT_BURST", 4),
 		LimitMaxConcurrentRequests:    envIntOr("VAI_PROXY_MAX_CONCURRENT_REQUESTS", 20),
@@ -162,6 +188,45 @@ func LoadFromEnv() (Config, error) {
 	}
 	if cfg.WSMaxSessionsPerPrincipal <= 0 {
 		return Config{}, fmt.Errorf("VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL must be > 0")
+	}
+	if cfg.LiveMaxAudioFrameBytes <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_AUDIO_FRAME_BYTES must be > 0")
+	}
+	if cfg.LiveMaxJSONMessageBytes <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_JSON_MESSAGE_BYTES must be > 0")
+	}
+	if cfg.LiveMaxAudioFPS < 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_AUDIO_FPS must be >= 0")
+	}
+	if cfg.LiveMaxAudioBytesPerSecond < 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_AUDIO_BPS must be >= 0")
+	}
+	if cfg.LiveInboundBurstSeconds < 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_INBOUND_BURST_SECONDS must be >= 0")
+	}
+	if (cfg.LiveMaxAudioFPS > 0 || cfg.LiveMaxAudioBytesPerSecond > 0) && cfg.LiveInboundBurstSeconds < 1 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_INBOUND_BURST_SECONDS must be >= 1 when inbound audio limits are enabled")
+	}
+	if cfg.LiveSilenceCommitDuration <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_SILENCE_COMMIT_MS must be > 0")
+	}
+	if cfg.LiveGraceDuration <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_GRACE_MS must be > 0")
+	}
+	if cfg.LiveWSPingInterval <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_WS_PING_INTERVAL must be > 0")
+	}
+	if cfg.LiveWSWriteTimeout <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_WS_WRITE_TIMEOUT must be > 0")
+	}
+	if cfg.LiveWSReadTimeout < 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_WS_READ_TIMEOUT must be >= 0")
+	}
+	if cfg.LiveHandshakeTimeout <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT must be > 0")
+	}
+	if cfg.LiveTurnTimeout < 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_TURN_TIMEOUT must be >= 0")
 	}
 	if cfg.ReadHeaderTimeout <= 0 {
 		return Config{}, fmt.Errorf("VAI_PROXY_READ_HEADER_TIMEOUT must be > 0")
