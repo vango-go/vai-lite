@@ -702,7 +702,7 @@ WebSocket upgrade endpoint for Live Audio Mode.
 
 - Endpoint: `wss://<gateway>/v1/live`
 - Protocol: defined in `LIVE_AUDIO_MODE_DESIGN.md`.
-- Auth: gateway API key via query param or first message; BYOK headers via `hello` message fields.
+- Auth: gateway API key via query param or first message; BYOK provider keys via `hello` message fields.
 
 This section does not duplicate the full live protocol; see `LIVE_AUDIO_MODE_DESIGN.md` for:
 - Handshake (`hello` / `hello_ack`).
@@ -1957,9 +1957,653 @@ flowchart LR
   - An internal Go service switches from direct mode to gateway mode by setting `WithBaseURL(...)` + `WithGatewayAPIKey(...)` (and, in BYOK mode, `WithProviderKey(...)`), without changing request shapes.
   - Streaming works reliably through a reverse proxy (verified at least once in staging; pings + cancellation behave as specified).
 
-**Phase 09: Live Audio Mode** — NOT STARTED
-- WebSocket endpoint, session orchestration.
-- See `LIVE_AUDIO_MODE_DESIGN.md` for full design.
+**Phase 09A: Live Audio Mode (WebSocket) — Core Session + Cartesia Baseline** — NOT STARTED
+- Objective:
+  - Ship a **useful, stable, provider-agnostic `/v1/live` WebSocket** that supports real-time voice conversation end-to-end using **Cartesia STT + Cartesia TTS** (no ElevenLabs yet), aligned with `LIVE_AUDIO_MODE_DESIGN.md` and the gateway’s strict/lenient philosophy.
+  - Keep v1 semantics deterministic and safe even before the “played vs generated” machinery is perfect (default to conservative truncation).
+- Public contract (wire protocol v1):
+  - Implement the required client→server message set from `LIVE_AUDIO_MODE_DESIGN.md`:
+    - `hello` (first message; required)
+    - `audio_frame` (JSON/base64 variant required; binary variant optional but recommended to negotiate)
+    - `audio_stream_end` (optional; treat as mic stop boundary for STT flush)
+    - `playback_mark` (accepted + stored, but v1 can use it only for coarse interrupt handling)
+    - `control` (minimum: `interrupt` / `cancel_turn` / `end_session`)
+  - Implement the required server→client message set:
+    - `hello_ack` (negotiation + server limits + session id)
+    - `error` (session or turn scoped; canonical error shape)
+    - `warning` (non-fatal)
+    - `transcript_delta` (partial transcript updates; include `is_final` when available)
+    - `utterance_final` (committed user utterance after endpointing)
+    - `assistant_audio_start`, `assistant_audio_chunk`, `assistant_audio_end` (assistant speech segments)
+    - `audio_reset` (server tells client to immediately stop/flush assistant audio)
+    - `run_event` (optional in 9A; if implemented, keep it minimal and provider-agnostic)
+  - Versioning:
+    - `hello.protocol_version` must negotiate `"1"`; unsupported versions fail fast with `error(code="unsupported_version")` and close.
+    - Reserve the resume fields from `LIVE_AUDIO_MODE_DESIGN.md` but respond with `resume.supported=false` in 9A.
+  - Timebase:
+    - Implement `session_time_ms` anchored at `hello_ack` (as specified); accept missing timestamps but degrade determinism.
+- Server architecture (gateway-side):
+  - Routing:
+    - Add `GET /v1/live` route in `pkg/gateway/server/server.go` to a new `handlers.LiveHandler`.
+  - Handler + session packages (recommended layout):
+    - `pkg/gateway/handlers/live.go` — HTTP upgrade + lifecycle / limiter gates.
+    - `pkg/gateway/live/protocol/` — typed message structs + strict decoding + validation helpers.
+    - `pkg/gateway/live/session/` — `LiveSession` orchestration (STT, turn detector, run controller, TTS, playback tracker).
+  - WebSocket library:
+    - Use `github.com/gorilla/websocket` (already a dependency) with explicit read limits and ping/pong handlers.
+  - Middleware interactions:
+    - Ensure middleware wrappers preserve `http.Hijacker` semantics (already handled in `mw.AccessLog`).
+    - Auth for `/v1/live` (v1 requirement for cross-platform SDKs):
+      - Bypass `mw.Auth` for WebSocket upgrades and authenticate **in-band** using the first `hello` message and/or a query param.
+        - Rationale: browser WebSocket clients cannot set arbitrary HTTP headers like `Authorization`.
+      - Enforce `auth_mode` invariants consistently and never log secrets.
+- Credential resolution (v1 BYOK-first, consistent with the rest of this spec):
+  - Gateway auth (tenant/principal identity):
+    - Hosted: require a gateway API key via query param or `hello` fields.
+    - Self-host: allow `auth_mode=disabled` (loopback/private only) consistent with [3.2](#32-auth-modes).
+  - Provider BYOK keys (v1):
+    - Require BYOK credentials to be provided via `hello` fields (since WS headers can’t be amended post-upgrade).
+    - Minimum required for 9A:
+      - Cartesia key for STT+TTS.
+      - LLM provider key for the chosen `model` provider (e.g. Anthropic/OpenAI/Gemini).
+    - Security invariants (must match [3.5](#35-security-invariants)):
+      - Never log BYOK values; never echo them in errors; never send them back to clients in any server→client message.
+      - On validation errors, report only which credential is missing (not its value).
+    - Future (out of 9A scope): support “managed keys” for Live mode consistent with [3.4](#34-managed-keys-future) so browser-direct Live becomes safe without embedding provider keys in clients.
+- STT pipeline (Cartesia streaming WS):
+  - On successful `hello`:
+    - Initialize one streaming STT session (Cartesia) for the lifetime of the WS session.
+    - Enforce v1 baseline input format requirements from `LIVE_AUDIO_MODE_DESIGN.md`:
+      - Require `audio_in=pcm_s16le@16000Hz mono` (reject unsupported formats fast).
+  - Audio ingest:
+    - Accept `audio_frame` messages (base64 JSON).
+    - If `audio_transport=binary` is negotiated, accept binary frames (framing must match the design doc’s ordering guarantees).
+    - Enforce inbound limits:
+      - max frame bytes
+      - max frames per second / max inbound bandwidth (close on sustained abuse)
+  - Transcript forwarding:
+    - Stream `transcript_delta` to client on STT deltas, with monotonic timestamps when possible.
+- Turn detection + utterance commit (600ms silence + “real speech” gating):
+  - Implement `TurnDetector` driven by:
+    - audio-frame timestamps when present (preferred)
+    - server receipt time as fallback
+  - “Real speech” filter (v1 conservative):
+    - Ignore empty deltas, repeated whitespace, and ultra-short/noise-like outputs.
+    - Require a minimum character count OR presence of alphanumerics before committing.
+  - Endpointing:
+    - Commit an utterance when **no meaningful transcript delta** has been observed for `600ms` (configurable).
+    - Emit `utterance_final` with the committed text and `end_ms`.
+  - Grace period window (5s):
+    - Track the last commit time and allow resumed speech within the grace window to cancel the in-flight assistant turn (see below).
+- LLM “turn execution” (9A scope: `talk_to_user` only, no general tool-loop yet):
+  - For each committed utterance:
+    - Start exactly one streamed model call (`Provider.StreamMessage`) with:
+      - the current `played_history` (v1 can treat it as “committed-only” history; interrupted assistant output is not committed)
+      - a forced `talk_to_user` function tool definition (see `LIVE_AUDIO_MODE_DESIGN.md` §8.2)
+      - a system instruction that the assistant MUST respond via `talk_to_user(text)` and must not emit markdown
+    - Treat “plain assistant text without `talk_to_user`” as a policy violation:
+      - Start v1 **lenient**: synthesize a `talk_to_user` invocation locally and meter it (as recommended in the design doc).
+  - Cancellation:
+    - If an interrupt/grace cancel happens, cancel the model stream context and stop forwarding any late provider events for that turn.
+- `talk_to_user` execution (Cartesia streaming TTS):
+  - When `talk_to_user(text)` input is fully available:
+    - Create a new assistant speech segment id (`assistant_audio_id`).
+    - Emit `assistant_audio_start`.
+    - Stream sentence-sized chunks into a Cartesia streaming TTS context (reuse `pkg/core/voice/tts/cartesia.go`).
+    - Emit `assistant_audio_chunk` frames tagged with `assistant_audio_id`.
+    - Emit `assistant_audio_end` when complete.
+  - Backpressure (must exist even in 9A):
+    - Bound the outbound write queue; if the client cannot keep up, emit `warning(code="backpressure")` and close the segment (or the session) deterministically.
+- Interrupt / barge-in + grace-cancel behavior (9A conservative correctness):
+  - On `control.interrupt` OR confirmed resumed speech during grace window:
+    - Immediately emit `audio_reset` (client flushes playback).
+    - Cancel active TTS context and drop any late audio chunks.
+    - Conservative history rule (v1): treat the interrupted assistant segment as **unplayed** and do not append it to the model history.
+      - This is safe (prevents the “model remembers words the user didn’t hear”) even if it is sometimes overly aggressive.
+- Session lifecycle + limits:
+  - Enforce:
+    - `VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL` (must be implemented as a true “active session” semaphore, not only per-request rate limit).
+    - `VAI_PROXY_WS_MAX_DURATION` (max session wall duration) with a clean shutdown message (`warning` then close).
+  - Keepalive:
+    - WS ping/pong at 10–30s (configurable) and idle detection.
+- Observability (9A baseline):
+  - Metrics (minimum):
+    - active sessions gauge
+    - utterances committed count
+    - STT time-to-first-transcript
+    - assistant time-to-first-audio (TTFA)
+    - interrupts count
+    - audio_resets count
+  - Logs:
+    - Include `request_id` + derived `session_id` + principal kind (api_key/ip) but never raw keys.
+- Tests (must be hermetic):
+  - Protocol decode/validation unit tests in `pkg/gateway/live/protocol/*_test.go`.
+  - WebSocket contract tests with `httptest.Server` + `gorilla/websocket` client:
+    - handshake success/failure (unsupported version, missing creds, bad formats)
+    - `audio_frame` ingest → `transcript_delta` forwarding (using fake STT provider)
+    - `utterance_final` commit behavior (silence threshold, grace cancel)
+    - `talk_to_user` produces `assistant_audio_*` sequence (using fake TTS provider)
+    - interrupt/grace triggers `audio_reset` and cancels generation
+  - Race/leak checks:
+    - ensure goroutines exit on client close and on server draining.
+- Exit criteria:
+  - A reference client (internal) can:
+    - connect, stream mic audio, receive partial transcripts, trigger utterance commits, and hear assistant speech
+    - interrupt mid-speech and observe immediate `audio_reset`
+    - run for at least 10 minutes without leaks/disconnect loops under normal network conditions.
+
+# Phase 09A Implementation Plan — Live Audio Mode (WebSocket) “Cartesia Baseline” (BYOK-first)
+
+## Summary
+Implement `/v1/live` as a stable, provider-agnostic WebSocket endpoint that supports:
+- Always-on streaming STT (Cartesia) → `transcript_delta`
+- 600ms silence endpointing + “real speech” gating → `utterance_final`
+- One LLM turn per committed utterance, gated by terminal `talk_to_user(text)` tool
+- Streaming TTS (Cartesia) → `assistant_audio_start/chunk/end`
+- Grace window (5s) append-on-resume with immediate `audio_reset` + cancellation
+- Interrupt/barge-in with deterministic stop behavior (`audio_reset`, cancel TTS + cancel LLM)
+- BYOK for **LLMs + STT/TTS** via `hello.byok` (no provider keys stored)
+
+This phase is intentionally conservative on “played vs generated” correctness: if the assistant is interrupted, do **not** commit any assistant text to history for the next turn.
+
+---
+
+## Scope / Non-scope (Phase 09A)
+### In scope
+- `/v1/live` WebSocket handler and session orchestration
+- Wire protocol v1 (hello/hello_ack + message catalog in `LIVE_AUDIO_MODE_DESIGN.md`)
+- Cartesia STT + Cartesia TTS only (no ElevenLabs yet)
+- `talk_to_user` tool gate + lenient fallback for plain assistant text
+- Per-principal WS session concurrency cap + max session duration + keepalive
+- Hermetic tests (fake STT/TTS/LLM) + leak-safe shutdown behavior
+
+### Out of scope (Phase 09A)
+- ElevenLabs live TTS + alignment
+- Full tool allowlist beyond `talk_to_user` (web search/fetch in live turns)
+- Session resume (always `resume.supported=false`)
+- Precise played-history truncation using playback marks/alignment (9B)
+
+---
+
+## Public API / Protocol (Decision-Complete)
+
+### Endpoint
+- `GET /v1/live` (WebSocket upgrade), protocol v1 defined by `LIVE_AUDIO_MODE_DESIGN.md`.
+
+### Authentication (BYOK-first + browser-compatible)
+Because browsers cannot set arbitrary WS headers:
+- **Gateway auth is in-band** in the first message (`hello.auth.gateway_api_key`) and/or optional query param (`?gateway_api_key=`).
+- Enforce `VAI_PROXY_AUTH_MODE` for live:
+  - `required`: must present valid gateway key.
+  - `optional`: key optional; if present validate; else principal=IP.
+  - `disabled`: no gateway auth; principal=IP/anon.
+
+### Origin policy (chosen)
+- If `Origin` header is present, it **must** be in `VAI_PROXY_CORS_ORIGINS`.
+- If `Origin` header is absent (non-browser), allow.
+- Rationale: safe-by-default for hosted, consistent with BYOK-in-hello risk.
+
+### Hello message (required first client message)
+Implement and validate this *minimum* schema (allow unknown fields for forward-compat, but reject missing/invalid required fields):
+
+```jsonc
+{
+  "type": "hello",
+  "protocol_version": "1",
+  "client": {"name": "...", "version": "...", "platform": "..."},
+  "auth": {"mode": "api_key", "gateway_api_key": "vai_sk_..."},
+  "model": "anthropic/claude-sonnet-4",
+  "byok": {
+    "anthropic": "sk-ant-...",   // required if model provider is anthropic
+    "openai": "sk-...",          // required if model provider is openai or oai-resp
+    "gemini": "sk-...",          // required if model provider is gemini or gemini-oauth
+    "cartesia": "sk-car-..."     // required in 9A (STT + TTS)
+  },
+  "audio_in": {"encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1},
+  "audio_out":{"encoding":"pcm_s16le","sample_rate_hz":24000,"channels":1},
+  "voice": {                     // 9A-required for TTS unless you choose a global default
+    "language": "en",
+    "voice_id": "cartesia_voice_id",
+    "speed": 1.0,
+    "volume": 1.0,
+    "emotion": "neutral"
+  },
+  "features": {
+    "audio_transport": "binary" | "base64_json",
+    "send_playback_marks": true,
+    "want_partial_transcripts": true,
+    "want_assistant_text": true,
+    "client_has_aec": true
+  }
+}
+```
+
+Negotiation rules:
+- `protocol_version` must be `"1"` else terminal `error(code="unsupported")` + close.
+- `audio_in` must be exactly `pcm_s16le@16000Hz mono` else `error(code="unsupported")` + close.
+- `audio_out` must be `pcm_s16le` mono; allow only `sample_rate_hz=24000` in 9A (reject others).
+- `features.audio_transport`: support both; if client requests `binary` but server is configured to disable it, respond with `base64_json`.
+
+### hello_ack response (server → client)
+- Must include:
+  - negotiated `protocol_version`
+  - `session_id`
+  - negotiated `audio_in` and `audio_out`
+  - negotiated feature flags (`audio_transport`, `supports_alignment=false` in 9A)
+  - `resume: {supported:false, accepted:false, reason:"not_implemented"}`
+
+Also include server limits (additive fields clients can ignore):
+```jsonc
+"limits": {
+  "max_audio_frame_bytes": 8192,
+  "max_json_message_bytes": 65536,
+  "silence_commit_ms": 600,
+  "grace_ms": 5000
+}
+```
+
+### Client → server messages implemented in 9A
+- `audio_frame` (JSON base64) — required
+- Binary mic frames — supported when negotiated:
+  - `audio_stream_start` JSON then raw PCM bytes in binary frames
+- `audio_stream_end` — calls STT finalize boundary
+- `playback_mark` — accept + store latest per `assistant_audio_id` (used only for future; 9A uses it only to satisfy protocol and for logging)
+- `control` — implement at least:
+  - `op="interrupt"` (barge-in)
+  - `op="cancel_turn"`
+  - `op="end_session"`
+
+### Server → client messages implemented in 9A
+- `error` (terminal or per-turn) with the design-doc shape
+- `warning`
+- `audio_in_ack` (optional; implement, helps debugging and future resume)
+- `transcript_delta`
+- `utterance_final`
+- `assistant_audio_start`, `assistant_audio_chunk`, `assistant_audio_end`
+- `audio_reset`
+- `run_event` — omit in 9A (or keep extremely minimal behind `want_assistant_text`; decision: omit to reduce surface)
+
+---
+
+## Server-Side Architecture (Decision-Complete)
+
+### Routing
+- Add `GET /v1/live` to `pkg/gateway/server/server.go` wired to a new `handlers.LiveHandler`.
+
+### Middleware changes (critical correctness)
+Problem: `mw.RateLimit` currently holds request permits until handler returns; a WS session would consume an HTTP request slot for hours.
+Chosen behavior (recommended + selected):
+- **Bypass `mw.RateLimit` for WebSocket upgrades** (at least for path `/v1/live`).
+- Keep HTTP rate limiting for non-WS endpoints unchanged.
+
+Also:
+- `mw.Auth` should **bypass** WebSocket upgrades for `/v1/live` (auth is in-band after upgrade).
+- `mw.APIVersion` already bypasses WS upgrades; keep.
+- Keep `mw.AccessLog` wrapping `Hijacker` intact; it will log once per session on close.
+
+### New packages/files (proposed)
+1) `pkg/gateway/handlers/live.go`
+- Performs:
+  - method/path validation
+  - draining gate (`lifecycle.IsDraining()` → reject upgrade with HTTP status + JSON error)
+  - origin validation (see policy)
+  - websocket upgrade via `gorilla/websocket.Upgrader`
+  - read first message with deadline (e.g., 5s) and require `hello`
+  - enforce `auth_mode` + gateway key validation
+  - resolve principal key:
+    - if gateway key present and valid: principal=API key (hashed key using existing `ratelimit.PrincipalKeyFromAPIKey`)
+    - else: principal=IP (existing principal resolver logic can be reused)
+  - acquire and hold **WS session permit** for duration (new limiter API, see below)
+  - create `LiveSession` and run it until close; release permit on exit
+
+2) `pkg/gateway/live/protocol/*`
+- Typed message structs + validation:
+  - `DecodeClientMessage(data []byte) (any, stringType, error)` based on top-level `"type"`
+  - Validation helpers per message type
+- Encoding:
+  - `WriteJSON(conn, msg)` with write deadlines and size bounds
+- Important: never log raw inbound frames; redact `hello.byok` and `hello.auth.gateway_api_key` in any structured log dumps.
+
+3) `pkg/gateway/live/session/*`
+Core orchestrator implementing the state machine from `LIVE_AUDIO_MODE_DESIGN.md` §7:
+- Components inside session:
+  - `STTSession` (Cartesia streaming, always-on)
+  - `TurnDetector` (silence timer driven by “meaningful transcript deltas”)
+  - `RunController` (one streamed LLM call per committed utterance)
+  - `TTS` (Cartesia streaming context per assistant segment)
+  - `PlaybackTracker` (store playback marks; used minimally in 9A)
+  - `History` (played history only; conservative interruption semantics)
+
+### WS session limiting (per principal)
+Implement true per-principal active-session caps using config:
+- `VAI_PROXY_WS_MAX_SESSIONS_PER_PRINCIPAL`
+
+Implementation approach (recommended):
+- Extend `pkg/gateway/ratelimit.Limiter`:
+  - Add a third semaphore per principal: `wsSem`
+  - Add `AcquireWSSession(principalKey string, now time.Time) Decision`
+- Extend `ratelimit.Config` and `server.New()` limiter wiring to include `MaxConcurrentWSSessions = cfg.WSMaxSessionsPerPrincipal`.
+
+### Live runtime limits (9A defaults)
+Implement as constants *and* env-configurable values (minimal set):
+- `VAI_PROXY_LIVE_MAX_AUDIO_FRAME_BYTES` default `8192`
+- `VAI_PROXY_LIVE_MAX_JSON_MESSAGE_BYTES` default `65536`
+- `VAI_PROXY_LIVE_SILENCE_COMMIT_MS` default `600`
+- `VAI_PROXY_LIVE_GRACE_MS` default `5000`
+- `VAI_PROXY_LIVE_WS_PING_INTERVAL` default `20s`
+- `VAI_PROXY_LIVE_WS_WRITE_TIMEOUT` default `5s`
+- `VAI_PROXY_LIVE_WS_READ_TIMEOUT` default `0` (rely on ping/pong + deadlines per read loop)
+- `VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT` default `5s`
+- `VAI_PROXY_LIVE_BACKPRESSURE_MAX_UNPLAYED_MS` default `2500` (9A: enforce via outbound queue/deadlines, not played_ms math)
+
+---
+
+## Live Session Logic (Decision-Complete)
+
+### Timebase
+- Server sets `t0 = time.Now()` immediately after sending `hello_ack`.
+- `session_time_ms := time.Since(t0).Milliseconds()` used for:
+  - transcript timestamps (server-estimated)
+  - utterance `end_ms`
+  - diagnostics
+- If client provides `audio_frame.timestamp_ms`, store it for future, but 9A behavior is driven by STT delta timing + server timers.
+
+### STT (Cartesia streaming)
+- Create once per session using `hello.byok.cartesia`.
+- Enforce `audio_in` is `pcm_s16le@16000Hz mono`.
+- `audio_frame` handling:
+  - base64 decode to bytes; reject if decoded > max bytes
+  - forward to STT session (`SendAudio`)
+  - optionally emit `audio_in_ack` every N frames (e.g., every 25 frames or 500ms)
+- On `audio_stream_end`, call `FinalizeUtterance()` on STT session to flush boundary.
+
+### Transcript forwarding
+If `hello.features.want_partial_transcripts`:
+- For each STT delta: emit `transcript_delta` with:
+  - `utterance_id` = current active utterance id (even before commit)
+  - `is_final` = from STT if provided
+  - `text` = delta text (treat as latest hypothesis, not append)
+  - `timestamp_ms` = server-estimated session_time_ms
+
+### “Real speech” gating (from design doc §7.2)
+Implement deterministic heuristic function `IsConfirmedSpeech(text string, isFinal bool, assistantSpeaking bool, clientHasAEC bool) bool`:
+- Base thresholds:
+  - trim whitespace
+  - `minChars = 4`
+  - must contain at least one letter/digit
+- When assistant is speaking OR `client_has_aec` is false/unknown:
+  - `minChars = 8`
+  - if STT provides `is_final`, prefer final segments for confirmation (but do not block forever; allow interim if it becomes “long enough”)
+
+### Turn commit (600ms silence)
+Define “silence” as: **no meaningful transcript update** for `silence_commit_ms`.
+- On each meaningful transcript delta, reset silence timer.
+- When silence timer fires:
+  - if current utterance text is not confirmed speech → do nothing (stay listening)
+  - else:
+    - emit `utterance_final {text, end_ms=session_time_ms}`
+    - call STT `FinalizeUtterance()` to reset for the next segment
+    - begin LLM turn (`Running` state)
+    - open grace window timer for `grace_ms` starting at commit
+
+### Grace window (5s append-on-resume)
+While grace active:
+- If transcript deltas arrive but not confirmed speech: ignore for cancellation (stay in Grace).
+- If **confirmed speech** arrives:
+  1) emit `audio_reset {reason:"barge_in"}` for any active assistant segment
+  2) cancel active LLM context (if running)
+  3) cancel active TTS context and drop late chunks
+  4) append resumed speech to pending user text:
+     - `pendingUserText = committedText + " " + resumedText` (trim + collapse whitespace)
+  5) return to Listening and wait for another 600ms silence to commit the combined utterance
+
+If grace expires with no confirmed speech:
+- continue/finish the assistant output normally.
+
+### LLM turn execution (talk_to_user gate)
+For each committed utterance:
+- Build `played_history` messages:
+  - append user message `{role:"user", content:"<pendingUserText>"}`
+- Prepare `types.MessageRequest`:
+  - `Model` = provider-stripped model name (use `core.ParseModelString` like other handlers)
+  - `Tools` = `[talk_to_user function tool]`
+  - `ToolChoice` = `types.ToolChoiceTool("talk_to_user")` (force)
+  - `System` = a strict instruction:
+    - “You must respond by calling talk_to_user({text}). No markdown. Expand numbers/symbols/abbreviations.”
+- Stream with `Provider.StreamMessage` and accumulate events:
+  - Use a StreamAccumulator (reuse/port `pkg/gateway/runloop/accumulator.go`) to reconstruct tool inputs from `input_json_delta`.
+- Terminal condition:
+  - If `talk_to_user` tool_use completes (content_block_stop with valid parsed input), stop reading further and cancel provider stream context (best-effort).
+  - If stream ends without `talk_to_user` but contains assistant text blocks: **lenient fallback** → treat concatenated text as `talk_to_user.text`.
+  - If neither tool nor text: treat as “no speech” and return to Idle.
+
+Provider BYOK for LLM:
+- Determine provider prefix from `hello.model` (split on first `/`).
+- Map to required BYOK entry:
+  - `anthropic/*` → `hello.byok.anthropic`
+  - `openai/*` and `oai-resp/*` → `hello.byok.openai`
+  - `gemini/*` and `gemini-oauth/*` → `hello.byok.gemini`
+- If missing: send terminal `error(scope="turn", code="unauthorized")` and remain connected (or close if auth_mode required; decision: per-turn error, keep session).
+
+### talk_to_user execution (Cartesia TTS)
+When tool input `text` is available:
+- Create `assistant_audio_id` (monotonic counter with prefix `a_`).
+- Emit `assistant_audio_start`:
+  - include negotiated audio format
+  - include `text` if `want_assistant_text=true`, else omit/empty
+- Create Cartesia streaming context (per segment) using `hello.byok.cartesia` and `hello.voice` settings:
+  - output: `pcm_s16le@24000 mono`
+- Chunking policy:
+  - sentence-ish buffering using existing sentence buffer logic from `pkg/core/voice/streaming_tts.go` (or a simplified local copy)
+  - flush at sentence boundaries and final
+- Emit audio chunks:
+  - base64 JSON variant always supported
+  - if negotiated `binary`, also support header+binary framing per design doc
+- On completion: emit `assistant_audio_end`.
+
+### Interrupt handling (control + speech-driven)
+- `control.op="interrupt"`:
+  - immediately emit `audio_reset {reason:"barge_in"}` for active segment (if any)
+  - cancel TTS context + cancel LLM ctx
+  - do **not** commit assistant text to history (conservative)
+  - return to Listening
+- `control.op="cancel_turn"`:
+  - cancel LLM + stop any TTS; emit `audio_reset {reason:"cancel_turn"}` if needed
+  - return to Idle (or Listening if mic still active)
+- `control.op="end_session"`:
+  - send `warning` then close WS with normal closure
+
+### Backpressure / write safety (9A)
+Implement bounded, deterministic write behavior:
+- Single writer goroutine that owns all `conn.WriteMessage` calls
+- Per-write deadline (`write_timeout`)
+- If any write blocks/errors/timeouts → close the session
+- Do not buffer unbounded audio:
+  - bounded outbound channel; if full, close session (optionally best-effort warning)
+
+### History (played_history only; conservative)
+- On normal completion (assistant_audio_end):
+  - append assistant message to `played_history` as plain text content (not tool_use)
+- On interruption:
+  - append **nothing** (assistant text not committed)
+
+---
+
+## Testing Plan (Hermetic + Useful)
+
+### Unit tests
+- `pkg/gateway/live/protocol`:
+  - strict hello validation: missing fields, bad protocol_version, unsupported audio formats, malformed byok
+  - unknown message types → terminal error decision
+  - redaction helpers never include secrets
+- `pkg/gateway/live/session`:
+  - gating function cases (minChars, punctuation-only, assistantSpeaking thresholds)
+  - silence commit timer behavior (use short durations)
+  - grace window cancel path
+  - interrupt path produces `audio_reset` + cancels turn
+
+### WebSocket contract tests (httptest.Server + gorilla/websocket)
+Build a test server with injected fakes:
+- Fake STT session that emits deltas on demand
+- Fake TTS that yields deterministic audio chunks and respects cancel
+- Fake LLM provider stream that yields:
+  - tool_use with input_json_delta (to validate JSON reassembly)
+  - plain-text fallback path
+
+Scenarios:
+1) Handshake success → hello_ack
+2) Handshake fail: unsupported protocol_version → error + close
+3) Auth mode required + missing/invalid gateway key → error + close
+4) Origin allowlist behavior:
+   - Origin present but not allowlisted → reject upgrade
+5) STT → transcript_delta forwarding
+6) 600ms silence commit emits utterance_final and triggers LLM call
+7) talk_to_user produces assistant_audio_start/chunk/end in order
+8) `control.interrupt` during speaking emits audio_reset and stops further audio
+9) Grace cancel: resume speech within grace cancels active run/speech, appends, re-commits combined utterance
+10) WS session cap: open N sessions with same key, N+1 rejected
+
+### Leak/cleanup checks
+- Ensure all goroutines exit when:
+  - client closes socket
+  - server cancels context
+  - session duration timer fires
+  - draining mode rejects new sessions
+- Run tests with `-race` in CI/local verification.
+
+---
+
+## Implementation Steps (Concrete Task Breakdown)
+
+1) **Plumbing**
+- Add `/v1/live` route to server.
+- Add `handlers.LiveHandler` with upgrade + origin gate + handshake + session startup.
+- Add live package skeleton (`protocol`, `session`).
+
+2) **Middleware correctness**
+- Update `mw.RateLimit` to bypass WS upgrades (selected behavior).
+- Update `mw.Auth` to bypass WS upgrades for `/v1/live`.
+
+3) **Limiter support**
+- Extend `ratelimit.Limiter` to support `AcquireWSSession` with per-principal semaphore.
+- Wire `cfg.WSMaxSessionsPerPrincipal` through `server.New()` into limiter config.
+
+4) **Protocol implementation**
+- Decode/validate all client message types needed for 9A.
+- Encode all server message types needed for 9A.
+- Implement binary audio framing rules for server→client when negotiated.
+
+5) **Session orchestration**
+- STT: Cartesia streaming session lifecycle + audio ingest
+- TurnDetector: silence timer + commit + grace logic
+- LLM: streamed call + tool gating + lenient fallback
+- TTS: Cartesia streaming per segment, cancellation + drop-late-chunks discipline
+- Interrupt/control handling
+- Backpressure-safe writer + ping/pong keepalive
+- Session duration + draining behavior
+
+6) **Tests**
+- Add unit tests for protocol + gating
+- Add WS contract tests with fakes
+- Validate race/leak safety (run `go test -race ./...`)
+
+---
+
+## Acceptance Criteria (Exit Conditions for “complete” 9A)
+- `/v1/live` works end-to-end with:
+  - `hello` → `hello_ack`
+  - mic audio → partial transcripts → committed utterances
+  - committed utterance → `talk_to_user` → audible assistant audio stream
+- Interrupt + grace behavior matches `LIVE_AUDIO_MODE_DESIGN.md`:
+  - `audio_reset` emitted immediately on barge-in/grace cancel
+  - active LLM + TTS are cancelled; no late audio is forwarded
+- WS session caps and max duration are enforced per principal without consuming HTTP request concurrency permits.
+- Origin allowlist is enforced for browser-origin WS connections.
+- All tests are hermetic; no real provider network calls.
+- No goroutine leaks in repeated connect/disconnect tests; `-race` passes.
+
+## Assumptions / Defaults
+- Phase 09A supports Cartesia-only voice; ElevenLabs and alignment are Phase 09B.
+- “Silence” is modeled as “no meaningful STT delta” (not audio energy VAD) in 9A.
+- Conservative correctness: interrupted assistant speech is not committed to model history.
+- Browser-direct Live is not “safe” with BYOK; this phase provides the protocol, but hosted deployments should use a backend relay or ship managed keys later.
+
+
+**Phase 09B: Live Audio Mode (WebSocket) — Production Tooling + ElevenLabs + Played-History Correctness** — NOT STARTED
+- Objective:
+  - Upgrade 9A into a production-grade Live experience: correct “played vs generated” history, realistic TTS (ElevenLabs), bounded tool usage, strong backpressure semantics, and operational safeguards for hosted use.
+- Full tool-loop integration (gateway-owned tools + deterministic history deltas):
+  - Support a bounded set of gateway-managed tools during a live turn (in addition to `talk_to_user`):
+    - Start with `vai_web_search` / `vai_web_fetch` (already present for `/v1/runs`) plus any other low-risk internal tools.
+  - Implement **terminal tool semantics**:
+    - `talk_to_user` is terminal for the live turn: once executed, the LLM turn completes without another model call.
+    - Prefer implementing a shared “terminal tool” mechanism that can be reused by the SDK run loop and the gateway run controller.
+  - `run_event` streaming:
+    - Emit provider/gateway run events to the client in the stable `run_event` envelope (only the curated subset; no provider-shaped leakage).
+  - Budgets:
+    - `max_tool_calls_per_turn`, `tool_timeout_ms`, `run_timeout_ms` (turn-scoped) enforced strictly.
+    - If budgets are exceeded, emit `warning` and force the model to resolve by calling `talk_to_user` with a concise apology/next step (or terminate the turn).
+- ElevenLabs “live” TTS integration (+ fallback policy):
+  - Add `pkg/core/voice/tts/elevenlabs.go` implementing `tts.Provider` streaming contexts with:
+    - multi-context support (respect provider caps; e.g. context limit)
+    - best-effort hard-stop on interrupt (close/cancel context)
+    - optional alignment (`sync_alignment`) when available
+  - Provider selection:
+    - Default: ElevenLabs TTS, Cartesia STT (per `LIVE_AUDIO_MODE_DESIGN.md` §12.1).
+    - Explicit fallback to Cartesia TTS (tenant/session policy), never a silent runtime surprise.
+  - Keepalive rules for provider WS connections (avoid provider idle disconnect).
+- Credential resolution (Live mode, hosted-friendly):
+  - Continue v1 BYOK-first: provider keys supplied by the client/SDK via `hello` and used only for the lifetime of the session.
+  - Add (optional) managed keys mode consistent with [3.4](#34-managed-keys-future):
+    - tenant-managed key > BYOK (unless an explicit `byok_override=true` policy is enabled).
+- Correctness: played history vs canonical history (interrupt truncation):
+  - Implement `HistoryManager` as described in `LIVE_AUDIO_MODE_DESIGN.md` §11:
+    - maintain `canonical_history` for audit/debug
+    - maintain `played_history` for what the model sees next turn
+  - Implement `PlaybackTracker`:
+    - treat client `playback_mark.played_ms` as authoritative
+    - map played milliseconds → text prefix using alignment when available
+    - when alignment is unavailable, degrade conservatively (discard segment on interrupt)
+  - On interrupt:
+    - update `played_history` to reflect truncated assistant output (not the full generated text)
+    - ensure the next model turn is built from `played_history` deterministically.
+- Backpressure contract (required for hosted):
+  - Implement negotiated backpressure behavior (design doc §4.5):
+    - maximum outbound buffered audio duration/bytes
+    - `audio_in_ack` (optional) and/or explicit server warnings when the client is behind
+    - deterministic close behavior when the client is persistently non-responsive
+  - Ensure large audio bursts can’t OOM the gateway (bounded queues everywhere).
+- Session resume (reconnection) — partial v1.1 behavior:
+  - Implement short-window resume (10–30s) behind a feature flag:
+    - accept `resume_session_id` in `hello`
+    - replay un-acked assistant audio for the active segment (optional) and/or re-emit the last known session state
+    - enforce strong limits and expire state aggressively to prevent memory blowups.
+- Operational hardening:
+  - Enforce inbound mic limits (design doc §4.6):
+    - bandwidth caps, max duration of continuous audio without commits, max frame rate, max message size.
+  - Add graceful draining for live sessions:
+    - refuse new sessions immediately on drain
+    - optionally send `warning(code="draining")` to active sessions and close after a bounded grace.
+  - Expand observability:
+    - metrics from design doc §13.5 (TTFB/TTFA, interrupts, audio resets, grace cancels, live session duration histograms)
+    - structured close reasons (normal, client disconnect, auth failure, backpressure, timeouts).
+- Testing (expanded):
+  - Unit tests:
+    - state machine transitions (silence commit, grace cancel, interrupt path)
+    - played-history truncation using synthetic alignment mappings
+    - budget enforcement and terminal tool behavior
+  - Contract tests:
+    - fake WS servers for ElevenLabs and Cartesia simulating alignment + cancellation edge cases
+  - End-to-end simulation harness:
+    - deterministic scripted traces (“user speaks / pauses / interrupts”) validating:
+      - audio stops within a bound after interrupt
+      - played history passed to the model matches `played_ms` truncation
+      - no goroutine leaks across repeated connect/disconnect cycles.
+- Exit criteria:
+  - Production-grade correctness and UX:
+    - interrupts stop assistant audio quickly and reliably; the model does not “remember” unheard text
+    - TTFA is within target for the default provider mix (measured, not assumed)
+    - backpressure and limits prevent runaway resource usage under adversarial clients.
 
 **Phase 10: TypeScript SDK** — NOT STARTED
 - Thin client targeting `/v1/messages` and `/v1/runs`.

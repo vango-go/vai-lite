@@ -1,7 +1,9 @@
 // Package vai provides the Vai SDK for Go.
 //
 // This repo is intentionally trimmed down to focus on `Run` / `RunStream` and tools.
-// The SDK runs in-process (direct mode) and calls providers directly.
+// It supports:
+//   - direct mode (SDK calls providers directly), and
+//   - gateway proxy mode (SDK calls /v1/messages and /v1/runs endpoints).
 package vai
 
 import (
@@ -44,13 +46,13 @@ func NewClient(opts ...ClientOption) *Client {
 	c := &Client{
 		providerKeys: make(map[string]string),
 		logger:       slog.Default(),
-		httpClient:   &http.Client{},
+		httpClient:   newDefaultHTTPClient(),
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	if c.httpClient == nil {
-		c.httpClient = &http.Client{}
+		c.httpClient = newDefaultHTTPClient()
 	}
 
 	c.core = core.NewEngine(c.providerKeys)

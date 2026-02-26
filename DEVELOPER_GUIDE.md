@@ -1,6 +1,9 @@
-# Developer Guide (vai-lite) — WIP (Live Audio Mode & Proxy/Gateway)
+# Developer Guide (vai-lite)
 
-`vai-lite` is a trimmed-down, **direct-mode only** Go SDK for running tool-using LLM agents.
+`vai-lite` is a trimmed-down Go SDK for tool-using LLM agents with two execution modes:
+
+- **Direct mode** (default): SDK calls providers directly.
+- **Proxy mode**: SDK calls VAI Gateway endpoints (`/v1/messages`, `/v1/runs`, `/v1/runs:stream`) via `WithBaseURL(...)`.
 
 Most examples use `panic(err)` for brevity. In production code, handle errors explicitly and consider retries/backoff for transient provider failures.
 
@@ -25,10 +28,9 @@ Everything else is in service of these primitives:
 
 This repo intentionally **does not** include:
 
-- Proxy/HTTP server mode
-- Live/WebSocket server mode (WIP design notes included below)
+- Live/WebSocket server mode in SDK (`client.Live.*`)
 - Standalone audio service endpoints (`client.Audio.*`)
-- Extra endpoints (`/v1/messages`, `/v1/audio`, `/v1/models`, etc.)
+- Additional gateway SDK surfaces beyond messages + runs in this phase
 
 ---
 
@@ -84,8 +86,9 @@ This repo intentionally **does not** include:
 Key directories you’ll touch:
 
 - `sdk/` — The public SDK you import (`github.com/vango-go/vai-lite/sdk`)
-  - `sdk/client.go` — direct-mode client + provider registration
+  - `sdk/client.go` — client construction, mode switch (direct vs proxy), provider registration
   - `sdk/messages.go` — `Create` / `Stream` / `CreateStream` / `Extract` / `Run` / `RunStream`
+  - `sdk/runs_service.go` — gateway server-run surface: `Runs.Create` / `Runs.Stream`
   - `sdk/run.go` — the tool loop implementation
   - `sdk/tools.go` — tool builders (`MakeTool`, `ToolSet`, native tool constructors)
   - `sdk/stream.go` — stream wrapper that accumulates final responses
@@ -121,7 +124,9 @@ import vai "github.com/vango-go/vai-lite/sdk"
 
 ## 3. Provider Authentication
 
-`vai-lite` is direct-mode only. It calls providers directly, so **your process** must have the provider keys available.
+In direct mode, `vai-lite` calls providers directly, so **your process** must have provider keys available.
+
+In proxy mode, `WithProviderKey(...)` maps to gateway `X-Provider-Key-*` headers; `WithGatewayAPIKey(...)` sets `Authorization: Bearer ...` for gateway auth.
 
 ### Environment variables
 
@@ -151,6 +156,23 @@ client := vai.NewClient(
 	vai.WithProviderKey("anthropic", "sk-ant-..."),
 )
 ```
+
+### Proxy mode configuration
+
+```go
+client := vai.NewClient(
+	vai.WithBaseURL("https://api.vai.example.com"),
+	vai.WithGatewayAPIKey("vai_sk_..."), // optional for self-host auth_mode=disabled
+	vai.WithProviderKey("anthropic", "sk-ant-..."),
+	vai.WithProviderKey("cartesia", "sk-cartesia-..."), // sent for voice requests
+)
+```
+
+Proxy mode notes:
+- `Messages.Run` / `Messages.RunStream` remain client-side loops.
+- `Runs.Create` / `Runs.Stream` call gateway server-side loops.
+- Server-side runs reject client function tools (use gateway builtins/provider-native tools instead).
+- For non-streaming proxy calls, pass request contexts with explicit deadlines in production.
 
 ### 3.1 OpenAI-Compatible Chat Providers
 

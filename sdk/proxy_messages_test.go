@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/vango-go/vai-lite/pkg/core"
 	"github.com/vango-go/vai-lite/pkg/core/types"
@@ -261,8 +263,10 @@ func TestProxyMessagesStream_ParsesGatewaySSEAndAudio(t *testing.T) {
 	t.Parallel()
 
 	audioPayload := []byte("pcm-data")
+	var gotAccept string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccept = r.Header.Get("Accept")
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 
@@ -347,6 +351,9 @@ func TestProxyMessagesStream_ParsesGatewaySSEAndAudio(t *testing.T) {
 	if !sawAudioChunk {
 		t.Fatalf("expected audio_chunk event")
 	}
+	if gotAccept != "text/event-stream" {
+		t.Fatalf("Accept = %q, want %q", gotAccept, "text/event-stream")
+	}
 	if err := stream.Err(); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("stream.Err() = %v, want nil or EOF", err)
 	}
@@ -363,6 +370,109 @@ func TestProxyMessagesStream_ParsesGatewaySSEAndAudio(t *testing.T) {
 	}
 	if string(chunks[0]) != string(audioPayload) {
 		t.Fatalf("audio chunk = %q, want %q", string(chunks[0]), string(audioPayload))
+	}
+}
+
+func TestProxyMessagesStream_AudioUnavailableClosesAudioChannelEarly(t *testing.T) {
+	t.Parallel()
+
+	var gotAccept string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccept = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSEJSON(t, w, "message_start", types.MessageStartEvent{
+			Type: "message_start",
+			Message: types.MessageResponse{
+				Type:  "message",
+				ID:    "msg_stream",
+				Role:  "assistant",
+				Model: "openai/gpt-4o-mini",
+			},
+		})
+		writeSSEJSON(t, w, "audio_chunk", types.AudioChunkEvent{
+			Type:   "audio_chunk",
+			Format: "pcm_s16le",
+			Audio:  base64.StdEncoding.EncodeToString([]byte("chunk-1")),
+		})
+		writeSSEJSON(t, w, "audio_unavailable", types.AudioUnavailableEvent{
+			Type:    "audio_unavailable",
+			Reason:  "tts_failed",
+			Message: "tts failed",
+		})
+		time.Sleep(200 * time.Millisecond)
+		writeSSEJSON(t, w, "content_block_start", types.ContentBlockStartEvent{
+			Type:         "content_block_start",
+			Index:        0,
+			ContentBlock: types.TextBlock{Type: "text", Text: ""},
+		})
+		writeSSEJSON(t, w, "content_block_delta", types.ContentBlockDeltaEvent{
+			Type:  "content_block_delta",
+			Index: 0,
+			Delta: types.TextDelta{Type: "text_delta", Text: "still streaming text"},
+		})
+		delta := types.MessageDeltaEvent{Type: "message_delta"}
+		delta.Delta.StopReason = types.StopReasonEndTurn
+		writeSSEJSON(t, w, "message_delta", delta)
+		writeSSEJSON(t, w, "message_stop", types.MessageStopEvent{Type: "message_stop"})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("openai", "sk-openai"),
+		WithProviderKey("cartesia", "sk-cartesia"),
+		WithHTTPClient(server.Client()),
+	)
+
+	stream, err := client.Messages.Stream(context.Background(), &MessageRequest{
+		Model: "openai/gpt-4o-mini",
+		Messages: []Message{
+			{Role: "user", Content: Text("hello")},
+		},
+		Voice: VoiceOutput("voice-id"),
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer stream.Close()
+
+	sawAudioUnavailable := false
+	sawAudioChunk := false
+	for event := range stream.Events() {
+		if _, ok := event.(types.AudioChunkEvent); ok {
+			sawAudioChunk = true
+			select {
+			case chunk, open := <-stream.AudioEvents():
+				if !open {
+					t.Fatalf("audio channel closed before first chunk")
+				}
+				if string(chunk.Data) != "chunk-1" {
+					t.Fatalf("first chunk data = %q, want %q", string(chunk.Data), "chunk-1")
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Fatalf("first audio chunk not delivered")
+			}
+		}
+		if _, ok := event.(types.AudioUnavailableEvent); ok {
+			sawAudioUnavailable = true
+			select {
+			case _, open := <-stream.AudioEvents():
+				if open {
+					t.Fatalf("audio channel should close after audio_unavailable")
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Fatalf("audio channel did not close promptly after audio_unavailable")
+			}
+		}
+	}
+	if !sawAudioUnavailable {
+		t.Fatalf("expected audio_unavailable event")
+	}
+	if !sawAudioChunk {
+		t.Fatalf("expected audio_chunk event before audio_unavailable")
+	}
+	if gotAccept != "text/event-stream" {
+		t.Fatalf("Accept = %q, want %q", gotAccept, "text/event-stream")
 	}
 }
 
@@ -444,6 +554,12 @@ func TestGatewayEndpoint_JoinVariants(t *testing.T) {
 			endpoint: "/v1/messages",
 			want:     "https://api.example.com/gateway/v1/messages",
 		},
+		{
+			name:     "strips query and fragment",
+			baseURL:  "https://api.example.com/gateway/?tenant=a#frag",
+			endpoint: "/v1/messages",
+			want:     "https://api.example.com/gateway/v1/messages",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -458,6 +574,148 @@ func TestGatewayEndpoint_JoinVariants(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGatewayEndpoint_InvalidBaseURL(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		baseURL string
+	}{
+		{name: "empty", baseURL: ""},
+		{name: "missing scheme", baseURL: "api.example.com"},
+		{name: "invalid URL", baseURL: "://bad"},
+		{name: "userinfo rejected", baseURL: "https://user:pass@api.example.com"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewClient(WithBaseURL(tc.baseURL))
+			_, err := client.gatewayEndpoint("/v1/messages")
+			if err == nil {
+				t.Fatalf("expected error")
+			}
+		})
+	}
+}
+
+func TestDecodeGatewayErrorResponse_UsesRetryAfterHeader(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"too many requests"}}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithHTTPClient(server.Client()),
+	)
+
+	_, err := client.Messages.Create(context.Background(), &MessageRequest{
+		Model: "openai/gpt-4o-mini",
+		Messages: []Message{
+			{Role: "user", Content: Text("hello")},
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	var apiErr *core.Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *core.Error", err)
+	}
+	if apiErr.RetryAfter == nil || *apiErr.RetryAfter != 7 {
+		t.Fatalf("retry_after = %#v, want 7", apiErr.RetryAfter)
+	}
+}
+
+func TestStreamErr_BlocksUntilDone(t *testing.T) {
+	t.Parallel()
+
+	stream := newStreamFromEventStream(&delayedEOFEventStream{delay: 120 * time.Millisecond})
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- stream.Err()
+	}()
+
+	select {
+	case <-done:
+		t.Fatalf("Err() returned before stream completion")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	for range stream.Events() {
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Err() = %v, want EOF", err)
+		}
+		if time.Since(start) < 100*time.Millisecond {
+			t.Fatalf("Err() did not block for stream completion")
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("Err() did not return after stream completion")
+	}
+}
+
+func TestTransportError_RedactsUserInfo(t *testing.T) {
+	t.Parallel()
+
+	err := &TransportError{
+		Op:  "POST",
+		URL: "https://user:pass@example.com/v1/messages",
+		Err: errors.New("dial tcp"),
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "user") || strings.Contains(msg, "pass") {
+		t.Fatalf("transport error message leaked credentials: %q", msg)
+	}
+}
+
+func TestWithDefaultGatewayTimeout(t *testing.T) {
+	t.Parallel()
+
+	ctxWithTimeout, cancel := withDefaultGatewayTimeout(context.Background())
+	defer cancel()
+	if _, ok := ctxWithTimeout.Deadline(); !ok {
+		t.Fatalf("expected default deadline to be applied")
+	}
+
+	existingCtx, existingCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer existingCancel()
+	preservedCtx, preservedCancel := withDefaultGatewayTimeout(existingCtx)
+	defer preservedCancel()
+	if preservedCtx != existingCtx {
+		t.Fatalf("context with existing deadline should be preserved")
+	}
+}
+
+type delayedEOFEventStream struct {
+	delay time.Duration
+	done  bool
+}
+
+func (s *delayedEOFEventStream) Next() (types.StreamEvent, error) {
+	if s.done {
+		return nil, io.EOF
+	}
+	time.Sleep(s.delay)
+	s.done = true
+	return nil, io.EOF
+}
+
+func (s *delayedEOFEventStream) Close() error {
+	s.done = true
+	return nil
 }
 
 func writeSSEJSON(t *testing.T, w http.ResponseWriter, event string, payload any) {

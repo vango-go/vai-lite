@@ -11,14 +11,16 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vango-go/vai-lite/pkg/core"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 const (
-	vaiVersionHeader = "X-VAI-Version"
-	vaiVersionValue  = "1"
+	vaiVersionHeader                  = "X-VAI-Version"
+	vaiVersionValue                   = "1"
+	defaultGatewayNonStreamingTimeout = 2 * time.Minute
 )
 
 var providerByokHeaders = map[string]string{
@@ -106,6 +108,9 @@ func (p *gatewayProxyProvider) publicModel(model string) string {
 }
 
 func (c *Client) proxyCreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	ctx, cancel := withDefaultGatewayTimeout(ctx)
+	defer cancel()
+
 	headers, err := c.buildGatewayHeaders(req.Model, req.Voice, false)
 	if err != nil {
 		return nil, err
@@ -277,6 +282,9 @@ func (c *Client) gatewayEndpoint(path string) (string, error) {
 	if err != nil || strings.TrimSpace(base.Scheme) == "" || strings.TrimSpace(base.Host) == "" {
 		return "", core.NewInvalidRequestError("invalid gateway base URL")
 	}
+	if base.User != nil {
+		return "", core.NewInvalidRequestError("gateway base URL must not include credentials")
+	}
 
 	base.RawQuery = ""
 	base.Fragment = ""
@@ -373,6 +381,16 @@ func parseRetryAfterHeader(raw string) *int {
 		return nil
 	}
 	return &seconds
+}
+
+func withDefaultGatewayTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), defaultGatewayNonStreamingTimeout)
+	}
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultGatewayNonStreamingTimeout)
 }
 
 func typesErrorToCoreError(err types.Error) *core.Error {

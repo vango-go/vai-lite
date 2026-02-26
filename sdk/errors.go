@@ -2,6 +2,7 @@ package vai
 
 import (
 	"fmt"
+	"net/url"
 
 	"github.com/vango-go/vai-lite/pkg/core"
 )
@@ -45,7 +46,7 @@ func (e *TransportError) Error() string {
 	case e == nil:
 		return ""
 	case e.Op != "" && e.URL != "":
-		return fmt.Sprintf("transport error during %s %s: %v", e.Op, e.URL, e.Err)
+		return fmt.Sprintf("transport error during %s %s: %v", e.Op, redactURLUserInfo(e.URL), e.Err)
 	case e.Op != "":
 		return fmt.Sprintf("transport error during %s: %v", e.Op, e.Err)
 	default:
@@ -58,4 +59,16 @@ func (e *TransportError) Unwrap() error {
 		return nil
 	}
 	return e.Err
+}
+
+func redactURLUserInfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed == nil {
+		return raw
+	}
+	parsed.User = nil
+	return parsed.String()
 }

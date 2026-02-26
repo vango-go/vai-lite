@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/vango-go/vai-lite/pkg/core"
@@ -98,8 +99,18 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 	defer close(s.done)
 
 	audioEvents := s.audioEvents
-	if s.voiceOutput != nil || s.gatewayAudio {
-		defer close(audioEvents)
+	audioEventsOpen := s.voiceOutput != nil || s.gatewayAudio
+	var closeAudioOnce sync.Once
+	closeAudioEvents := func() {
+		if !audioEventsOpen {
+			return
+		}
+		closeAudioOnce.Do(func() {
+			close(audioEvents)
+		})
+	}
+	if audioEventsOpen {
+		defer closeAudioEvents()
 	}
 
 	var response types.MessageResponse
@@ -160,6 +171,7 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 	}
 
 	voiceAborted := false
+	gatewayAudioClosed := false
 
 streamLoop:
 	for {
@@ -212,6 +224,9 @@ streamLoop:
 			response.Usage = e.Usage
 		case types.AudioChunkEvent:
 			if s.gatewayAudio {
+				if gatewayAudioClosed {
+					break
+				}
 				audioBytes, err := base64.StdEncoding.DecodeString(e.Audio)
 				if err != nil {
 					if s.err == nil || errors.Is(s.err, io.EOF) {
@@ -224,6 +239,11 @@ streamLoop:
 				case <-s.done:
 					return
 				}
+			}
+		case types.AudioUnavailableEvent:
+			if s.gatewayAudio && !gatewayAudioClosed {
+				gatewayAudioClosed = true
+				closeAudioEvents()
 			}
 		}
 
@@ -328,6 +348,7 @@ func (s *Stream) Response() *types.MessageResponse {
 
 // Err returns any error that occurred during streaming.
 func (s *Stream) Err() error {
+	<-s.done
 	return s.err
 }
 

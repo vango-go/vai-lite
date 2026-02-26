@@ -120,7 +120,9 @@ func TestRunsCreate_RejectsClientFunctionTools(t *testing.T) {
 func TestRunsStream_ParsesEventCatalogAndNestedStreamEvents(t *testing.T) {
 	t.Parallel()
 
+	var gotAccept string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccept = r.Header.Get("Accept")
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeSSEJSON(t, w, "run_start", types.RunStartEvent{
 			Type:      "run_start",
@@ -205,6 +207,9 @@ func TestRunsStream_ParsesEventCatalogAndNestedStreamEvents(t *testing.T) {
 	}
 	if !sawNestedText {
 		t.Fatalf("expected nested stream_event text delta")
+	}
+	if gotAccept != "text/event-stream" {
+		t.Fatalf("Accept = %q, want %q", gotAccept, "text/event-stream")
 	}
 	if result := stream.Result(); result == nil || result.StopReason != types.RunStopReasonEndTurn {
 		t.Fatalf("unexpected stream result: %#v", result)

@@ -33,6 +33,8 @@ func (s *RunsService) Create(ctx context.Context, req *types.RunRequest) (*types
 
 	requestCopy := *req
 	requestCopy.Request.Stream = false
+	ctx, cancel := withDefaultGatewayTimeout(ctx)
+	defer cancel()
 
 	headers, err := s.client.buildGatewayHeaders(requestCopy.Request.Model, requestCopy.Request.Voice, false)
 	if err != nil {

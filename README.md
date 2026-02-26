@@ -3,19 +3,47 @@
 Minimal Vango AI Go SDK focused on:
 - Single-turn methods: `Messages.Create()`, `Messages.Stream()`, `Messages.CreateStream()`
 - `Messages.Run()` and `Messages.RunStream()`
+- Gateway server-run methods: `Runs.Create()` and `Runs.Stream()`
 - Tool execution + tool helpers (native tool normalization, `MakeTool`, `FuncAsTool`, `ToolSet`, etc.)
 
-This repo is **direct-mode only**: it runs in-process and calls providers directly. There is no proxy server or live mode.
+This repo supports two modes:
+- **Direct mode** (default): SDK calls providers directly.
+- **Proxy mode**: SDK calls a VAI Gateway (`/v1/messages`, `/v1/runs`, `/v1/runs:stream`) via `WithBaseURL(...)`.
 
 Cartesia non-live audio mode is supported through request `Voice` config:
-- Audio input blocks can be transcribed via STT before model invocation.
-- Output text can be synthesized to audio chunks/final audio.
+- Direct mode: SDK performs STT/TTS locally using Cartesia.
+- Proxy mode: SDK forwards `Voice` and audio blocks to gateway; gateway performs STT/TTS and streams `audio_chunk` events.
 
 ## Install
 
 ```bash
 go get github.com/vango-go/vai-lite/sdk
 ```
+
+## Client Modes
+
+### Direct mode (default)
+
+```go
+client := vai.NewClient(
+  vai.WithProviderKey("anthropic", "sk-ant-..."), // optional; env vars also supported
+)
+```
+
+### Proxy mode (gateway)
+
+```go
+client := vai.NewClient(
+  vai.WithBaseURL("https://api.vai.example.com"),
+  vai.WithGatewayAPIKey("vai_sk_..."),            // optional for self-host auth_mode=disabled
+  vai.WithProviderKey("anthropic", "sk-ant-..."), // BYOK header in proxy mode
+  vai.WithProviderKey("cartesia", "sk-cart-..."), // sent when Voice input/output is requested
+)
+```
+
+Notes:
+- In proxy mode, `WithProviderKey(...)` becomes source for `X-Provider-Key-*` BYOK headers.
+- Non-streaming proxy calls apply a default timeout if your context has no deadline; pass per-request context deadlines in production.
 
 ## Cartesia setup
 
@@ -157,6 +185,16 @@ for ev := range stream.Events() {
 ```
 
 `Run`/`RunStream` remain the primary agent APIs; voice mode is additive when `req.Voice` is set.
+
+## Client-side vs Server-side Runs
+
+- `Messages.Run()` / `Messages.RunStream()`:
+  - Client-side tool loop orchestration (SDK executes function tool handlers you register).
+  - Works in direct and proxy modes.
+- `Runs.Create()` / `Runs.Stream()`:
+  - Gateway server-side run loop (`/v1/runs` and `/v1/runs:stream`).
+  - Intended for provider-native tools and gateway-managed builtins.
+  - Caller function tools are rejected for server-run requests.
 
 ## Structured output
 

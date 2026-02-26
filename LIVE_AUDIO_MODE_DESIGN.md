@@ -195,7 +195,14 @@ Normative v1 guidance:
   "type": "hello",
   "protocol_version": "1",
   "client": {"name": "vai-js", "version": "0.1.0", "platform": "web"},
-  "auth": {"mode": "api_key"},
+  "auth": {"mode": "api_key", "gateway_api_key": "vai_sk_..."},
+  "byok": {
+    "anthropic": "sk-ant-...",
+    "openai": "sk-...",
+    "gemini": "sk-...",
+    "cartesia": "sk-car-...",
+    "elevenlabs": "sk-11l-..."
+  },
   "audio_in": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
   "audio_out": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
   "features": {
@@ -940,14 +947,18 @@ must be tuned with real traffic (latency, noise environments, voice choice, and 
 ## 13. Operational Concerns for a Hosted Gateway
 
 ### 13.1 Auth and tenancy
-- The gateway authenticates the client (API key / JWT).
-- The gateway stores per-tenant provider credentials (ElevenLabs API key, Cartesia key, etc.).
-- The gateway never forwards raw provider keys to clients.
+- The gateway authenticates the client (gateway API key / JWT).
+- **v1 is BYOK-first:** the client/SDK provides upstream provider keys (LLM + STT/TTS) to the gateway during the `hello`
+  handshake, and the gateway uses them only for the lifetime of the session.
+- The gateway never forwards raw provider keys to clients, and never echoes them in logs, errors, or telemetry.
+- Browser safety warning (v1): if a browser client connects directly to the gateway, BYOK keys provided in `hello` are
+  visible in the browser’s network inspector. For hosted use, prefer a backend relay or ship managed keys first.
+- Future (managed keys): the gateway MAY store per-tenant provider credentials so browser-direct Live becomes safe without
+  embedding provider keys in clients (align with “managed keys” in `GATEWAY_SPEC.md`).
 
 Fail-fast policy:
-- If the requested `voice_provider` is not configured for the tenant (missing credentials), the gateway should fail
-  fast during the handshake (e.g. `hello_ack` includes an explicit error, or a terminal error message is sent and the
-  socket is closed).
+- If required credentials are missing (gateway auth and/or required BYOK provider keys), the gateway should fail fast
+  during the handshake (e.g. send a terminal `error` and close).
 - Provider fallback should be explicit (tenant policy/config), not an implicit runtime surprise.
 
 ### 13.2 Tooling policy (live mode)
