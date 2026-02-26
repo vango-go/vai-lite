@@ -99,7 +99,8 @@ Strict behavior:
 ### 2.5 Strict unknown block handling
 
 Current behavior (`UnmarshalContentBlock`):
-- Unknown `type` returns `TextBlock{Type: <unknown>, Text: "[unknown block type: ...]"}`.
+- Unknown `type` returns an opaque `UnknownContentBlock{Type, Raw}` that preserves the original JSON payload for
+  forward compatibility (unknown blocks can round-trip through marshal/unmarshal without data loss).
 
 Strict request behavior:
 - Unknown block type is an error.

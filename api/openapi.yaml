@@ -125,11 +125,11 @@ paths:
                       role: assistant
                       model: anthropic/claude-sonnet-4
                       content: []
-                      stop_reason: end_turn
+                      stop_reason: ""
                       usage:
-                        input_tokens: 1
-                        output_tokens: 1
-                        total_tokens: 2
+                        input_tokens: 0
+                        output_tokens: 0
+                        total_tokens: 0
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -670,7 +670,7 @@ components:
             - type: string
             - type: array
               items:
-                $ref: "#/components/schemas/ContentBlock"
+                $ref: "#/components/schemas/RequestContentBlock"
         temperature:
           type: number
         top_p:
@@ -715,7 +715,7 @@ components:
             - type: string
             - type: array
               items:
-                $ref: "#/components/schemas/ContentBlock"
+                $ref: "#/components/schemas/RequestContentBlock"
 
     MessageResponse:
       type: object
@@ -734,7 +734,7 @@ components:
         content:
           type: array
           items:
-            $ref: "#/components/schemas/ContentBlock"
+            $ref: "#/components/schemas/ResponseContentBlock"
         stop_reason:
           $ref: "#/components/schemas/StopReason"
         stop_sequence:
@@ -747,9 +747,76 @@ components:
           type: object
           additionalProperties: true
 
+    MessageResponseShell:
+      type: object
+      required: [id, type, role, model, content]
+      description: |
+        Partial `MessageResponse` used at stream start (`message_start`).
+
+        At `message_start`, the assistant message is a shell and `stop_reason` is not yet known; it becomes available
+        later via `message_delta.delta.stop_reason`. Clients MUST NOT interpret `stop_reason` from `message_start`.
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          const: message
+        role:
+          type: string
+          const: assistant
+        model:
+          type: string
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResponseContentBlock"
+        stop_reason:
+          type: string
+          description: |
+            Stop reason is unknown at stream start and is finalized via `message_delta.delta.stop_reason`.
+            This field may be omitted or an empty string in `message_start`.
+        stop_sequence:
+          anyOf:
+            - type: string
+            - type: "null"
+        usage:
+          $ref: "#/components/schemas/Usage"
+        metadata:
+          type: object
+          additionalProperties: true
+
     StopReason:
       type: string
-      enum: [end_turn, max_tokens, stop_sequence, tool_use]
+      minLength: 1
+      description: |
+        Reason generation stopped.
+
+        Forward-compatible: treat this as an opaque string (new values may be added within `/v1`).
+
+        Known values (v1):
+        - `end_turn`
+        - `max_tokens`
+        - `stop_sequence`
+        - `tool_use`
+      examples: ["end_turn", "max_tokens", "stop_sequence", "tool_use"]
+
+    RunStopReason:
+      type: string
+      description: |
+        Reason a server-side run stopped.
+
+        Forward-compatible: treat this as an opaque string (new values may be added within `/v1`).
+
+        Known values (v1):
+        - `end_turn`
+        - `max_tool_calls`
+        - `max_turns`
+        - `max_tokens`
+        - `timeout`
+        - `cancelled`
+        - `error`
+        - `custom`
+      examples: ["end_turn", "max_tool_calls", "max_turns", "max_tokens", "timeout", "cancelled", "error", "custom"]
 
     Usage:
       type: object
@@ -775,8 +842,11 @@ components:
           minimum: 0
 
     # --- Content blocks ---
-    ContentBlock:
-      description: Typed content block with a `type` discriminator.
+    RequestContentBlock:
+      description: |
+        Typed content block with a `type` discriminator.
+
+        This schema is used for request bodies (strict-on-ingress): unknown content block types are rejected.
       oneOf:
         - $ref: "#/components/schemas/TextBlock"
         - $ref: "#/components/schemas/ImageBlock"
@@ -788,6 +858,30 @@ components:
         - $ref: "#/components/schemas/ThinkingBlock"
         - $ref: "#/components/schemas/ServerToolUseBlock"
         - $ref: "#/components/schemas/WebSearchToolResultBlock"
+
+    ContentBlock:
+      description: |
+        Typed content block with a `type` discriminator.
+
+        This schema is used for responses/streams (lenient-on-egress): unknown content block types may be added within
+        `/v1` and callers must treat them as opaque and ignore them if unsupported.
+      oneOf:
+        - $ref: "#/components/schemas/TextBlock"
+        - $ref: "#/components/schemas/ImageBlock"
+        - $ref: "#/components/schemas/AudioBlock"
+        - $ref: "#/components/schemas/VideoBlock"
+        - $ref: "#/components/schemas/DocumentBlock"
+        - $ref: "#/components/schemas/ToolUseBlock"
+        - $ref: "#/components/schemas/ToolResultBlock"
+        - $ref: "#/components/schemas/ThinkingBlock"
+        - $ref: "#/components/schemas/ServerToolUseBlock"
+        - $ref: "#/components/schemas/WebSearchToolResultBlock"
+        - $ref: "#/components/schemas/UnknownContentBlock"
+
+    ResponseContentBlock:
+      description: Alias of `ContentBlock` used to clarify response/stream contexts.
+      allOf:
+        - $ref: "#/components/schemas/ContentBlock"
 
     TextBlock:
       type: object
@@ -911,7 +1005,7 @@ components:
         content:
           type: array
           items:
-            $ref: "#/components/schemas/ContentBlock"
+            $ref: "#/components/schemas/RequestContentBlock"
         is_error:
           type: boolean
 
@@ -955,6 +1049,33 @@ components:
         title: { type: string }
         encrypted_content: { type: string }
         page_age: { type: string }
+
+    UnknownContentBlock:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: Unknown content block type.
+      additionalProperties: true
+      not:
+        properties:
+          type:
+            enum:
+              - text
+              - image
+              - audio
+              - video
+              - document
+              - tool_use
+              - tool_result
+              - thinking
+              - server_tool_use
+              - web_search_tool_result
+        required: [type]
+      description: |
+        Opaque content block used for forward compatibility in responses/streams.
+        Clients must ignore unknown block types (and unknown fields within known types) safely.
 
     # --- Tools ---
     Tool:
@@ -1208,6 +1329,7 @@ components:
         - $ref: "#/components/schemas/AudioChunkEvent"
         - $ref: "#/components/schemas/AudioUnavailableEvent"
         - $ref: "#/components/schemas/ErrorEvent"
+        - $ref: "#/components/schemas/UnknownMessageStreamEvent"
 
     StreamEvent:
       description: Provider-normalized stream event (identical schema to `MessageStreamEvent`).
@@ -1219,7 +1341,7 @@ components:
       required: [type, message]
       properties:
         type: { type: string, const: message_start }
-        message: { $ref: "#/components/schemas/MessageResponse" }
+        message: { $ref: "#/components/schemas/MessageResponseShell" }
 
     ContentBlockStartEvent:
       type: object
@@ -1227,7 +1349,7 @@ components:
       properties:
         type: { type: string, const: content_block_start }
         index: { type: integer, minimum: 0 }
-        content_block: { $ref: "#/components/schemas/ContentBlock" }
+        content_block: { $ref: "#/components/schemas/ResponseContentBlock" }
 
     ContentBlockDeltaEvent:
       type: object
@@ -1243,6 +1365,7 @@ components:
         - $ref: "#/components/schemas/TextDelta"
         - $ref: "#/components/schemas/InputJSONDelta"
         - $ref: "#/components/schemas/ThinkingDelta"
+        - $ref: "#/components/schemas/UnknownDelta"
 
     TextDelta:
       type: object
@@ -1264,6 +1387,50 @@ components:
       properties:
         type: { type: string, const: thinking_delta }
         thinking: { type: string }
+
+    UnknownDelta:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: Unknown delta type.
+      additionalProperties: true
+      not:
+        properties:
+          type:
+            enum: [text_delta, input_json_delta, thinking_delta]
+        required: [type]
+      description: |
+        Opaque delta used for forward compatibility. Clients must ignore unknown delta types safely.
+
+    UnknownMessageStreamEvent:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: Unknown `/v1/messages` SSE event type.
+      additionalProperties: true
+      not:
+        properties:
+          type:
+            enum:
+              - message_start
+              - content_block_start
+              - content_block_delta
+              - content_block_stop
+              - message_delta
+              - message_stop
+              - ping
+              - audio_chunk
+              - audio_unavailable
+              - error
+        required: [type]
+      description: |
+        Opaque SSE event used for forward compatibility. Clients must ignore unknown event types safely.
+        Maintenance: when adding new known `/v1/messages` SSE event types, also add them to the `not` exclusion list
+        above so `oneOf` validation remains correct.
 
     ContentBlockStopEvent:
       type: object
@@ -1407,8 +1574,7 @@ components:
         usage:
           $ref: "#/components/schemas/Usage"
         stop_reason:
-          type: string
-          enum: [end_turn, max_tool_calls, max_turns, max_tokens, timeout, cancelled, error, custom]
+          $ref: "#/components/schemas/RunStopReason"
         messages:
           type: array
           items:
@@ -1455,7 +1621,7 @@ components:
         content:
           type: array
           items:
-            $ref: "#/components/schemas/ContentBlock"
+            $ref: "#/components/schemas/ResponseContentBlock"
         is_error:
           type: boolean
         error:
@@ -1476,6 +1642,7 @@ components:
         - $ref: "#/components/schemas/RunCompleteEvent"
         - $ref: "#/components/schemas/RunPingEvent"
         - $ref: "#/components/schemas/RunErrorEvent"
+        - $ref: "#/components/schemas/UnknownRunStreamEvent"
 
     RunStartEvent:
       type: object
@@ -1522,7 +1689,7 @@ components:
         content:
           type: array
           items:
-            $ref: "#/components/schemas/ContentBlock"
+            $ref: "#/components/schemas/ResponseContentBlock"
         is_error:
           type: boolean
         error:
@@ -1575,6 +1742,34 @@ components:
         type: { type: string, const: error }
         error:
           $ref: "#/components/schemas/Error"
+
+    UnknownRunStreamEvent:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: Unknown `/v1/runs:stream` SSE event type.
+      additionalProperties: true
+      not:
+        properties:
+          type:
+            enum:
+              - run_start
+              - step_start
+              - stream_event
+              - tool_call_start
+              - tool_result
+              - step_complete
+              - history_delta
+              - run_complete
+              - ping
+              - error
+        required: [type]
+      description: |
+        Opaque SSE event used for forward compatibility. Clients must ignore unknown event types safely.
+        Maintenance: when adding new known `/v1/runs:stream` SSE event types, also add them to the `not` exclusion list
+        above so `oneOf` validation remains correct.
 
     # --- Models ---
     ModelsResponse:

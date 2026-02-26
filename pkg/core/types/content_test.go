@@ -208,6 +208,61 @@ func TestUnmarshalContentBlocks(t *testing.T) {
 	}
 }
 
+func TestUnmarshalContentBlock_Unknown_PreservesRaw(t *testing.T) {
+	input := `{"type":"new_future_block","foo":1,"bar":{"baz":true}}`
+
+	block, err := UnmarshalContentBlock([]byte(input))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+	if block.BlockType() != "new_future_block" {
+		t.Fatalf("BlockType=%q, want %q", block.BlockType(), "new_future_block")
+	}
+	if _, ok := block.(UnknownContentBlock); !ok {
+		t.Fatalf("expected UnknownContentBlock, got %T", block)
+	}
+
+	out, err := json.Marshal(block)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+	if string(out) != input {
+		t.Fatalf("raw mismatch: got %s want %s", string(out), input)
+	}
+}
+
+func TestUnmarshalContentBlock_Unknown_NestedInToolResult_PreservesRaw(t *testing.T) {
+	unknown := `{"type":"new_future_block","foo":1,"bar":{"baz":true}}`
+	input := `{"type":"tool_result","tool_use_id":"call_123","content":[` + unknown + `]}`
+
+	block, err := UnmarshalContentBlock([]byte(input))
+	if err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+	tr, ok := block.(ToolResultBlock)
+	if !ok {
+		t.Fatalf("expected ToolResultBlock, got %T", block)
+	}
+	if len(tr.Content) != 1 {
+		t.Fatalf("expected 1 nested block, got %d", len(tr.Content))
+	}
+	nested := tr.Content[0]
+	if nested.BlockType() != "new_future_block" {
+		t.Fatalf("nested BlockType=%q, want %q", nested.BlockType(), "new_future_block")
+	}
+	if _, ok := nested.(UnknownContentBlock); !ok {
+		t.Fatalf("expected nested UnknownContentBlock, got %T", nested)
+	}
+
+	out, err := json.Marshal(nested)
+	if err != nil {
+		t.Fatalf("Failed to marshal nested: %v", err)
+	}
+	if string(out) != unknown {
+		t.Fatalf("nested raw mismatch: got %s want %s", string(out), unknown)
+	}
+}
+
 func TestContentBlock_Interface(t *testing.T) {
 	// Verify all types implement ContentBlock
 	var _ ContentBlock = TextBlock{}
@@ -218,4 +273,5 @@ func TestContentBlock_Interface(t *testing.T) {
 	var _ ContentBlock = ToolResultBlock{}
 	var _ ContentBlock = ToolUseBlock{}
 	var _ ContentBlock = ThinkingBlock{}
+	var _ ContentBlock = UnknownContentBlock{}
 }

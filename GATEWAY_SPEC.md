@@ -528,6 +528,9 @@ event: message_stop
 data: {"type":"message_stop"}
 ```
 
+`message_start.message` is an initial shell. `stop_reason` is not yet known at stream start (it may be omitted or empty)
+and is finalized later via `message_delta.delta.stop_reason`.
+
 When voice output is enabled, the gateway also emits `audio_chunk` events interleaved with text events. See [10.3](#103-voice-output-tts-streaming).
 
 **Terminal events:**
@@ -733,7 +736,7 @@ This section does not duplicate the full live protocol; see `LIVE_AUDIO_MODE_DES
 The gateway's HTTP API contract is "JSON of `pkg/core/types`". To make this true in practice:
 
 - **Request bodies are strictly decoded.** Unknown content block types, incorrect union shapes, and malformed tool configs are rejected with actionable error messages.
-- **Provider responses remain leniently decoded.** Unknown provider-emitted block types are represented as placeholders or ignored (forward compatibility).
+- **Provider responses remain leniently decoded.** Unknown provider-emitted block types are represented as opaque blocks (forward compatibility).
 
 This means:
 - `UnmarshalContentBlockStrict` is used for request parsing (rejects unknowns).
@@ -1868,7 +1871,87 @@ flowchart LR
 - `api/openapi.yaml` covering all endpoints.
 
 **Phase 08: Go SDK Proxy Transport** — NOT STARTED
-- `WithBaseURL`, `WithGatewayAPIKey`, BYOK header mapping.
+- Objective: allow existing Go call sites to route through the hosted/self-hosted gateway with minimal code changes, while preserving today’s direct-mode behavior for local dev.
+- Public SDK options (additive, backwards compatible):
+  - `WithBaseURL(url string)` — enables proxy mode when set (route through gateway instead of calling providers directly).
+    - Must accept URLs with or without trailing slash and join paths safely (no `//v1/messages` bugs).
+  - `WithGatewayAPIKey(key string)` — sets `Authorization: Bearer <key>` for hosted (optional for self-host with `auth_mode=disabled`).
+  - `WithHTTPClient(*http.Client)` — allow callers to supply timeouts, custom transports, mTLS, proxies.
+  - Keep `WithProviderKey(provider, key)`:
+    - Direct mode: continues to override env vars for provider clients.
+    - Proxy mode: becomes the source of BYOK headers (the gateway receives the key; the SDK must not call providers directly).
+- Transport architecture (recommended approach):
+  - Implement a “gateway proxy provider” that satisfies `core.Provider` but sends requests to the gateway’s HTTP API.
+  - Register one proxy provider per provider prefix (`anthropic`, `openai`, `oai-resp`, `groq`, `cerebras`, `openrouter`, `gemini`, `gemini-oauth`, …) so existing model strings remain stable.
+    - This is required because `core.Engine` routes on the provider prefix and strips it before calling `Provider.CreateMessage/StreamMessage`; the proxy provider must reconstruct the full model string as `<provider>/<modelName>` for the gateway request.
+  - When proxy mode is enabled, skip direct-provider initialization and register the proxy providers instead (no accidental “half direct / half gateway” behavior).
+- HTTP request details (proxy mode):
+  - Endpoints:
+    - `POST /v1/messages` (non-stream + SSE) for single turns.
+    - `POST /v1/runs` and `POST /v1/runs:stream` for server-side runs (Phase 06 dependency).
+  - Required headers:
+    - `X-VAI-Version: 1` (explicit version negotiation; treat missing as v1-compatible but send it anyway).
+    - `Content-Type: application/json`.
+    - For SSE: `Accept: text/event-stream`.
+  - Auth headers:
+    - If configured: `Authorization: Bearer <gateway_api_key>`.
+    - Never log or return bearer tokens.
+  - BYOK headers (send only what’s required for the routed provider/model):
+    - Determine provider prefix from the *public* model string (before `core.Engine` strips it) and set the correct `X-Provider-Key-*` header per [3.3](#33-byok-provider-key-headers).
+    - Allow missing BYOK headers to support future managed keys (Phase 2); the gateway will return a canonical auth error if a key is required and missing.
+    - Never log or return BYOK header values.
+- Error handling (proxy mode):
+  - Non-streaming:
+    - On non-2xx: decode the HTTP error envelope into `core.Error` (same canonical inner error object as the gateway).
+    - If the body is not decodable, return an `api_error` with a safe message (do not echo raw body if it may contain secrets).
+    - If present, plumb `X-Request-Id` into the returned error’s `request_id` when the body omits it.
+  - Streaming:
+    - If the HTTP upgrade/response is non-2xx, decode the error envelope as above.
+    - If an SSE terminal `error` event is received, unmarshal the canonical error object and terminate the stream.
+  - Transport-level failures (DNS, timeouts, connection reset):
+    - Return a distinct transport error type so callers can distinguish retryable network failures from gateway API errors.
+- SSE implementation (proxy mode):
+  - Implement a robust SSE reader:
+    - Supports `event: <type>` + `data: <json>` framing.
+    - Supports multi-line `data:` concatenation (SSE spec compliant) and ignores comment lines (`:`).
+    - Ignores unknown event types (forward-compat), except terminal `error`.
+    - Honors context cancellation promptly (closing the response body stops the goroutine).
+  - `/v1/messages` streaming:
+    - Unmarshal `data` into `types.StreamEvent` using `types.UnmarshalStreamEvent`.
+    - Pings may be ignored; they must not break parsing.
+  - `/v1/runs:stream`:
+    - Add a `types.UnmarshalRunStreamEvent` helper (analogous to `UnmarshalStreamEvent`) that switches on `"type"` and unmarshals into the concrete structs in `pkg/core/types/run.go`.
+    - For `stream_event`, reuse `types.UnmarshalStreamEvent` for the nested provider event payload.
+- Voice behavior (proxy mode):
+  - Do **not** run local STT/TTS preprocessing/postprocessing in the SDK; forward `request.voice` and audio blocks to the gateway and let it apply the shared helpers.
+  - Non-streaming: accept gateway-appended audio blocks.
+  - Streaming: forward gateway-emitted `audio_chunk` and `audio_unavailable` events (do not synthesize audio client-side).
+- Run behavior in proxy mode (be explicit about tool execution locus):
+  - `/v1/runs` v1 supports provider-native tools and gateway-managed builtins only (no client-executed function tools; see [9.3](#93-client-executed-function-tools)).
+  - Recommended SDK strategy:
+    - Keep the existing client-side tool loop (`sdk/run.go`) available (direct mode and proxy mode).
+    - Add an explicit “server-run” option/path that calls `/v1/runs` and `/v1/runs:stream` when callers want gateway-managed builtins and do not need client-executed function tools.
+    - If a caller attempts a server-run while providing function tools/handlers, fail fast with a clear `invalid_request_error` explaining the constraint (do not silently fall back to client-side execution).
+- Test plan (SDK-focused; all should be hermetic using `httptest`):
+  - Header construction:
+    - `Authorization` present/absent behavior.
+    - `X-VAI-Version: 1` always set in proxy mode.
+    - Correct `X-Provider-Key-*` header selection based on model prefix (including shared-key cases like OpenAI + Responses API).
+  - URL/path joining edge cases (trailing slash, base path prefixes).
+  - `/v1/messages` non-streaming:
+    - Success decode into `types.MessageResponse`.
+    - Error decode into `core.Error` (including `request_id` plumbing).
+  - `/v1/messages` SSE:
+    - Parses real gateway framing (`event:` + `data:`), tolerates `ping`, ignores unknown event types, terminates on `error`.
+    - Voice stream includes `audio_chunk` and `audio_unavailable`.
+  - `/v1/runs` blocking:
+    - Decodes `types.RunResultEnvelope` and exposes stop reasons consistently.
+  - `/v1/runs:stream`:
+    - Parses `run_start`, `step_start`, `stream_event`, `tool_call_start`, `tool_result`, `history_delta`, `run_complete`, `error`.
+    - Validates that nested `stream_event.event` round-trips as a `types.StreamEvent`.
+- Exit criteria:
+  - An internal Go service switches from direct mode to gateway mode by setting `WithBaseURL(...)` + `WithGatewayAPIKey(...)` (and, in BYOK mode, `WithProviderKey(...)`), without changing request shapes.
+  - Streaming works reliably through a reverse proxy (verified at least once in staging; pings + cancellation behave as specified).
 
 **Phase 09: Live Audio Mode** — NOT STARTED
 - WebSocket endpoint, session orchestration.

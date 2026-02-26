@@ -2,7 +2,6 @@ package types
 
 import (
 	"encoding/json"
-	"fmt"
 )
 
 // ContentBlock is the interface for all content types.
@@ -175,6 +174,29 @@ type WebSearchResultEntry struct {
 	PageAge          string `json:"page_age,omitempty"`
 }
 
+// UnknownContentBlock is an opaque content block used for forward compatibility
+// when a provider emits a content block type unknown to this SDK version.
+//
+// When unmarshaled from JSON, Raw preserves the original JSON payload so it can
+// be re-emitted unchanged.
+type UnknownContentBlock struct {
+	Type string          `json:"type"`
+	Raw  json.RawMessage `json:"-"`
+}
+
+func (b UnknownContentBlock) BlockType() string { return b.Type }
+
+func (b UnknownContentBlock) MarshalJSON() ([]byte, error) {
+	if len(b.Raw) > 0 {
+		return copiedRaw(b.Raw), nil
+	}
+	return json.Marshal(struct {
+		Type string `json:"type"`
+	}{
+		Type: b.Type,
+	})
+}
+
 // UnmarshalContentBlock deserializes a content block from JSON.
 func UnmarshalContentBlock(data []byte) (ContentBlock, error) {
 	// First, determine the type
@@ -274,8 +296,10 @@ func UnmarshalContentBlock(data []byte) (ContentBlock, error) {
 		return block, nil
 
 	default:
-		// Return a generic text block for unknown types to avoid breaking on new Anthropic features
-		return TextBlock{Type: typeHolder.Type, Text: fmt.Sprintf("[unknown block type: %s]", typeHolder.Type)}, nil
+		return UnknownContentBlock{
+			Type: typeHolder.Type,
+			Raw:  copiedRaw(data),
+		}, nil
 	}
 }
 
