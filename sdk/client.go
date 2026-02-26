@@ -6,6 +6,7 @@ package vai
 
 import (
 	"log/slog"
+	"net/http"
 	"os"
 
 	"github.com/vango-go/vai-lite/pkg/core"
@@ -25,62 +26,80 @@ import (
 // Client is the main entry point for the SDK.
 type Client struct {
 	Messages *MessagesService
+	Runs     *RunsService
 
 	// Internal
 	core          *core.Engine
 	providerKeys  map[string]string
 	logger        *slog.Logger
 	voicePipeline *voice.Pipeline
+	httpClient    *http.Client
+	baseURL       string
+	gatewayAPIKey string
 }
 
-// NewClient creates a new client (direct mode only).
+// NewClient creates a new client.
 // Provider keys are loaded from env by default (e.g. ANTHROPIC_API_KEY).
 func NewClient(opts ...ClientOption) *Client {
 	c := &Client{
 		providerKeys: make(map[string]string),
 		logger:       slog.Default(),
+		httpClient:   &http.Client{},
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
+	if c.httpClient == nil {
+		c.httpClient = &http.Client{}
+	}
 
 	c.core = core.NewEngine(c.providerKeys)
-	c.initProviders()
-	c.initVoicePipeline()
+	if c.isProxyMode() {
+		c.initProxyProviders()
+	} else {
+		c.initProviders()
+		c.initVoicePipeline()
+	}
 
 	c.Messages = &MessagesService{client: c}
+	c.Runs = &RunsService{client: c}
 	return c
+}
+
+func (c *Client) isProxyMode() bool {
+	return c != nil && c.baseURL != ""
 }
 
 func (c *Client) initProviders() {
 	// Anthropic
 	if key := c.core.GetAPIKey("anthropic"); key != "" {
-		c.core.RegisterProvider(newAnthropicAdapter(anthropic.New(key)))
+		c.core.RegisterProvider(newAnthropicAdapter(anthropic.New(key, anthropic.WithHTTPClient(c.httpClient))))
 	}
 
 	// OpenAI Chat Completions + Responses (shared key)
 	if key := c.core.GetAPIKey("openai"); key != "" {
-		c.core.RegisterProvider(newOpenAIAdapter(openai.New(key)))
-		c.core.RegisterProvider(newOaiRespAdapter(oai_resp.New(key)))
+		c.core.RegisterProvider(newOpenAIAdapter(openai.New(key, openai.WithHTTPClient(c.httpClient))))
+		c.core.RegisterProvider(newOaiRespAdapter(oai_resp.New(key, oai_resp.WithHTTPClient(c.httpClient))))
 	}
 
 	// Groq
 	if key := c.core.GetAPIKey("groq"); key != "" {
-		c.core.RegisterProvider(newGroqAdapter(groq.New(key)))
+		c.core.RegisterProvider(newGroqAdapter(groq.New(key, groq.WithHTTPClient(c.httpClient))))
 	}
 
 	// Cerebras
 	if key := c.core.GetAPIKey("cerebras"); key != "" {
-		c.core.RegisterProvider(newCerebrasAdapter(cerebras.New(key)))
+		c.core.RegisterProvider(newCerebrasAdapter(cerebras.New(key, cerebras.WithHTTPClient(c.httpClient))))
 	}
 
 	// OpenRouter
 	if key := c.core.GetAPIKey("openrouter"); key != "" {
-		c.core.RegisterProvider(newOpenRouterAdapter(openrouter.New(key)))
+		c.core.RegisterProvider(newOpenRouterAdapter(openrouter.New(key, openrouter.WithHTTPClient(c.httpClient))))
 	}
 
 	// Gemini OAuth (optional; uses ~/.config/vango/gemini-oauth-credentials.json)
 	var geminiOAuthOpts []gemini_oauth.Option
+	geminiOAuthOpts = append(geminiOAuthOpts, gemini_oauth.WithHTTPClient(c.httpClient))
 	if projectID := os.Getenv("GEMINI_OAUTH_PROJECT_ID"); projectID != "" {
 		geminiOAuthOpts = append(geminiOAuthOpts, gemini_oauth.WithProjectID(projectID))
 	}
@@ -96,14 +115,17 @@ func (c *Client) initProviders() {
 		geminiKey = os.Getenv("GOOGLE_API_KEY")
 	}
 	if geminiKey != "" {
-		c.core.RegisterProvider(newGeminiAdapter(gemini.New(geminiKey)))
+		c.core.RegisterProvider(newGeminiAdapter(gemini.New(geminiKey, gemini.WithHTTPClient(c.httpClient))))
 	}
 }
 
 func (c *Client) initVoicePipeline() {
 	cartesiaKey := c.getCartesiaAPIKey()
 	if cartesiaKey != "" {
-		c.voicePipeline = voice.NewPipeline(cartesiaKey)
+		c.voicePipeline = voice.NewPipelineWithProviders(
+			stt.NewCartesiaWithClient(cartesiaKey, c.httpClient),
+			tts.NewCartesiaWithClient(cartesiaKey, c.httpClient),
+		)
 	}
 }
 
@@ -122,7 +144,7 @@ func (c *Client) getSTTProvider() stt.Provider {
 	if cartesiaKey == "" {
 		return nil
 	}
-	return stt.NewCartesia(cartesiaKey)
+	return stt.NewCartesiaWithClient(cartesiaKey, c.httpClient)
 }
 
 func (c *Client) getTTSProvider() tts.Provider {
@@ -133,7 +155,7 @@ func (c *Client) getTTSProvider() tts.Provider {
 	if cartesiaKey == "" {
 		return nil
 	}
-	return tts.NewCartesia(cartesiaKey)
+	return tts.NewCartesiaWithClient(cartesiaKey, c.httpClient)
 }
 
 // VoicePipeline returns the voice pipeline when initialized.

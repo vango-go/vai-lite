@@ -34,6 +34,12 @@ type (
 	// PingEvent is sent periodically to keep the connection alive.
 	PingEvent = types.PingEvent
 
+	// GatewayAudioChunkEvent is a gateway-emitted streaming audio payload.
+	GatewayAudioChunkEvent = types.AudioChunkEvent
+
+	// GatewayAudioUnavailableEvent signals that audio streaming is no longer available.
+	GatewayAudioUnavailableEvent = types.AudioUnavailableEvent
+
 	// ErrorEvent signals an error during streaming.
 	ErrorEvent = types.ErrorEvent
 )
@@ -79,6 +85,54 @@ type (
 
 // Other types
 type (
+	// ServerRunRequest is the request body for RunsService calls.
+	ServerRunRequest = types.RunRequest
+
+	// ServerRunConfig controls gateway-side run limits.
+	ServerRunConfig = types.RunConfig
+
+	// ServerRunResultEnvelope is the blocking /v1/runs response.
+	ServerRunResultEnvelope = types.RunResultEnvelope
+
+	// ServerRunResult is the terminal server-side run result.
+	ServerRunResult = types.RunResult
+
+	// ServerRunStep captures one server-side run step.
+	ServerRunStep = types.RunStep
+
+	// ServerRunEvent is an SSE event from /v1/runs:stream.
+	ServerRunEvent = types.RunStreamEvent
+
+	// ServerRunStartEvent marks run start.
+	ServerRunStartEvent = types.RunStartEvent
+
+	// ServerRunStepStartEvent marks step start.
+	ServerRunStepStartEvent = types.RunStepStartEvent
+
+	// ServerRunStreamEventWrapper wraps nested /v1/messages stream events.
+	ServerRunStreamEventWrapper = types.RunStreamEventWrapper
+
+	// ServerRunToolCallStartEvent marks builtin tool execution start.
+	ServerRunToolCallStartEvent = types.RunToolCallStartEvent
+
+	// ServerRunToolResultEvent contains builtin tool execution output.
+	ServerRunToolResultEvent = types.RunToolResultEvent
+
+	// ServerRunStepCompleteEvent marks step completion.
+	ServerRunStepCompleteEvent = types.RunStepCompleteEvent
+
+	// ServerRunHistoryDeltaEvent carries deterministic history updates.
+	ServerRunHistoryDeltaEvent = types.RunHistoryDeltaEvent
+
+	// ServerRunCompleteEvent marks terminal successful completion.
+	ServerRunCompleteEvent = types.RunCompleteEvent
+
+	// ServerRunPingEvent is a keepalive.
+	ServerRunPingEvent = types.RunPingEvent
+
+	// ServerRunErrorEvent is the terminal error event.
+	ServerRunErrorEvent = types.RunErrorEvent
+
 	// Usage contains token counts and cost information.
 	Usage = types.Usage
 

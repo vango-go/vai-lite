@@ -45,6 +45,12 @@ func withStreamVoiceOutput(ttsCtx *tts.StreamingContext, format, voice string) s
 	}
 }
 
+func withStreamGatewayAudioPassthrough() streamOption {
+	return func(s *Stream) {
+		s.gatewayAudio = true
+	}
+}
+
 // Stream wraps a streaming response from the Messages API.
 type Stream struct {
 	eventStream core.EventStream
@@ -57,6 +63,7 @@ type Stream struct {
 
 	userTranscript string
 	voiceOutput    *streamVoiceOutput
+	gatewayAudio   bool
 }
 
 // newStreamFromEventStream creates a Stream from a core.EventStream.
@@ -72,7 +79,7 @@ func newStreamFromEventStream(eventStream core.EventStream, opts ...streamOption
 	for _, opt := range opts {
 		opt(s)
 	}
-	if s.voiceOutput != nil {
+	if s.voiceOutput != nil || s.gatewayAudio {
 		s.audioEvents = make(chan AudioChunk, 100)
 	}
 
@@ -91,7 +98,7 @@ func (s *Stream) readEvents(events chan<- types.StreamEvent) {
 	defer close(s.done)
 
 	audioEvents := s.audioEvents
-	if s.voiceOutput != nil {
+	if s.voiceOutput != nil || s.gatewayAudio {
 		defer close(audioEvents)
 	}
 
@@ -203,6 +210,21 @@ streamLoop:
 		case types.MessageDeltaEvent:
 			response.StopReason = e.Delta.StopReason
 			response.Usage = e.Usage
+		case types.AudioChunkEvent:
+			if s.gatewayAudio {
+				audioBytes, err := base64.StdEncoding.DecodeString(e.Audio)
+				if err != nil {
+					if s.err == nil || errors.Is(s.err, io.EOF) {
+						s.err = fmt.Errorf("failed to decode gateway audio chunk: %w", err)
+					}
+					break
+				}
+				select {
+				case audioEvents <- AudioChunk{Data: audioBytes, Format: e.Format}:
+				case <-s.done:
+					return
+				}
+			}
 		}
 
 		// Don't block if stream is closed

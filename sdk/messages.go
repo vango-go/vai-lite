@@ -33,9 +33,15 @@ func (s *MessagesService) Create(ctx context.Context, req *MessageRequest) (*Res
 		return nil, fmt.Errorf("req must not be nil")
 	}
 
-	processedReq, userTranscript, err := s.preprocessVoiceInput(ctx, req)
-	if err != nil {
-		return nil, err
+	processedReq := req
+	userTranscript := ""
+
+	if !s.client.isProxyMode() {
+		var err error
+		processedReq, userTranscript, err = s.preprocessVoiceInput(ctx, req)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	resp, err := s.createTurn(ctx, processedReq)
@@ -50,8 +56,10 @@ func (s *MessagesService) Create(ctx context.Context, req *MessageRequest) (*Res
 		resp.Metadata["user_transcript"] = userTranscript
 	}
 
-	if err := s.appendVoiceOutput(ctx, req, resp.MessageResponse); err != nil {
-		return nil, err
+	if !s.client.isProxyMode() {
+		if err := s.appendVoiceOutput(ctx, req, resp.MessageResponse); err != nil {
+			return nil, err
+		}
 	}
 
 	return resp, nil
@@ -63,9 +71,15 @@ func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (*Str
 		return nil, fmt.Errorf("req must not be nil")
 	}
 
-	processedReq, userTranscript, err := s.preprocessVoiceInput(ctx, req)
-	if err != nil {
-		return nil, err
+	processedReq := req
+	userTranscript := ""
+
+	if !s.client.isProxyMode() {
+		var err error
+		processedReq, userTranscript, err = s.preprocessVoiceInput(ctx, req)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	reqCopy := *processedReq
@@ -77,7 +91,11 @@ func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (*Str
 	}
 
 	opts := []streamOption{withStreamUserTranscript(userTranscript)}
-	if req.Voice != nil && req.Voice.Output != nil {
+	if s.client.isProxyMode() {
+		if req.Voice != nil && req.Voice.Output != nil {
+			opts = append(opts, withStreamGatewayAudioPassthrough())
+		}
+	} else if req.Voice != nil && req.Voice.Output != nil {
 		if err := s.requireVoicePipeline(); err != nil {
 			return nil, err
 		}

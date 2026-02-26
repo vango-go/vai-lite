@@ -1,5 +1,11 @@
 package types
 
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
 // RunRequest is the request body for /v1/runs and /v1/runs:stream.
 type RunRequest struct {
 	Request  MessageRequest `json:"request"`
@@ -164,3 +170,289 @@ type RunErrorEvent struct {
 }
 
 func (e RunErrorEvent) EventType() string { return "error" }
+
+// UnknownRunStreamEvent is an opaque run-stream event used for forward compatibility.
+type UnknownRunStreamEvent struct {
+	Type string          `json:"type"`
+	Raw  json.RawMessage `json:"-"`
+}
+
+func (e UnknownRunStreamEvent) EventType() string { return e.Type }
+
+func (e UnknownRunStreamEvent) MarshalJSON() ([]byte, error) {
+	if len(e.Raw) > 0 {
+		return copiedRaw(e.Raw), nil
+	}
+	return json.Marshal(struct {
+		Type string `json:"type"`
+	}{
+		Type: e.Type,
+	})
+}
+
+// UnmarshalRunStreamEvent deserializes a /v1/runs:stream event from JSON.
+func UnmarshalRunStreamEvent(data []byte) (RunStreamEvent, error) {
+	var typeHolder struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &typeHolder); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(typeHolder.Type) == "" {
+		return nil, fmt.Errorf("missing run stream event type")
+	}
+
+	switch typeHolder.Type {
+	case "run_start":
+		var event RunStartEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
+	case "step_start":
+		var event RunStepStartEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
+	case "stream_event":
+		var raw struct {
+			Type  string          `json:"type"`
+			Event json.RawMessage `json:"event"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		nested, err := UnmarshalStreamEvent(raw.Event)
+		if err != nil {
+			return nil, err
+		}
+		return RunStreamEventWrapper{
+			Type:  raw.Type,
+			Event: nested,
+		}, nil
+
+	case "tool_call_start":
+		var event RunToolCallStartEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
+	case "tool_result":
+		var raw struct {
+			Type    string            `json:"type"`
+			ID      string            `json:"id"`
+			Name    string            `json:"name"`
+			Content []json.RawMessage `json:"content"`
+			IsError bool              `json:"is_error,omitempty"`
+			Error   *Error            `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		content, err := unmarshalContentBlocks(raw.Content)
+		if err != nil {
+			return nil, err
+		}
+		return RunToolResultEvent{
+			Type:    raw.Type,
+			ID:      raw.ID,
+			Name:    raw.Name,
+			Content: content,
+			IsError: raw.IsError,
+			Error:   raw.Error,
+		}, nil
+
+	case "step_complete":
+		var raw struct {
+			Type     string          `json:"type"`
+			Index    int             `json:"index"`
+			Response json.RawMessage `json:"response,omitempty"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		response, err := unmarshalOptionalMessageResponse(raw.Response)
+		if err != nil {
+			return nil, err
+		}
+		return RunStepCompleteEvent{
+			Type:     raw.Type,
+			Index:    raw.Index,
+			Response: response,
+		}, nil
+
+	case "history_delta":
+		var event RunHistoryDeltaEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
+	case "run_complete":
+		var raw struct {
+			Type   string          `json:"type"`
+			Result json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		result, err := unmarshalRunResult(raw.Result)
+		if err != nil {
+			return nil, err
+		}
+		return RunCompleteEvent{
+			Type:   raw.Type,
+			Result: result,
+		}, nil
+
+	case "ping":
+		var event RunPingEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
+	case "error":
+		var event RunErrorEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		return event, nil
+
+	default:
+		return UnknownRunStreamEvent{
+			Type: typeHolder.Type,
+			Raw:  copiedRaw(data),
+		}, nil
+	}
+}
+
+// UnmarshalRunResultEnvelope deserializes a blocking /v1/runs response.
+func UnmarshalRunResultEnvelope(data []byte) (*RunResultEnvelope, error) {
+	var raw struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	result, err := unmarshalRunResult(raw.Result)
+	if err != nil {
+		return nil, err
+	}
+	return &RunResultEnvelope{Result: result}, nil
+}
+
+func unmarshalRunResult(data []byte) (*RunResult, error) {
+	if isNullRaw(data) {
+		return nil, nil
+	}
+
+	var raw struct {
+		Response json.RawMessage `json:"response,omitempty"`
+		Steps    []struct {
+			Index       int               `json:"index"`
+			Response    json.RawMessage   `json:"response,omitempty"`
+			ToolCalls   []RunToolCall     `json:"tool_calls,omitempty"`
+			ToolResults []json.RawMessage `json:"tool_results,omitempty"`
+			DurationMS  int64             `json:"duration_ms"`
+		} `json:"steps"`
+		ToolCallCount int           `json:"tool_call_count"`
+		TurnCount     int           `json:"turn_count"`
+		Usage         Usage         `json:"usage"`
+		StopReason    RunStopReason `json:"stop_reason"`
+		Messages      []Message     `json:"messages,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+
+	response, err := unmarshalOptionalMessageResponse(raw.Response)
+	if err != nil {
+		return nil, err
+	}
+
+	steps := make([]RunStep, 0, len(raw.Steps))
+	for _, rawStep := range raw.Steps {
+		stepResponse, err := unmarshalOptionalMessageResponse(rawStep.Response)
+		if err != nil {
+			return nil, err
+		}
+
+		toolResults := make([]RunToolResult, 0, len(rawStep.ToolResults))
+		for _, rawToolResult := range rawStep.ToolResults {
+			tr, err := unmarshalRunToolResult(rawToolResult)
+			if err != nil {
+				return nil, err
+			}
+			toolResults = append(toolResults, tr)
+		}
+
+		steps = append(steps, RunStep{
+			Index:       rawStep.Index,
+			Response:    stepResponse,
+			ToolCalls:   rawStep.ToolCalls,
+			ToolResults: toolResults,
+			DurationMS:  rawStep.DurationMS,
+		})
+	}
+
+	return &RunResult{
+		Response:      response,
+		Steps:         steps,
+		ToolCallCount: raw.ToolCallCount,
+		TurnCount:     raw.TurnCount,
+		Usage:         raw.Usage,
+		StopReason:    raw.StopReason,
+		Messages:      raw.Messages,
+	}, nil
+}
+
+func unmarshalRunToolResult(data []byte) (RunToolResult, error) {
+	var raw struct {
+		ToolUseID string            `json:"tool_use_id"`
+		Content   []json.RawMessage `json:"content"`
+		IsError   bool              `json:"is_error,omitempty"`
+		Error     *Error            `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return RunToolResult{}, err
+	}
+	content, err := unmarshalContentBlocks(raw.Content)
+	if err != nil {
+		return RunToolResult{}, err
+	}
+	return RunToolResult{
+		ToolUseID: raw.ToolUseID,
+		Content:   content,
+		IsError:   raw.IsError,
+		Error:     raw.Error,
+	}, nil
+}
+
+func unmarshalContentBlocks(rawBlocks []json.RawMessage) ([]ContentBlock, error) {
+	content := make([]ContentBlock, 0, len(rawBlocks))
+	for _, blockRaw := range rawBlocks {
+		block, err := UnmarshalContentBlock(blockRaw)
+		if err != nil {
+			return nil, err
+		}
+		content = append(content, block)
+	}
+	return content, nil
+}
+
+func unmarshalOptionalMessageResponse(data []byte) (*MessageResponse, error) {
+	if isNullRaw(data) {
+		return nil, nil
+	}
+	return UnmarshalMessageResponse(data)
+}
+
+func isNullRaw(data []byte) bool {
+	trimmed := strings.TrimSpace(string(data))
+	return trimmed == "" || trimmed == "null"
+}

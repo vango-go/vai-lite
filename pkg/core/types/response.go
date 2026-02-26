@@ -1,6 +1,9 @@
 package types
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // MessageResponse is the response from the Messages API.
 type MessageResponse struct {
@@ -114,4 +117,44 @@ func (r *MessageResponse) UserTranscript() string {
 		}
 	}
 	return ""
+}
+
+// UnmarshalMessageResponse deserializes a MessageResponse, decoding content
+// blocks into concrete ContentBlock implementations.
+func UnmarshalMessageResponse(data []byte) (*MessageResponse, error) {
+	var raw struct {
+		ID           string            `json:"id"`
+		Type         string            `json:"type"`
+		Role         string            `json:"role"`
+		Model        string            `json:"model"`
+		Content      []json.RawMessage `json:"content"`
+		StopReason   StopReason        `json:"stop_reason"`
+		StopSequence *string           `json:"stop_sequence,omitempty"`
+		Usage        Usage             `json:"usage"`
+		Metadata     map[string]any    `json:"metadata,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+
+	content := make([]ContentBlock, 0, len(raw.Content))
+	for _, blockRaw := range raw.Content {
+		block, err := UnmarshalContentBlock(blockRaw)
+		if err != nil {
+			return nil, err
+		}
+		content = append(content, block)
+	}
+
+	return &MessageResponse{
+		ID:           raw.ID,
+		Type:         raw.Type,
+		Role:         raw.Role,
+		Model:        raw.Model,
+		Content:      content,
+		StopReason:   raw.StopReason,
+		StopSequence: raw.StopSequence,
+		Usage:        raw.Usage,
+		Metadata:     raw.Metadata,
+	}, nil
 }

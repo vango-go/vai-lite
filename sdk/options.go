@@ -1,6 +1,10 @@
 package vai
 
-import "log/slog"
+import (
+	"log/slog"
+	"net/http"
+	"strings"
+)
 
 // ClientOption configures a Client.
 type ClientOption func(*Client)
@@ -12,7 +16,36 @@ func WithProviderKey(provider, key string) ClientOption {
 		if c.providerKeys == nil {
 			c.providerKeys = make(map[string]string)
 		}
-		c.providerKeys[provider] = key
+		normalized := strings.ToLower(strings.TrimSpace(provider))
+		if normalized == "" {
+			return
+		}
+		c.providerKeys[normalized] = key
+	}
+}
+
+// WithBaseURL enables gateway proxy mode by routing SDK calls to the given base URL.
+// Supports values with or without trailing slash and optional base path prefix.
+func WithBaseURL(url string) ClientOption {
+	return func(c *Client) {
+		c.baseURL = strings.TrimSpace(url)
+	}
+}
+
+// WithGatewayAPIKey sets the gateway bearer token used in proxy mode.
+func WithGatewayAPIKey(key string) ClientOption {
+	return func(c *Client) {
+		c.gatewayAPIKey = strings.TrimSpace(key)
+	}
+}
+
+// WithHTTPClient sets the HTTP client used for proxy mode requests.
+// In direct mode, this client is also passed to provider clients when available.
+func WithHTTPClient(client *http.Client) ClientOption {
+	return func(c *Client) {
+		if client != nil {
+			c.httpClient = client
+		}
 	}
 }
 

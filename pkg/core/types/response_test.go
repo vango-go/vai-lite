@@ -122,3 +122,32 @@ func TestStopReason_Values(t *testing.T) {
 		}
 	}
 }
+
+func TestUnmarshalMessageResponse(t *testing.T) {
+	raw := []byte(`{
+		"id": "msg_1",
+		"type": "message",
+		"role": "assistant",
+		"model": "anthropic/claude-sonnet-4",
+		"content": [
+			{"type": "text", "text": "hello"},
+			{"type": "thinking", "thinking": "reasoning"}
+		],
+		"stop_reason": "end_turn",
+		"usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+	}`)
+
+	resp, err := UnmarshalMessageResponse(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalMessageResponse() error = %v", err)
+	}
+	if resp.ID != "msg_1" {
+		t.Fatalf("ID = %q, want %q", resp.ID, "msg_1")
+	}
+	if len(resp.Content) != 2 {
+		t.Fatalf("len(Content) = %d, want 2", len(resp.Content))
+	}
+	if got := resp.TextContent(); got != "hello" {
+		t.Fatalf("TextContent() = %q, want %q", got, "hello")
+	}
+}

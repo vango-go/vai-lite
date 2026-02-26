@@ -276,8 +276,9 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 
 	workingReq := *req
 	userTranscript := ""
+	proxyMode := s.client != nil && s.client.isProxyMode()
 
-	if req.Voice != nil && req.Voice.Input != nil {
+	if !proxyMode && req.Voice != nil && req.Voice.Input != nil {
 		processedReq, transcript, err := s.preprocessVoiceInput(ctx, req)
 		if err != nil {
 			return nil, err
@@ -285,7 +286,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 		workingReq = *processedReq
 		userTranscript = transcript
 	}
-	if req.Voice != nil && req.Voice.Output != nil {
+	if !proxyMode && req.Voice != nil && req.Voice.Output != nil {
 		if err := s.requireVoicePipeline(); err != nil {
 			return nil, err
 		}
@@ -310,7 +311,7 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 			}
 			resp.Metadata["user_transcript"] = userTranscript
 		}
-		if workingReq.Voice != nil && workingReq.Voice.Output != nil {
+		if !proxyMode && workingReq.Voice != nil && workingReq.Voice.Output != nil {
 			if err := s.appendVoiceOutput(ctx, &workingReq, resp.MessageResponse); err != nil {
 				return err
 			}
@@ -1054,12 +1055,13 @@ func (vs *runVoiceStreamer) Transcript() string {
 func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest, cfg *runConfig) *RunStream {
 	var prepErr error
 	var userTranscript string
+	proxyMode := s.client != nil && s.client.isProxyMode()
 
 	workingReq := req
-	if req != nil && req.Voice != nil && req.Voice.Input != nil {
+	if !proxyMode && req != nil && req.Voice != nil && req.Voice.Input != nil {
 		workingReq, userTranscript, prepErr = s.preprocessVoiceInput(ctx, req)
 	}
-	if prepErr == nil && req != nil && req.Voice != nil && req.Voice.Output != nil {
+	if !proxyMode && prepErr == nil && req != nil && req.Voice != nil && req.Voice.Output != nil {
 		prepErr = s.requireVoicePipeline()
 	}
 
@@ -1095,12 +1097,12 @@ func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest
 
 	go func() {
 		defer cancel()
-		rs.run(runCtx, s, workingReq, cfg, userTranscript)
+		rs.run(runCtx, s, workingReq, cfg, userTranscript, proxyMode)
 	}()
 	return rs
 }
 
-func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig, userTranscript string) {
+func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *MessageRequest, cfg *runConfig, userTranscript string, proxyMode bool) {
 	defer rs.finish()
 
 	result := &RunResult{
@@ -1120,7 +1122,7 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		defer cancel()
 	}
 
-	voiceEnabled := req.Voice != nil && req.Voice.Output != nil
+	voiceEnabled := !proxyMode && req.Voice != nil && req.Voice.Output != nil
 	var voiceStream *runVoiceStreamer
 	newVoiceStream := func() (*runVoiceStreamer, error) {
 		ttsCtx, err := svc.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice)
@@ -1378,7 +1380,7 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 					}
 
 					injectedMessage := intReq.message
-					if req.Voice != nil && req.Voice.Input != nil {
+					if !proxyMode && req.Voice != nil && req.Voice.Input != nil {
 						processed, transcript, err := svc.client.voicePipeline.ProcessInputAudio(ctx, []types.Message{injectedMessage}, req.Voice)
 						if err != nil {
 							intReq.result <- fmt.Errorf("transcribe interrupt audio: %w", err)
@@ -1437,6 +1439,19 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 				}
 
 				rs.send(StreamEventWrapper{Event: event})
+
+				if audioEvent, ok := event.(types.AudioChunkEvent); ok {
+					audioBytes, decodeErr := base64.StdEncoding.DecodeString(audioEvent.Audio)
+					if decodeErr != nil {
+						result.StopReason = RunStopError
+						result.Messages = snapshotHistory()
+						rs.result = result
+						rs.err = fmt.Errorf("decode audio chunk: %w", decodeErr)
+						stream.Close()
+						return
+					}
+					rs.send(AudioChunkEvent{Data: audioBytes, Format: audioEvent.Format})
+				}
 
 				// Track partial text content for potential interruption
 				if deltaEvent, ok := event.(types.ContentBlockDeltaEvent); ok {

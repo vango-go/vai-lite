@@ -1898,6 +1898,9 @@ flowchart LR
     - Never log or return bearer tokens.
   - BYOK headers (send only what’s required for the routed provider/model):
     - Determine provider prefix from the *public* model string (before `core.Engine` strips it) and set the correct `X-Provider-Key-*` header per [3.3](#33-byok-provider-key-headers).
+    - Voice BYOK headers are orthogonal to the model/provider:
+      - If `request.voice.input` and/or `request.voice.output` is set, and the caller configured a Cartesia key, the SDK MUST send `X-Provider-Key-Cartesia` regardless of which LLM provider is selected (because the gateway will perform STT/TTS).
+      - Future: Live mode may require `X-Provider-Key-ElevenLabs` for TTS; do not hardcode “only the LLM provider needs a key”.
     - Allow missing BYOK headers to support future managed keys (Phase 2); the gateway will return a canonical auth error if a key is required and missing.
     - Never log or return BYOK header values.
 - Error handling (proxy mode):
@@ -1929,7 +1932,8 @@ flowchart LR
 - Run behavior in proxy mode (be explicit about tool execution locus):
   - `/v1/runs` v1 supports provider-native tools and gateway-managed builtins only (no client-executed function tools; see [9.3](#93-client-executed-function-tools)).
   - Recommended SDK strategy:
-    - Keep the existing client-side tool loop (`sdk/run.go`) available (direct mode and proxy mode).
+    - Keep the existing client-side tool loop (`sdk/run.go`) available (direct mode and proxy mode); do not change the meaning of today’s `Messages.Run` / `Messages.RunStream` by default.
+    - Add a distinct, additive server-run surface (recommended: a new `Runs` service with `client.Runs.Create(...)` and `client.Runs.Stream(...)`) that calls `/v1/runs` and `/v1/runs:stream`.
     - Add an explicit “server-run” option/path that calls `/v1/runs` and `/v1/runs:stream` when callers want gateway-managed builtins and do not need client-executed function tools.
     - If a caller attempts a server-run while providing function tools/handlers, fail fast with a clear `invalid_request_error` explaining the constraint (do not silently fall back to client-side execution).
 - Test plan (SDK-focused; all should be hermetic using `httptest`):
