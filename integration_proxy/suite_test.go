@@ -104,6 +104,7 @@ func TestMain(m *testing.M) {
 		vai.WithBaseURL(gatewayBaseURL),
 		vai.WithProviderKey("openai", os.Getenv("OPENAI_API_KEY")),
 		vai.WithProviderKey("gemini", os.Getenv("GEMINI_API_KEY")),
+		vai.WithProviderKey("openrouter", os.Getenv("OPENROUTER_API_KEY")),
 	)
 	testCtx = context.Background()
 
@@ -127,6 +128,13 @@ func requireGeminiKey(t *testing.T) {
 	}
 }
 
+func requireOpenRouterKey(t *testing.T) {
+	t.Helper()
+	if strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")) == "" {
+		t.Skip("OPENROUTER_API_KEY not set")
+	}
+}
+
 func selectedProxyProviders(t *testing.T) []proxyProviderConfig {
 	t.Helper()
 
@@ -143,6 +151,12 @@ func selectedProxyProviders(t *testing.T) []proxyProviderConfig {
 			ModelEnv:     "VAI_INTEGRATION_GEMINI_MODEL",
 			RequireKey:   requireGeminiKey,
 		},
+		{
+			Name:         "openrouter",
+			DefaultModel: "openrouter/z-ai/glm-4.7",
+			ModelEnv:     "VAI_INTEGRATION_OPENROUTER_MODEL",
+			RequireKey:   requireOpenRouterKey,
+		},
 	}
 
 	filter := strings.ToLower(strings.TrimSpace(getenvDefault("VAI_INTEGRATION_PROXY_PROVIDER", "all")))
@@ -152,9 +166,11 @@ func selectedProxyProviders(t *testing.T) []proxyProviderConfig {
 	case "oai-resp", "oairesp", "oai", "openai":
 		return all[:1]
 	case "gemini":
-		return all[1:]
+		return []proxyProviderConfig{all[1]}
+	case "openrouter":
+		return []proxyProviderConfig{all[2]}
 	default:
-		t.Fatalf("unsupported VAI_INTEGRATION_PROXY_PROVIDER=%q (expected all|oai-resp|gemini)", filter)
+		t.Fatalf("unsupported VAI_INTEGRATION_PROXY_PROVIDER=%q (expected all|oai-resp|gemini|openrouter)", filter)
 		return nil
 	}
 }
