@@ -2600,7 +2600,7 @@ Scenarios:
 
 **Phase 09B: Live Audio Mode (WebSocket) — Production Tooling + ElevenLabs + Played-History Correctness** — NOT STARTED
 - Objective:
-  - Upgrade 9A into a production-grade Live experience: correct “played vs generated” history, realistic TTS (ElevenLabs), bounded tool usage, strong backpressure semantics, and operational safeguards for hosted use.
+  - Upgrade 9A into a production-grade Live experience: correct “played vs generated” history, explicit TTS provider selection (Cartesia or ElevenLabs), bounded tool usage, strong backpressure semantics, and operational safeguards for hosted use.
 - Full tool-loop integration (gateway-owned tools + deterministic history deltas):
   - Support a bounded set of gateway-managed tools during a live turn (in addition to `talk_to_user`):
     - Start with `vai_web_search` / `vai_web_fetch` (already present for `/v1/runs`) plus any other low-risk internal tools.
@@ -2612,14 +2612,15 @@ Scenarios:
   - Budgets:
     - `max_tool_calls_per_turn`, `tool_timeout_ms`, `run_timeout_ms` (turn-scoped) enforced strictly.
     - If budgets are exceeded, emit `warning` and force the model to resolve by calling `talk_to_user` with a concise apology/next step (or terminate the turn).
-- ElevenLabs “live” TTS integration (+ fallback policy):
+- ElevenLabs “live” TTS integration (explicit provider selection; no automatic fallback):
   - Add `pkg/core/voice/tts/elevenlabs.go` implementing `tts.Provider` streaming contexts with:
     - multi-context support (respect provider caps; e.g. context limit)
     - best-effort hard-stop on interrupt (close/cancel context)
     - optional alignment (`sync_alignment`) when available
-- Provider selection:
-    - Recommended baseline: ElevenLabs TTS, Cartesia STT (per `LIVE_AUDIO_MODE_DESIGN.md` §12.1), when credentials/policy allow.
-    - Explicit fallback to Cartesia TTS (tenant/session policy), never a silent runtime surprise.
+- Provider selection (explicit; no silent switching):
+    - The client selects the TTS provider explicitly via `hello.voice.provider` (`cartesia` or `elevenlabs`).
+    - The gateway MUST NOT silently switch providers mid-session or “fall back” automatically.
+    - If the selected provider’s required BYOK credential is missing, fail fast during the handshake with a clear error.
   - Keepalive rules for provider WS connections (avoid provider idle disconnect).
 - Credential resolution (Live mode, hosted-friendly):
   - Continue v1 BYOK-first: provider keys supplied by the client/SDK via `hello` and used only for the lifetime of the session.
@@ -2671,8 +2672,474 @@ Scenarios:
 - Exit criteria:
   - Production-grade correctness and UX:
     - interrupts stop assistant audio quickly and reliably; the model does not “remember” unheard text
-    - TTFA is within target for the default provider mix (measured, not assumed)
+    - TTFA is within target for the selected provider (measured, not assumed)
     - backpressure and limits prevent runaway resource usage under adversarial clients.
+
+## Phase 09B — Live Audio Mode (/v1/live): ElevenLabs + Played-History Correctness + Production Tooling
+
+### Summary
+Build on the existing `/v1/live` implementation to make Live Audio Mode production-correct and provider-flexible by adding:
+- Explicit, **required** TTS provider selection: `hello.voice.provider ∈ {"cartesia","elevenlabs"}`
+- **Strict handshake requirements** for ElevenLabs correctness:
+  - `hello.features.send_playback_marks=true` is **required** when `provider="elevenlabs"`
+  - ElevenLabs BYOK key is **required** when `provider="elevenlabs"`
+- **ElevenLabs Live TTS** (WS) with **normalized char alignment** emitted to clients on `assistant_audio_chunk(.alignment)`
+- **Played vs canonical history** with **interrupt truncation** using `playback_mark.played_ms` + alignment
+- **Barge-in anytime** while assistant audio is playing (not only grace)
+- Hosted-grade **bounded backpressure**: windowing on `unplayed_ms = sent_ms - played_ms`, deterministic `audio_reset{reason:"backpressure"}` behavior
+- **Opt-in `run_event`** message streaming (`hello.features.want_run_events=true`) using stable `types.RunStreamEvent` payloads (curated subset)
+
+Pre-launch assumption: breaking changes are acceptable; we will be strict and fail fast rather than guess defaults.
+
+---
+
+## 0) Scope (Phase 09B)
+
+### In scope
+- `/v1/live` protocol additions (additive in schema; strict validation can be breaking pre-launch)
+- ElevenLabs TTS integration (WS) with alignment normalization
+- Playback marks requirement (strict for ElevenLabs)
+- Played-history truncation logic and history selection for the next LLM call
+- Backpressure windowing using playback marks + PCM duration math
+- Opt-in `run_event` emission for live tool loop visibility
+- Hermetic tests including fake ElevenLabs WS server
+
+### Out of scope
+- Session resume (`resume.supported` remains false)
+- Cartesia TTS alignment/timestamps correlation (keep conservative for Cartesia)
+- Multiple concurrent assistant speech contexts (we keep one active assistant audio context at a time)
+- Browser-safe managed keys (still BYOK-first)
+
+---
+
+## 1) Public Protocol Changes (Wire Contract)
+
+### 1.1 `hello.voice.provider` (required)
+File: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/protocol/protocol.go`
+
+Add to `HelloVoice`:
+- `Provider string \`json:"provider,omitempty"\``
+
+Validation rules:
+- If missing/empty → reject session with `error{code:"bad_request", message:"voice.provider is required"}` and close.
+- If not `"cartesia"` or `"elevenlabs"` → reject with `error{code:"unsupported", param:"voice.provider"}` and close.
+
+### 1.2 `hello.features.want_run_events` (opt-in)
+Add to `HelloFeatures`:
+- `WantRunEvents bool \`json:"want_run_events,omitempty"\``
+
+Default false.
+
+### 1.3 ElevenLabs correctness requirement: playback marks must be enabled
+Handshake rule (enforced in handler; see §2.2):
+- If `hello.voice.provider=="elevenlabs"` then `hello.features.send_playback_marks` **must be true**.
+- If false/missing → reject session (terminal error + close). No “coarse mode” for ElevenLabs; we won’t claim correct truncation without playback marks.
+
+Error response:
+- `error{scope:"session", code:"bad_request", message:"send_playback_marks must be true when voice.provider is elevenlabs", close:true, details:{param:"features.send_playback_marks"}}`
+
+### 1.4 Server alignment fields on audio chunks
+File: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/protocol/protocol.go`
+
+Extend:
+- `ServerAssistantAudioChunk` with `Alignment *Alignment \`json:"alignment,omitempty"\``
+- `ServerAssistantAudioChunkHeader` with `Alignment *Alignment \`json:"alignment,omitempty"\`` (binary transport)
+- Add a new struct:
+```go
+type Alignment struct {
+  Kind        string   `json:"kind"`         // "char" in 9B
+  Normalized  bool     `json:"normalized"`   // true for ElevenLabs normalizedAlignment
+  Chars       []string `json:"chars"`
+  CharStartMS []int    `json:"char_start_ms"`
+  CharDurMS   []int    `json:"char_dur_ms"`
+}
+```
+
+### 1.5 hello_ack advertises alignment kind
+Extend `HelloAckFeatures`:
+- `AlignmentKind string \`json:"alignment_kind,omitempty"\``
+
+Rules:
+- If `provider="elevenlabs"`: `supports_alignment=true`, `alignment_kind="char"`
+- Else: `supports_alignment=false`, omit `alignment_kind`
+
+### 1.6 `run_event` server→client message (opt-in)
+Add in protocol:
+```go
+type ServerRunEvent struct {
+  Type   string          `json:"type"`    // "run_event"
+  TurnID int             `json:"turn_id"`
+  Event  json.RawMessage `json:"event"`   // JSON for a types.RunStreamEvent
+}
+```
+
+Contract:
+- Emitted only when `hello.features.want_run_events=true`.
+- Payload is always a single `types.RunStreamEvent` JSON object, *never provider-native deltas*.
+
+---
+
+## 2) /v1/live Handshake & Dependency Wiring
+
+### 2.1 Enforce explicit provider selection
+File: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/handlers/live.go`
+
+Add validations after decoding hello:
+- `hello.Voice != nil` already required; additionally require `voice.provider`.
+- Enforce:
+  - `provider="cartesia"`: requires Cartesia key (already required for STT/TTS baseline; in 9B still required for STT even if ElevenLabs TTS)
+  - `provider="elevenlabs"`: requires ElevenLabs key via `byokForProvider(hello.BYOK,"elevenlabs")`
+
+### 2.2 Enforce playback marks for ElevenLabs
+In `ServeHTTP` after `transport` negotiation and before `hello_ack`:
+- If `hello.Voice.Provider=="elevenlabs"` and `!hello.Features.SendPlaybackMarks`:
+  - send terminal session error and close (see §1.3)
+- Rationale: played-history correctness + backpressure math depend on playback marks.
+
+### 2.3 TTS provider selection wiring
+Refactor live handler + session deps to support multiple TTS providers with alignment:
+
+- Replace `session.TTSProvider` dependency with a new `session.LiveTTSProvider` (see §3).
+- Live handler will construct:
+  - `sttProvider` (Cartesia; unchanged)
+  - `liveTTSProvider`:
+    - Cartesia-live provider when `voice.provider=="cartesia"`
+    - ElevenLabs-live provider when `voice.provider=="elevenlabs"`
+
+Test hooks:
+- Update `LiveTTSFactory` signature in `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/handlers/live.go` accordingly so existing tests can inject fake TTS.
+
+### 2.4 hello_ack alignment flags
+Set `hello_ack.features.supports_alignment` and `alignment_kind` per §1.5 based on the negotiated TTS provider.
+
+---
+
+## 3) Live TTS Abstraction (alignment-aware, provider-specific stop semantics)
+
+### 3.1 New live TTS interfaces
+Add file: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/tts_live.go`
+
+Interfaces (decision-complete):
+- `LiveTTSProvider` exposes:
+  - `Name() string`
+  - `Capabilities() LiveTTSCaps` (alignment info)
+  - `NewConnection(ctx, cfg) (LiveTTSConnection, error)`
+- `LiveTTSConnection` exposes:
+  - `StartContext(ctx, contextID, settings) error`
+  - `SendText(ctx, contextID, text string, flush bool) error`
+  - `CloseContext(ctx, contextID) error`
+  - `Chunks() <-chan LiveTTSChunk` (audio + alignment + final markers)
+  - `Close() error`
+
+Constraints (enforced in session, not provider):
+- Only one active assistant context at a time (contextID == current `assistant_audio_id`).
+
+### 3.2 Cartesia-live implementation
+Add: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/tts_cartesia_live.go`
+
+Implementation decision:
+- Use existing `pkg/core/voice/tts.CartesiaProvider.NewStreamingContext` **per speech segment** (one WS per segment).
+- Emit `LiveTTSChunk{Audio:..., Alignment:nil}` from the underlying streaming context’s audio channel.
+- `CloseContext` closes the underlying WS to stop promptly.
+- No alignment support; `Capabilities.SupportsAlignment=false`.
+
+### 3.3 ElevenLabs-live implementation
+Add: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/tts_elevenlabs_live.go`
+
+Behavior:
+- One WS connection per live session.
+- Multi-context capable, but session uses only one at a time.
+- Dial URL:
+  - base configurable for tests (default ElevenLabs)
+  - path includes `voice_id`
+  - query params fixed for 9B defaults:
+    - `model_id=eleven_flash_v2_5`
+    - `output_format=pcm_24000`
+    - `sync_alignment=true`
+    - `apply_text_normalization=off` (if later configurable, still default off)
+    - `inactivity_timeout=60`
+- Auth:
+  - `xi-api-key` header
+
+Server message handling:
+- Audio chunk messages contain:
+  - `audio` (base64)
+  - `contextId` (string)
+  - `normalizedAlignment` (preferred; if absent but `alignment` present, we can map it with `normalized=false`)
+- Final message:
+  - `isFinal=true`, `contextId`
+- Convert `normalizedAlignment` to `protocol.Alignment{kind:"char", normalized:true,...}`:
+  - copy `chars`
+  - map `charStartTimesMs` → `char_start_ms`
+  - map `charDurationsMs` → `char_dur_ms`
+
+Client message handling:
+- `StartContext(contextID)`:
+  - send the required init: `{"text":" ","context_id":"<id>"}`
+- `SendText(contextID, text, flush)`:
+  - ensure trailing space when text is non-empty
+  - send `{"text":"... ","context_id":"<id>","flush":<flush>}`
+- `CloseContext(contextID)`:
+  - send `{"context_id":"<id>","close_context":true}`
+
+Keepalive:
+- While connection is open, every 15s send `{"text":"","context_id":"<active_id>"}` if an active context exists (and has not been closed).
+- (If no active context, no keepalive required; or optionally keep socket alive with a minimal ping if ElevenLabs requires it—decision: no keepalive without active context.)
+
+Capabilities:
+- `SupportsAlignment=true`, `AlignmentKind="char"`.
+
+---
+
+## 4) PlaybackTracker + HistoryManager (Played vs Canonical)
+
+### 4.1 New structures
+Add:
+- `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/playback.go`
+- `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/history.go`
+
+Maintain two histories:
+- `canonicalHistory []types.Message`:
+  - includes user utterances as committed
+  - includes full assistant speak text even if interrupted
+  - includes tool-use + tool-result messages for auditing (internal; not fed to model)
+- `playedHistory []types.Message`:
+  - includes user utterances (after grace consolidation)
+  - includes assistant speak text only when:
+    - segment finishes normally, or
+    - segment interrupted and truncated to “played text” using playback marks + alignment
+
+Model turn messages MUST be built from `playedHistory` only.
+
+### 4.2 Per-segment accounting
+Track a `SpeechSegment` per active `assistant_audio_id`:
+- `ID`
+- `FullText`
+- `SentSamples int64` (PCM16 mono samples actually forwarded)
+- `LastPlaybackMark protocol.ClientPlaybackMark`
+- `AlignmentAccum` (for ElevenLabs; nil for Cartesia)
+- `PendingFinalize bool`
+- `FinalizeDeadline time.Time` (now+`PlaybackStopWaitMS`)
+
+### 4.3 Computing `sent_ms` from PCM
+Given v1 audio_out is constrained to `pcm_s16le` mono 24000 Hz:
+- samples = `len(chunkBytes) / 2` (bytesPerSample=2)
+- `sent_ms = SentSamples * 1000 / 24000`
+
+This value is the canonical “server-sent duration” and is required for:
+- backpressure (`unplayed_ms`)
+- sanity clamping of played_ms
+
+### 4.4 Truncation using alignment (ElevenLabs)
+Implement:
+- `PlayedPrefix(playedMS int64) string`
+
+Algorithm (decision-complete):
+- Clamp `playedMS` to `[0, sent_ms]`.
+- If `AlignmentAccum` has consistent lengths:
+  - find the greatest index `i` where `start[i]+dur[i] <= playedMS`
+  - join `chars[:i+1]` to produce `played_text`
+- If no alignment:
+  - if playback state is `"finished"` → `played_text = FullText`
+  - else → `played_text = ""` (conservative)
+
+### 4.5 Finalization after `audio_reset`
+When we send `audio_reset` for a segment:
+- mark `PendingFinalize=true`
+- start a timer for `PlaybackStopWaitMS` (default 500ms)
+- finalize when either:
+  - we receive `playback_mark` for that `assistant_audio_id` with state `"stopped"` or `"finished"`, or
+  - the timer fires (use last known mark)
+
+Finalization step:
+- compute `played_text`
+- append `played_text` to `playedHistory` if non-empty
+- clear the segment
+
+---
+
+## 5) Session State Machine + Loop Integration Changes
+
+File: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/session.go`
+
+### 5.1 Separate “turn generation” from “speech streaming”
+Refactor the current `speakTurn` path so that:
+- LLM turn completes and yields `FullText` (already happens via `runTurn`)
+- Speech streaming is driven by the live TTS connection’s `Chunks()` channel, allowing:
+  - alignment capture
+  - sent_ms accounting
+  - backpressure enforcement
+  - immediate drop of late chunks after cancel/reset
+
+Decision: the session main select loop owns **all** `assistant_audio_chunk` sending and segment tracking.
+
+### 5.2 Barge-in anytime (speech-driven)
+Current 9A only interrupts on confirmed speech during grace; 9B adds:
+- If `activeAssistantID != ""` and `IsConfirmedSpeech(...)` becomes true from STT deltas:
+  - treat as barge-in interrupt immediately:
+    1) send `audio_reset{reason:"barge_in", assistant_audio_id}`
+    2) cancel TTS context (provider-specific close)
+    3) cancel active LLM context if still running
+    4) enter finalize-wait for stop mark (see §4.5)
+- Client-triggered `control.op="interrupt"` remains supported and should short-circuit (it is the “fastest” path for SDKs).
+
+### 5.3 Grace period semantics (unchanged, but now works with played-history)
+While grace is active:
+- confirmed speech cancels the run + assistant output (same as before)
+- additionally:
+  - perform segment interrupt finalization with truncation (played-history)
+  - replace last committed user message in both `playedHistory` and `canonicalHistory` by searching from end for the most recent user message and updating it (do not rely on shared indices)
+
+### 5.4 Tool loop budgets and timeouts (turn-scoped)
+Add to session config:
+- `MaxToolCallsPerTurn` (default 5)
+- `ToolTimeout` (default 10s)
+- `MaxModelCallsPerTurn` (default 8)
+- `TurnTimeout` already exists (default 30s), remains overall cap
+
+Tool loop behavior in `runTurn` (decision-complete):
+- Keep existing server-tools + talk_to_user loop structure, but enforce:
+  - reject tool plans that include both talk_to_user + other tools (warn + safe apology)
+  - enforce `MaxToolCallsPerTurn` and `MaxModelCallsPerTurn`
+  - per-tool timeout = `min(ToolTimeout, remainingTurnTime)`
+- Turn failure UX:
+  - emit `warning` (code depends on failure: `tool_budget_exceeded`, `tool_timeout`, `tool_plan_invalid`, `provider_error`)
+  - produce a short apology speak text for the user (still goes through TTS)
+
+### 5.5 `talk_to_user` terminal semantics (explicit)
+In live mode:
+- when `talk_to_user` is detected (early input_json_delta parsing or final tool_use), the turn ends immediately.
+- No second model call after speaking begins.
+
+### 5.6 `run_event` emission (opt-in, curated)
+If `hello.features.want_run_events=true`:
+- Emit `run_event` for these `types.RunStreamEvent` only:
+  - `run_start`, `step_start`
+  - `tool_call_start`, `tool_result`
+  - `step_complete`, `history_delta`
+  - `run_complete`, `error`
+- Do **not** emit provider `stream_event` deltas (too noisy/provider-shaped).
+- Tool result payload size:
+  - enforce a hard cap (e.g. 16KB JSON) for `tool_result.content` in run_event; if larger, replace with a single text block: `"(tool result omitted: too large)"` and include `details{truncated:true, original_bytes:n}` in a parallel `warning` if needed.
+
+---
+
+## 6) Backpressure (Hosted-Grade, Deterministic, Bounded Memory)
+
+### 6.1 Unplayed windowing (requires playback marks; strict for ElevenLabs)
+For active segment:
+- `played_ms` from latest `playback_mark` for `assistant_audio_id` (default 0 if none)
+- `sent_ms` from PCM accounting
+- `unplayed_ms = sent_ms - played_ms`
+
+If `unplayed_ms > LiveMaxUnplayedMS` (default 2500ms):
+1) cancel/close provider context
+2) send `audio_reset{reason:"backpressure", assistant_audio_id}`
+3) finalize played-history using last known mark (and stop-wait window)
+4) continue session (return to listening)
+
+### 6.2 Repeated backpressure escalation
+Config:
+- `MaxBackpressureResetsPerMinute` (default 3)
+
+If exceeded:
+- send terminal `error{code:"rate_limited", message:"client cannot keep up with audio playback"}` and close
+
+### 6.3 Bounded outbound queues (still required)
+Keep bounded `outboundNormal` / `outboundPriority` behavior.
+On enqueue backpressure (`errBackpressure`):
+- treat as backpressure condition:
+  - send `audio_reset{reason:"backpressure"}`
+  - cancel context + run
+  - apply escalation counter as above
+
+---
+
+## 7) Config Additions
+
+File: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/config/config.go`
+
+Add env vars + config fields:
+- `VAI_PROXY_LIVE_MAX_UNPLAYED_MS` (default `2500ms`)
+- `VAI_PROXY_LIVE_PLAYBACK_STOP_WAIT_MS` (default `500ms`)
+- `VAI_PROXY_LIVE_TOOL_TIMEOUT` (default `10s`)
+- `VAI_PROXY_LIVE_MAX_TOOL_CALLS_PER_TURN` (default `5`)
+- `VAI_PROXY_LIVE_MAX_MODEL_CALLS_PER_TURN` (default `8`)
+- `VAI_PROXY_LIVE_MAX_BACKPRESSURE_RESETS_PER_MIN` (default `3`)
+- (Optional for tests) `VAI_PROXY_LIVE_ELEVENLABS_WS_BASE_URL` (default empty; use constant in code unless set)
+
+Pass these into `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/session.go` config struct.
+
+---
+
+## 8) Tests (Hermetic, Useful, Race-Safe)
+
+### 8.1 Protocol tests
+File: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/protocol/protocol_test.go`
+- `hello.voice.provider` required + valid enum
+- `hello.features.want_run_events` decoding
+- `assistant_audio_chunk` alignment marshal/unmarshal
+
+### 8.2 Handler handshake tests
+File: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/handlers/live_test.go`
+- Missing `voice.provider` → session error + close
+- `provider="elevenlabs"` but no ElevenLabs BYOK → unauthorized + close
+- `provider="elevenlabs"` but `send_playback_marks=false` → bad_request + close
+- `provider="cartesia"` works without ElevenLabs BYOK and without playback marks
+
+### 8.3 Fake ElevenLabs WS contract tests
+Add: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/tts_elevenlabs_live_test.go`
+- Fake WS server sends audio + normalizedAlignment + isFinal
+- Assert adapter emits chunks with `Alignment.Kind="char"` and `Normalized=true`
+
+### 8.4 Played-history truncation tests
+Add: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/live/session/playback_test.go`
+- Alignment-based truncation correctness (off-by-one, clamp)
+- No alignment + finished/stopped states behavior
+
+### 8.5 End-to-end interrupt truncation test (WS)
+Extend: `/Users/collinshill/Documents/projects/vai-lite/pkg/gateway/handlers/live_test.go`
+Scenario:
+1) Start session with `provider="elevenlabs"` and playback marks enabled
+2) Trigger a turn that speaks a known text with alignment
+3) Send playback marks indicating partial play
+4) Trigger barge-in (either `control.interrupt` or STT-confirmed speech)
+5) Assert:
+   - `audio_reset` emitted quickly
+   - no stale chunks after reset for that assistant_audio_id
+   - next LLM call messages include truncated assistant content (validate captured `MessageRequest.Messages` in fake provider)
+
+### 8.6 Backpressure windowing test
+- Simulate client that never advances `played_ms` while server sends enough audio to exceed `MaxUnplayedMS`
+- Expect `audio_reset{reason:"backpressure"}`
+- Verify escalation after N resets within a minute closes session
+
+Run all with `go test -race ./...`.
+
+---
+
+## 9) Acceptance Criteria (Phase 09B Done)
+- `hello.voice.provider` is required; no silent TTS provider switching or implicit fallback.
+- For `provider="elevenlabs"`:
+  - handshake requires ElevenLabs BYOK + `send_playback_marks=true`
+  - `hello_ack.features.supports_alignment=true` and `alignment_kind="char"`
+  - `assistant_audio_chunk` includes normalized char alignment
+- Barge-in works anytime assistant audio is active:
+  - immediate `audio_reset`
+  - provider context stops (best-effort) and late chunks are dropped
+  - played-history truncation reflects `played_ms` and alignment; next LLM call uses `playedHistory`
+- Backpressure is bounded using `unplayed_ms` windowing and deterministic resets; repeated failure closes session.
+- `run_event` messages are emitted only when opted-in and contain only curated stable `types.RunStreamEvent` payloads (no provider deltas, no secrets).
+
+---
+
+## Assumptions / Defaults (Locked)
+- Live STT is Cartesia-only in 9B (Cartesia BYOK always required).
+- `audio_out` is PCM16LE mono 24kHz; `sent_ms` math depends on it.
+- Only one assistant speech segment is active at a time.
+- ElevenLabs defaults: `eleven_flash_v2_5`, `pcm_24000`, `sync_alignment=true`, `apply_text_normalization=off`, `inactivity_timeout=60`.
+- Resume remains unsupported (`hello_ack.resume.supported=false`).
+
 
 **Phase 10: TypeScript SDK** — NOT STARTED
 - Thin client targeting `/v1/messages` and `/v1/runs`.
