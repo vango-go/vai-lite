@@ -203,6 +203,30 @@ func TestParseResponse_MapsOutputItemsAndUsageMetadata(t *testing.T) {
 	}
 }
 
+func TestParseResponse_AcceptsTextContentTypeText(t *testing.T) {
+	p := &Provider{}
+	body := []byte(`{
+		"id":"resp_123",
+		"model":"gpt-5-mini",
+		"status":"completed",
+		"output":[
+			{
+				"type":"message",
+				"content":[{"type":"text","text":"pong"}]
+			}
+		],
+		"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+	}`)
+
+	resp, err := p.parseResponse(body, nil)
+	if err != nil {
+		t.Fatalf("parseResponse() error = %v", err)
+	}
+	if got := resp.TextContent(); got != "pong" {
+		t.Fatalf("TextContent()=%q, want %q", got, "pong")
+	}
+}
+
 func TestValidateRequest_RejectsStopSequences(t *testing.T) {
 	p := &Provider{}
 	err := p.validateRequest(&types.MessageRequest{

@@ -8,6 +8,29 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
+func extractText(raw json.RawMessage) string {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+
+	// Some API variants wrap the text in an object. Try common field names.
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		for _, key := range []string{"value", "text", "content"} {
+			if v, ok := obj[key].(string); ok {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
 // parseResponse converts an OpenAI Responses API response to Vango format.
 func (p *Provider) parseResponse(body []byte, reqExtensions map[string]any) (*types.MessageResponse, error) {
 	var respResp responsesResponse
@@ -32,19 +55,27 @@ func (p *Provider) parseResponse(body []byte, reqExtensions map[string]any) (*ty
 			// Extract text content from message items
 			for _, c := range item.Content {
 				switch c.Type {
-				case "output_text":
-					if c.Text != "" {
+				case "text":
+					// OpenAI sometimes emits "text" instead of "output_text" depending on model/API version.
+					if text := extractText(c.Text); text != "" {
 						content = append(content, types.TextBlock{
 							Type: "text",
-							Text: c.Text,
+							Text: text,
+						})
+					}
+				case "output_text":
+					if text := extractText(c.Text); text != "" {
+						content = append(content, types.TextBlock{
+							Type: "text",
+							Text: text,
 						})
 					}
 				case "refusal":
 					// Handle refusal as text
-					if c.Text != "" {
+					if text := extractText(c.Text); text != "" {
 						content = append(content, types.TextBlock{
 							Type: "text",
-							Text: "[Refusal] " + c.Text,
+							Text: "[Refusal] " + text,
 						})
 					}
 				}
@@ -156,11 +187,13 @@ func (p *Provider) parseResponse(body []byte, reqExtensions map[string]any) (*ty
 	}
 
 	// If no text content was extracted from output items, check the output_text helper field
-	if !hasTextContent(content) && respResp.OutputText != "" {
-		content = append([]types.ContentBlock{types.TextBlock{
-			Type: "text",
-			Text: respResp.OutputText,
-		}}, content...)
+	if !hasTextContent(content) {
+		if helperText := extractText(respResp.OutputText); helperText != "" {
+			content = append([]types.ContentBlock{types.TextBlock{
+				Type: "text",
+				Text: helperText,
+			}}, content...)
+		}
 	}
 
 	// Build response extensions to include response_id for state management

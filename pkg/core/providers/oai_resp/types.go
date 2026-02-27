@@ -134,7 +134,7 @@ type responsesResponse struct {
 	IncompleteDetails  *incompleteDetails `json:"incomplete_details,omitempty"`
 	Model              string             `json:"model"`
 	Output             []outputItem       `json:"output"`
-	OutputText         string             `json:"output_text"` // helper field with full text
+	OutputText         json.RawMessage    `json:"output_text,omitempty"` // helper field with full text (string or object in some variants)
 	Usage              responsesUsage     `json:"usage"`
 	Error              *responsesError    `json:"error,omitempty"`
 	PreviousResponseID string             `json:"previous_response_id,omitempty"`
@@ -241,9 +241,9 @@ func (o *outputItem) UnmarshalJSON(data []byte) error {
 
 // outputContent represents content within a message output.
 type outputContent struct {
-	Type        string       `json:"type"` // "output_text", "refusal"
-	Text        string       `json:"text,omitempty"`
-	Annotations []annotation `json:"annotations,omitempty"`
+	Type        string          `json:"type"`           // "output_text", "text", "refusal"
+	Text        json.RawMessage `json:"text,omitempty"` // string or object depending on API variant
+	Annotations []annotation    `json:"annotations,omitempty"`
 }
 
 // annotation represents an annotation in output text.

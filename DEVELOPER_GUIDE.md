@@ -32,6 +32,8 @@ This repo intentionally **does not** include:
 - Standalone audio service endpoints (`client.Audio.*`)
 - Additional gateway SDK surfaces beyond messages + runs in this phase
 
+Note: the **gateway** in this repo (`cmd/vai-proxy`) *does* implement Live Audio Mode at `GET /v1/live` (WebSocket). The SDK does not yet ship a `Live` client wrapper.
+
 ---
 
 ## Table of Contents
@@ -71,7 +73,7 @@ This repo intentionally **does not** include:
   - [11.1 Integration provider filtering + reliability controls](#111-integration-provider-filtering--reliability-controls)
   - [11.2 CI release gate workflow](#112-ci-release-gate-workflow)
 - [12. Gotchas and Design Notes](#12-gotchas-and-design-notes)
-- [13. WIP: Live Audio Mode (Proxy WebSocket)](#13-wip-live-audio-mode-proxy-websocket)
+- [13. Live Audio Mode (Gateway WebSocket)](#13-live-audio-mode-gateway-websocket)
   - [13.1 Goals](#131-goals)
   - [13.2 Core semantics](#132-core-semantics)
   - [13.3 `talk_to_user(text)` terminal tool](#133-talk_to_usertext-terminal-tool)
@@ -1109,9 +1111,9 @@ For OpenAI-compatible Chat Completions providers, prefer composing `pkg/core/pro
 
 ---
 
-## 13. WIP: Live Audio Mode (Proxy WebSocket)
+## 13. Live Audio Mode (Gateway WebSocket)
 
-This section documents a **work-in-progress design** for a hosted “VAI gateway” that exposes a **live audio WebSocket endpoint** built around the same fundamental loop semantics as `RunStream`.
+This section documents the Live Audio Mode WebSocket implemented by the gateway binary (`cmd/vai-proxy`) at `GET /v1/live`.
 
 Canonical design doc (more detailed): `LIVE_AUDIO_MODE_DESIGN.md`.
 
@@ -1135,6 +1137,60 @@ Canonical design doc (more detailed): `LIVE_AUDIO_MODE_DESIGN.md`.
 - **Noise vs real speech:** the gateway must not cancel the assistant due to noise/echo-only activity; it should require “confirmed speech” before cancelling during grace/interrupt detection.
 - **User timestamps:** user messages should carry the timestamp of when the user finished speaking (session-relative `end_ms`).
 - **Timebase:** client timestamps should be session-relative and monotonic (see `LIVE_AUDIO_MODE_DESIGN.md`).
+
+### 13.2.1 Handshake requirements (v1 / Phase 9B)
+
+The first client frame MUST be `hello` (JSON text). The gateway is strict here and will close the session on invalid shapes.
+
+Required fields (minimum):
+- `hello.protocol_version="1"`
+- `hello.model` (`provider/model`)
+- `hello.audio_in` must be `pcm_s16le @ 16000 Hz mono`
+- `hello.audio_out` must be `pcm_s16le @ 24000 Hz mono`
+- `hello.voice.voice_id` (provider voice id; meaning depends on `hello.voice.provider`)
+- `hello.voice.provider` must be one of:
+  - `cartesia`
+  - `elevenlabs`
+
+Credentials (BYOK, in-band in `hello.byok`):
+- LLM provider key is required for the selected `hello.model` provider (for example `anthropic` / `openai` / `gemini`).
+- Cartesia key is required for STT in v1 (Live STT is Cartesia-only): `hello.byok.cartesia`.
+- If `hello.voice.provider="elevenlabs"`:
+  - `hello.byok.elevenlabs` is required.
+  - `hello.features.send_playback_marks` MUST be `true` (the gateway will not claim correct played-history truncation without marks).
+
+Optional feature flags:
+- `hello.features.want_run_events=true` enables server→client `run_event` frames (curated `types.RunStreamEvent` payloads; no provider delta spam).
+
+Example `hello` (Cartesia TTS):
+```json
+{
+  "type": "hello",
+  "protocol_version": "1",
+  "model": "anthropic/claude-sonnet-4",
+  "auth": {"mode": "api_key", "gateway_api_key": "vai_sk_..."},
+  "byok": {"anthropic": "sk-ant-...", "cartesia": "sk-car-..."},
+  "audio_in": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
+  "audio_out": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+  "voice": {"provider": "cartesia", "voice_id": "cartesia_voice_id", "language": "en"},
+  "features": {"audio_transport": "binary", "want_partial_transcripts": true, "want_assistant_text": true, "client_has_aec": true}
+}
+```
+
+Example `hello` (ElevenLabs TTS):
+```json
+{
+  "type": "hello",
+  "protocol_version": "1",
+  "model": "anthropic/claude-sonnet-4",
+  "auth": {"mode": "api_key", "gateway_api_key": "vai_sk_..."},
+  "byok": {"anthropic": "sk-ant-...", "cartesia": "sk-car-...", "elevenlabs": "sk-11l-..."},
+  "audio_in": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
+  "audio_out": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+  "voice": {"provider": "elevenlabs", "voice_id": "eleven_voice_id", "language": "en"},
+  "features": {"audio_transport": "binary", "send_playback_marks": true, "want_partial_transcripts": true, "want_assistant_text": true, "client_has_aec": true}
+}
+```
 
 ### 13.3 `talk_to_user(text)` terminal tool
 
@@ -1170,6 +1226,10 @@ Design approach:
 - If the TTS provider exposes alignment/timestamps, the gateway can truncate the assistant text at the corresponding character/word boundary; otherwise it falls back to coarse truncation (drop the unfinished segment).
 - Backpressure must be bounded: if the client falls behind and unplayed audio grows beyond a threshold, the gateway should stop/close the active speech context and emit `audio_reset{reason:"backpressure"}`.
 
+Implementation notes (current gateway behavior):
+- Playback-mark windowing is enforced only when `hello.features.send_playback_marks=true`.
+- For `voice.provider="elevenlabs"`, marks are required at handshake (so windowing is always enabled).
+
 ### 13.5 Provider notes (ElevenLabs + Cartesia)
 
 #### ElevenLabs TTS (multi-context WebSocket)
@@ -1178,6 +1238,10 @@ ElevenLabs provides:
 - per-context synthesis over a single socket (`context_id`)
 - base64 `audio` chunks
 - `alignment` and `normalizedAlignment` when `sync_alignment=true` (character-level timing)
+
+Gateway notes:
+- The gateway uses one active assistant speech context at a time (even though ElevenLabs can multiplex multiple contexts).
+- When ElevenLabs is selected, `hello_ack.features.supports_alignment=true` and `assistant_audio_chunk(.alignment)` is populated with the gateway’s normalized char alignment shape.
 
 Important casing notes (per their AsyncAPI):
 - Client messages: `context_id` (snake_case)
@@ -1224,12 +1288,23 @@ These are *recommended starting points* for a live gateway; validate against rea
   - keepalive when needed: send `{"text":"", "context_id":"..."}` periodically
 
 Credential policy:
-- If the session/deployment selects `voice_provider=elevenlabs` but no ElevenLabs BYOK credential is provided, fail fast during the handshake with a clear error. Do not silently fall back to Cartesia unless that is an explicit tenant/session policy.
+- If `hello.voice.provider="elevenlabs"` but no ElevenLabs BYOK credential is provided, the gateway fails fast during the handshake with a clear error. It does not silently fall back.
 
 Operational notes:
 - Prefer `audio_out=pcm_*` for v1 so timing/backpressure math is correct; compressed audio output is possible later but requires `sent_ms` to be computed from decoded PCM duration.
 - Enforce inbound mic limits (frame size/rate); drop with warnings and fail fast on sustained overload.
 - Use an allowlisted tool policy + timeouts so live sessions can’t hang on tools.
+
+### 13.7 Gateway configuration (live env vars)
+
+In addition to the base gateway configuration, live mode is controlled by:
+- `VAI_PROXY_LIVE_MAX_UNPLAYED_MS` (default `2500ms`)
+- `VAI_PROXY_LIVE_PLAYBACK_STOP_WAIT_MS` (default `500ms`)
+- `VAI_PROXY_LIVE_TOOL_TIMEOUT` (default `10s`)
+- `VAI_PROXY_LIVE_MAX_TOOL_CALLS_PER_TURN` (default `5`)
+- `VAI_PROXY_LIVE_MAX_MODEL_CALLS_PER_TURN` (default `8`)
+- `VAI_PROXY_LIVE_MAX_BACKPRESSURE_RESETS_PER_MIN` (default `3`)
+- `VAI_PROXY_LIVE_ELEVENLABS_WS_BASE_URL` (default empty; gateway uses built-in ElevenLabs default)
 
 #### Cartesia (STT default)
 - `model=ink-whisper`
