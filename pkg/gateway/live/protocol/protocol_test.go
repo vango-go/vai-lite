@@ -13,6 +13,7 @@ func TestDecodeClientMessage_Hello(t *testing.T) {
 		"model":"anthropic/claude-sonnet-4",
 		"audio_in":{"encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1},
 		"audio_out":{"encoding":"pcm_s16le","sample_rate_hz":24000,"channels":1},
+		"voice":{"provider":"cartesia","voice_id":"voice_1"},
 		"features":{"audio_transport":"binary"}
 	}`)
 
@@ -36,6 +37,7 @@ func TestDecodeClientMessage_HelloWithTools(t *testing.T) {
 		"model":"anthropic/claude-sonnet-4",
 		"audio_in":{"encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1},
 		"audio_out":{"encoding":"pcm_s16le","sample_rate_hz":24000,"channels":1},
+		"voice":{"provider":"cartesia","voice_id":"voice_1"},
 		"tools":{
 			"server_tools":["vai_web_search"],
 			"server_tool_config":{"vai_web_search":{"provider":"tavily"}}
@@ -59,6 +61,7 @@ func TestValidateHello_RejectsToolConfigForDisabledTool(t *testing.T) {
 		Model:           "anthropic/claude-sonnet-4",
 		AudioIn:         AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
 		AudioOut:        AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 24000, Channels: 1},
+		Voice:           &HelloVoice{Provider: "cartesia", VoiceID: "voice_1"},
 		Tools: &HelloTools{
 			ServerTools:      []string{"vai_web_search"},
 			ServerToolConfig: map[string]any{"vai_web_fetch": map[string]any{"provider": "firecrawl"}},
@@ -80,6 +83,44 @@ func TestDecodeClientMessage_HelloMissingRequired(t *testing.T) {
 		t.Fatalf("err type = %T", err)
 	}
 	if decErr.Code != "bad_request" {
+		t.Fatalf("code=%q", decErr.Code)
+	}
+}
+
+func TestValidateHello_RequiresVoiceProviderWhenVoiceProvided(t *testing.T) {
+	err := ValidateHello(ClientHello{
+		Type:            "hello",
+		ProtocolVersion: "1",
+		Model:           "anthropic/claude-sonnet-4",
+		AudioIn:         AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
+		AudioOut:        AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 24000, Channels: 1},
+		Voice:           &HelloVoice{VoiceID: "voice_1"},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "voice.provider") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateHello_RejectsUnknownVoiceProvider(t *testing.T) {
+	err := ValidateHello(ClientHello{
+		Type:            "hello",
+		ProtocolVersion: "1",
+		Model:           "anthropic/claude-sonnet-4",
+		AudioIn:         AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
+		AudioOut:        AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 24000, Channels: 1},
+		Voice:           &HelloVoice{Provider: "unknown", VoiceID: "voice_1"},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	decErr, ok := err.(*DecodeError)
+	if !ok {
+		t.Fatalf("err type = %T", err)
+	}
+	if decErr.Code != "unsupported" {
 		t.Fatalf("code=%q", decErr.Code)
 	}
 }
@@ -140,5 +181,35 @@ func TestClientHelloRedaction(t *testing.T) {
 	}
 	if strings.Contains(string(blob), "vai_web_search") == false {
 		t.Fatalf("expected server tool names in redacted payload: %s", string(blob))
+	}
+}
+
+func TestServerAssistantAudioChunk_AlignmentJSON(t *testing.T) {
+	chunk := ServerAssistantAudioChunk{
+		Type:             "assistant_audio_chunk",
+		AssistantAudioID: "a_1",
+		Seq:              1,
+		AudioB64:         "AQI=",
+		Alignment: &Alignment{
+			Kind:        AlignmentKindChar,
+			Normalized:  true,
+			Chars:       []string{"h", "i"},
+			CharStartMS: []int{0, 50},
+			CharDurMS:   []int{50, 50},
+		},
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded ServerAssistantAudioChunk
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Alignment == nil || decoded.Alignment.Kind != AlignmentKindChar {
+		t.Fatalf("alignment=%+v", decoded.Alignment)
+	}
+	if len(decoded.Alignment.Chars) != 2 {
+		t.Fatalf("chars=%v", decoded.Alignment.Chars)
 	}
 }

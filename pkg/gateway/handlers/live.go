@@ -119,6 +119,19 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeWSError(conn, "session", "bad_request", "voice.voice_id is required", true, nil)
 		return
 	}
+	voiceProvider := strings.ToLower(strings.TrimSpace(hello.Voice.Provider))
+	if voiceProvider == "" {
+		h.writeWSError(conn, "session", "bad_request", "voice.provider is required", true, map[string]any{"param": "voice.provider"})
+		return
+	}
+	if voiceProvider != protocol.VoiceProviderCartesia && voiceProvider != protocol.VoiceProviderElevenLabs {
+		h.writeWSError(conn, "session", "unsupported", "unsupported voice provider", true, map[string]any{"param": "voice.provider"})
+		return
+	}
+	if voiceProvider == protocol.VoiceProviderElevenLabs && !hello.Features.SendPlaybackMarks {
+		h.writeWSError(conn, "session", "bad_request", "send_playback_marks must be true when voice.provider is elevenlabs", true, map[string]any{"param": "features.send_playback_marks"})
+		return
+	}
 
 	transport := strings.TrimSpace(hello.Features.AudioTransport)
 	if transport == "" {
@@ -177,6 +190,13 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeWSError(conn, "session", "unauthorized", "missing cartesia key", true, map[string]any{"requires_byok_header": "X-Provider-Key-Cartesia"})
 		return
 	}
+	if voiceProvider == protocol.VoiceProviderElevenLabs {
+		elevenLabsKey := byokForProvider(hello.BYOK, protocol.VoiceProviderElevenLabs)
+		if strings.TrimSpace(elevenLabsKey) == "" {
+			h.writeWSError(conn, "session", "unauthorized", "missing elevenlabs key", true, map[string]any{"requires_byok_header": "X-Provider-Key-ElevenLabs"})
+			return
+		}
+	}
 	serverToolRegistry, liveServerToolErr := h.newLiveServerToolsRegistry(hello)
 	if liveServerToolErr != nil {
 		h.writeWSError(conn, "session", liveServerToolErr.Code, liveServerToolErr.Message, true, liveServerToolErr.Details)
@@ -194,7 +214,10 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		voiceHTTPClient = &http.Client{}
 	}
 	sttProvider := h.newSTTProvider(cartesiaKey, voiceHTTPClient)
-	ttsProvider := h.newTTSProvider(cartesiaKey, voiceHTTPClient)
+	var ttsProvider session.TTSProvider
+	if voiceProvider == protocol.VoiceProviderCartesia {
+		ttsProvider = h.newTTSProvider(cartesiaKey, voiceHTTPClient)
+	}
 
 	sessionID := "s_" + randHex(8)
 	ack := protocol.ServerHelloAck{
@@ -205,7 +228,13 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		AudioOut:        hello.AudioOut,
 		Features: protocol.HelloAckFeatures{
 			AudioTransport:    transport,
-			SupportsAlignment: false,
+			SupportsAlignment: voiceProvider == protocol.VoiceProviderElevenLabs,
+			AlignmentKind: func() string {
+				if voiceProvider == protocol.VoiceProviderElevenLabs {
+					return protocol.AlignmentKindChar
+				}
+				return ""
+			}(),
 		},
 		Resume: protocol.HelloAckResume{
 			Supported: false,
@@ -264,6 +293,13 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ReadTimeout:                h.Config.LiveWSReadTimeout,
 			MaxSessionDuration:         h.Config.WSMaxSessionDuration,
 			TurnTimeout:                h.Config.LiveTurnTimeout,
+			ToolTimeout:                h.Config.LiveToolTimeout,
+			MaxToolCallsPerTurn:        h.Config.LiveMaxToolCallsPerTurn,
+			MaxModelCallsPerTurn:       h.Config.LiveMaxModelCallsPerTurn,
+			MaxUnplayedDuration:        h.Config.LiveMaxUnplayedDuration,
+			PlaybackStopWait:           h.Config.LivePlaybackStopWait,
+			MaxBackpressurePerMin:      h.Config.LiveMaxBackpressurePerMin,
+			ElevenLabsWSBaseURL:        h.Config.LiveElevenLabsWSBaseURL,
 			OutboundQueueSize:          128,
 			AudioInAckEveryN:           25,
 			AudioTransportBinary:       transport == protocol.AudioTransportBinary,

@@ -99,7 +99,7 @@ func TestRunTurn_EarlyStopsOnTalkToUserContentBlockStop(t *testing.T) {
 		modelName: "test",
 	}
 
-	text, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}})
+	text, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1)
 	if err != nil {
 		t.Fatalf("runTurn error = %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRunTurn_PropagatesDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 
-	_, err := s.runTurn(ctx, []types.Message{{Role: "user", Content: "hi"}})
+	_, err := s.runTurn(ctx, []types.Message{{Role: "user", Content: "hi"}}, 1)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -215,7 +215,7 @@ func TestRunTurn_ServerToolThenTalkToUser(t *testing.T) {
 		serverTools: servertools.NewRegistry(fakeServerToolExecutor{name: "vai_web_search"}),
 	}
 
-	text, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}})
+	text, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1)
 	if err != nil {
 		t.Fatalf("runTurn error = %v", err)
 	}
@@ -251,7 +251,7 @@ func TestRunTurn_MaxToolCallsExceeded(t *testing.T) {
 		serverTools: servertools.NewRegistry(fakeServerToolExecutor{name: "vai_web_search"}),
 	}
 
-	_, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}})
+	_, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1)
 	if err == nil {
 		t.Fatalf("expected error")
 	}

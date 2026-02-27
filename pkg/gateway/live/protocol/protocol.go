@@ -12,6 +12,11 @@ const (
 
 	AudioTransportBinary     = "binary"
 	AudioTransportBase64JSON = "base64_json"
+
+	VoiceProviderCartesia   = "cartesia"
+	VoiceProviderElevenLabs = "elevenlabs"
+
+	AlignmentKindChar = "char"
 )
 
 type DecodeError struct {
@@ -69,6 +74,7 @@ type HelloBYOK struct {
 }
 
 type HelloVoice struct {
+	Provider string  `json:"provider,omitempty"`
 	Language string  `json:"language,omitempty"`
 	VoiceID  string  `json:"voice_id,omitempty"`
 	Speed    float64 `json:"speed,omitempty"`
@@ -82,6 +88,7 @@ type HelloFeatures struct {
 	WantPartialTranscripts bool   `json:"want_partial_transcripts,omitempty"`
 	WantAssistantText      bool   `json:"want_assistant_text,omitempty"`
 	ClientHasAEC           bool   `json:"client_has_aec,omitempty"`
+	WantRunEvents          bool   `json:"want_run_events,omitempty"`
 }
 
 type HelloTools struct {
@@ -305,6 +312,17 @@ func ValidateHello(msg ClientHello) error {
 	if err := validateHelloTools(msg.Tools); err != nil {
 		return err
 	}
+	if msg.Voice != nil {
+		provider := strings.ToLower(strings.TrimSpace(msg.Voice.Provider))
+		if provider == "" {
+			return badRequest("hello.voice.provider is required", "voice.provider")
+		}
+		switch provider {
+		case VoiceProviderCartesia, VoiceProviderElevenLabs:
+		default:
+			return unsupported("unsupported voice provider", "voice.provider")
+		}
+	}
 
 	transport := strings.TrimSpace(msg.Features.AudioTransport)
 	if transport == "" {
@@ -353,6 +371,7 @@ func validateHelloTools(tools *HelloTools) error {
 type HelloAckFeatures struct {
 	AudioTransport    string `json:"audio_transport"`
 	SupportsAlignment bool   `json:"supports_alignment"`
+	AlignmentKind     string `json:"alignment_kind,omitempty"`
 }
 
 type HelloAckResume struct {
@@ -430,17 +449,27 @@ type ServerAssistantAudioStart struct {
 }
 
 type ServerAssistantAudioChunk struct {
-	Type             string `json:"type"`
-	AssistantAudioID string `json:"assistant_audio_id"`
-	Seq              int64  `json:"seq"`
-	AudioB64         string `json:"audio_b64,omitempty"`
+	Type             string     `json:"type"`
+	AssistantAudioID string     `json:"assistant_audio_id"`
+	Seq              int64      `json:"seq"`
+	AudioB64         string     `json:"audio_b64,omitempty"`
+	Alignment        *Alignment `json:"alignment,omitempty"`
 }
 
 type ServerAssistantAudioChunkHeader struct {
-	Type             string `json:"type"`
-	AssistantAudioID string `json:"assistant_audio_id"`
-	Seq              int64  `json:"seq"`
-	Bytes            int    `json:"bytes"`
+	Type             string     `json:"type"`
+	AssistantAudioID string     `json:"assistant_audio_id"`
+	Seq              int64      `json:"seq"`
+	Bytes            int        `json:"bytes"`
+	Alignment        *Alignment `json:"alignment,omitempty"`
+}
+
+type Alignment struct {
+	Kind        string   `json:"kind"`
+	Normalized  bool     `json:"normalized"`
+	Chars       []string `json:"chars,omitempty"`
+	CharStartMS []int    `json:"char_start_ms,omitempty"`
+	CharDurMS   []int    `json:"char_dur_ms,omitempty"`
 }
 
 type ServerAssistantAudioEnd struct {
@@ -452,4 +481,10 @@ type ServerAudioReset struct {
 	Type             string `json:"type"`
 	Reason           string `json:"reason"`
 	AssistantAudioID string `json:"assistant_audio_id,omitempty"`
+}
+
+type ServerRunEvent struct {
+	Type   string          `json:"type"`
+	TurnID int             `json:"turn_id"`
+	Event  json.RawMessage `json:"event"`
 }

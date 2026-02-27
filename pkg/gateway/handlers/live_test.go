@@ -45,6 +45,101 @@ func TestLiveHandler_HandshakeUnsupportedVersion(t *testing.T) {
 	}
 }
 
+func TestLiveHandler_ElevenLabsRequiresPlaybackMarks(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	voice := hello["voice"].(map[string]any)
+	voice["provider"] = "elevenlabs"
+	byok := hello["byok"].(map[string]any)
+	byok["elevenlabs"] = "sk-el-test"
+	mustWriteJSON(t, conn, hello)
+
+	msg := mustReadJSON(t, conn, 2*time.Second)
+	if msg["type"] != "error" {
+		t.Fatalf("type=%v", msg["type"])
+	}
+	if msg["code"] != "bad_request" {
+		t.Fatalf("code=%v", msg["code"])
+	}
+}
+
+func TestLiveHandler_ElevenLabsRequiresBYOK(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	voice := hello["voice"].(map[string]any)
+	voice["provider"] = "elevenlabs"
+	features := hello["features"].(map[string]any)
+	features["send_playback_marks"] = true
+	mustWriteJSON(t, conn, hello)
+
+	msg := mustReadJSON(t, conn, 2*time.Second)
+	if msg["type"] != "error" {
+		t.Fatalf("type=%v", msg["type"])
+	}
+	if msg["code"] != "unauthorized" {
+		t.Fatalf("code=%v", msg["code"])
+	}
+}
+
+func TestLiveHandler_ElevenLabsAckAdvertisesAlignment(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	fakeEleven := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer fakeEleven.Close()
+
+	elevenBase := "ws" + strings.TrimPrefix(fakeEleven.URL, "http") + "/v1/text-to-speech/{voice_id}/stream-input"
+	h, serverURL := newLiveTestServer(t, liveTestOptions{liveElevenLabsWSBaseURL: elevenBase})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	voice := hello["voice"].(map[string]any)
+	voice["provider"] = "elevenlabs"
+	features := hello["features"].(map[string]any)
+	features["send_playback_marks"] = true
+	byok := hello["byok"].(map[string]any)
+	byok["elevenlabs"] = "sk-el-test"
+	mustWriteJSON(t, conn, hello)
+
+	ack := mustReadJSON(t, conn, 2*time.Second)
+	if ack["type"] != "hello_ack" {
+		t.Fatalf("type=%v payload=%+v", ack["type"], ack)
+	}
+	featuresResp, ok := ack["features"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing features in ack")
+	}
+	if featuresResp["supports_alignment"] != true {
+		t.Fatalf("supports_alignment=%v", featuresResp["supports_alignment"])
+	}
+	if featuresResp["alignment_kind"] != "char" {
+		t.Fatalf("alignment_kind=%v", featuresResp["alignment_kind"])
+	}
+}
+
 func TestLiveHandler_AudioFrameToTranscriptAndAssistantAudio(t *testing.T) {
 	h, serverURL := newLiveTestServer(t, liveTestOptions{
 		sttDeltasPerAudioFrame: [][]stt.TranscriptDelta{{{Text: "hello there", IsFinal: true}}},
@@ -615,6 +710,7 @@ type liveTestOptions struct {
 	liveMaxAudioFPS         *int
 	liveMaxAudioBPS         *int64
 	liveInboundBurstSeconds *int
+	liveElevenLabsWSBaseURL string
 }
 
 func newLiveTestServer(t *testing.T, opts liveTestOptions) (*liveHarness, string) {
@@ -647,6 +743,13 @@ func newLiveTestServer(t *testing.T, opts liveTestOptions) (*liveHarness, string
 		LiveWSReadTimeout:             0,
 		LiveHandshakeTimeout:          2 * time.Second,
 		LiveTurnTimeout:               opts.liveTurnTimeout,
+		LiveMaxUnplayedDuration:       2500 * time.Millisecond,
+		LivePlaybackStopWait:          500 * time.Millisecond,
+		LiveToolTimeout:               10 * time.Second,
+		LiveMaxToolCallsPerTurn:       5,
+		LiveMaxModelCallsPerTurn:      8,
+		LiveMaxBackpressurePerMin:     3,
+		LiveElevenLabsWSBaseURL:       opts.liveElevenLabsWSBaseURL,
 		UpstreamConnectTimeout:        2 * time.Second,
 		UpstreamResponseHeaderTimeout: 2 * time.Second,
 	}
@@ -698,7 +801,7 @@ func baseHello(version string) map[string]any {
 		},
 		"audio_in":  map[string]any{"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
 		"audio_out": map[string]any{"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
-		"voice":     map[string]any{"voice_id": "voice_test", "language": "en", "speed": 1.0, "volume": 1.0},
+		"voice":     map[string]any{"provider": "cartesia", "voice_id": "voice_test", "language": "en", "speed": 1.0, "volume": 1.0},
 		"features":  map[string]any{"audio_transport": "base64_json", "want_partial_transcripts": true, "want_assistant_text": true, "client_has_aec": true},
 	}
 }

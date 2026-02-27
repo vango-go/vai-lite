@@ -36,6 +36,13 @@ var gatewayEnvKeys = []string{
 	"VAI_PROXY_LIVE_WS_READ_TIMEOUT",
 	"VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT",
 	"VAI_PROXY_LIVE_TURN_TIMEOUT",
+	"VAI_PROXY_LIVE_MAX_UNPLAYED_MS",
+	"VAI_PROXY_LIVE_PLAYBACK_STOP_WAIT_MS",
+	"VAI_PROXY_LIVE_TOOL_TIMEOUT",
+	"VAI_PROXY_LIVE_MAX_TOOL_CALLS_PER_TURN",
+	"VAI_PROXY_LIVE_MAX_MODEL_CALLS_PER_TURN",
+	"VAI_PROXY_LIVE_MAX_BACKPRESSURE_RESETS_PER_MIN",
+	"VAI_PROXY_LIVE_ELEVENLABS_WS_BASE_URL",
 	"VAI_PROXY_CONNECT_TIMEOUT",
 	"VAI_PROXY_RESPONSE_HEADER_TIMEOUT",
 	"VAI_PROXY_TAVILY_BASE_URL",
@@ -169,6 +176,27 @@ func TestLoadFromEnv_DefaultsMatchSpec(t *testing.T) {
 	if cfg.LiveTurnTimeout != 30*time.Second {
 		t.Fatalf("LiveTurnTimeout = %v, want 30s", cfg.LiveTurnTimeout)
 	}
+	if cfg.LiveMaxUnplayedDuration != 2500*time.Millisecond {
+		t.Fatalf("LiveMaxUnplayedDuration = %v, want 2500ms", cfg.LiveMaxUnplayedDuration)
+	}
+	if cfg.LivePlaybackStopWait != 500*time.Millisecond {
+		t.Fatalf("LivePlaybackStopWait = %v, want 500ms", cfg.LivePlaybackStopWait)
+	}
+	if cfg.LiveToolTimeout != 10*time.Second {
+		t.Fatalf("LiveToolTimeout = %v, want 10s", cfg.LiveToolTimeout)
+	}
+	if cfg.LiveMaxToolCallsPerTurn != 5 {
+		t.Fatalf("LiveMaxToolCallsPerTurn = %d, want 5", cfg.LiveMaxToolCallsPerTurn)
+	}
+	if cfg.LiveMaxModelCallsPerTurn != 8 {
+		t.Fatalf("LiveMaxModelCallsPerTurn = %d, want 8", cfg.LiveMaxModelCallsPerTurn)
+	}
+	if cfg.LiveMaxBackpressurePerMin != 3 {
+		t.Fatalf("LiveMaxBackpressurePerMin = %d, want 3", cfg.LiveMaxBackpressurePerMin)
+	}
+	if cfg.LiveElevenLabsWSBaseURL != "" {
+		t.Fatalf("LiveElevenLabsWSBaseURL = %q, want empty", cfg.LiveElevenLabsWSBaseURL)
+	}
 	if cfg.UpstreamConnectTimeout != 5*time.Second {
 		t.Fatalf("UpstreamConnectTimeout = %v, want 5s", cfg.UpstreamConnectTimeout)
 	}
@@ -222,6 +250,13 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	t.Setenv("VAI_PROXY_LIVE_WS_READ_TIMEOUT", "4s")
 	t.Setenv("VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT", "6s")
 	t.Setenv("VAI_PROXY_LIVE_TURN_TIMEOUT", "31s")
+	t.Setenv("VAI_PROXY_LIVE_MAX_UNPLAYED_MS", "1900ms")
+	t.Setenv("VAI_PROXY_LIVE_PLAYBACK_STOP_WAIT_MS", "650ms")
+	t.Setenv("VAI_PROXY_LIVE_TOOL_TIMEOUT", "12s")
+	t.Setenv("VAI_PROXY_LIVE_MAX_TOOL_CALLS_PER_TURN", "6")
+	t.Setenv("VAI_PROXY_LIVE_MAX_MODEL_CALLS_PER_TURN", "10")
+	t.Setenv("VAI_PROXY_LIVE_MAX_BACKPRESSURE_RESETS_PER_MIN", "5")
+	t.Setenv("VAI_PROXY_LIVE_ELEVENLABS_WS_BASE_URL", "ws://127.0.0.1:3456/live")
 	t.Setenv("VAI_PROXY_RATE_LIMIT_RPS", "3.5")
 	t.Setenv("VAI_PROXY_RATE_LIMIT_BURST", "8")
 	t.Setenv("VAI_PROXY_MAX_CONCURRENT_REQUESTS", "44")
@@ -271,6 +306,27 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	}
 	if cfg.LiveTurnTimeout != 31*time.Second {
 		t.Fatalf("LiveTurnTimeout=%v, want 31s", cfg.LiveTurnTimeout)
+	}
+	if cfg.LiveMaxUnplayedDuration != 1900*time.Millisecond {
+		t.Fatalf("LiveMaxUnplayedDuration=%v, want 1900ms", cfg.LiveMaxUnplayedDuration)
+	}
+	if cfg.LivePlaybackStopWait != 650*time.Millisecond {
+		t.Fatalf("LivePlaybackStopWait=%v, want 650ms", cfg.LivePlaybackStopWait)
+	}
+	if cfg.LiveToolTimeout != 12*time.Second {
+		t.Fatalf("LiveToolTimeout=%v, want 12s", cfg.LiveToolTimeout)
+	}
+	if cfg.LiveMaxToolCallsPerTurn != 6 {
+		t.Fatalf("LiveMaxToolCallsPerTurn=%d, want 6", cfg.LiveMaxToolCallsPerTurn)
+	}
+	if cfg.LiveMaxModelCallsPerTurn != 10 {
+		t.Fatalf("LiveMaxModelCallsPerTurn=%d, want 10", cfg.LiveMaxModelCallsPerTurn)
+	}
+	if cfg.LiveMaxBackpressurePerMin != 5 {
+		t.Fatalf("LiveMaxBackpressurePerMin=%d, want 5", cfg.LiveMaxBackpressurePerMin)
+	}
+	if cfg.LiveElevenLabsWSBaseURL != "ws://127.0.0.1:3456/live" {
+		t.Fatalf("LiveElevenLabsWSBaseURL=%q", cfg.LiveElevenLabsWSBaseURL)
 	}
 	if cfg.LimitRPS != 3.5 || cfg.LimitBurst != 8 || cfg.LimitMaxConcurrentRequests != 44 || cfg.LimitMaxConcurrentStreams != 6 {
 		t.Fatalf("rate/concurrency mismatch: %v/%d/%d/%d", cfg.LimitRPS, cfg.LimitBurst, cfg.LimitMaxConcurrentRequests, cfg.LimitMaxConcurrentStreams)

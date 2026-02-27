@@ -63,6 +63,13 @@ type Config struct {
 	LiveWSReadTimeout          time.Duration
 	LiveHandshakeTimeout       time.Duration
 	LiveTurnTimeout            time.Duration
+	LiveMaxUnplayedDuration    time.Duration
+	LivePlaybackStopWait       time.Duration
+	LiveToolTimeout            time.Duration
+	LiveMaxToolCallsPerTurn    int
+	LiveMaxModelCallsPerTurn   int
+	LiveMaxBackpressurePerMin  int
+	LiveElevenLabsWSBaseURL    string
 
 	// In-memory limits (per principal).
 	LimitRPS                   float64
@@ -117,6 +124,13 @@ func LoadFromEnv() (Config, error) {
 		LiveWSReadTimeout:             envDurationOr("VAI_PROXY_LIVE_WS_READ_TIMEOUT", 0),
 		LiveHandshakeTimeout:          envDurationOr("VAI_PROXY_LIVE_HANDSHAKE_TIMEOUT", 5*time.Second),
 		LiveTurnTimeout:               envDurationOr("VAI_PROXY_LIVE_TURN_TIMEOUT", 30*time.Second),
+		LiveMaxUnplayedDuration:       envDurationOr("VAI_PROXY_LIVE_MAX_UNPLAYED_MS", 2500*time.Millisecond),
+		LivePlaybackStopWait:          envDurationOr("VAI_PROXY_LIVE_PLAYBACK_STOP_WAIT_MS", 500*time.Millisecond),
+		LiveToolTimeout:               envDurationOr("VAI_PROXY_LIVE_TOOL_TIMEOUT", 10*time.Second),
+		LiveMaxToolCallsPerTurn:       envIntOr("VAI_PROXY_LIVE_MAX_TOOL_CALLS_PER_TURN", 5),
+		LiveMaxModelCallsPerTurn:      envIntOr("VAI_PROXY_LIVE_MAX_MODEL_CALLS_PER_TURN", 8),
+		LiveMaxBackpressurePerMin:     envIntOr("VAI_PROXY_LIVE_MAX_BACKPRESSURE_RESETS_PER_MIN", 3),
+		LiveElevenLabsWSBaseURL:       strings.TrimSpace(os.Getenv("VAI_PROXY_LIVE_ELEVENLABS_WS_BASE_URL")),
 		LimitRPS:                      envFloat64Or("VAI_PROXY_RATE_LIMIT_RPS", 2.0),
 		LimitBurst:                    envIntOr("VAI_PROXY_RATE_LIMIT_BURST", 4),
 		LimitMaxConcurrentRequests:    envIntOr("VAI_PROXY_MAX_CONCURRENT_REQUESTS", 20),
@@ -225,6 +239,24 @@ func LoadFromEnv() (Config, error) {
 	}
 	if cfg.LiveTurnTimeout < 0 {
 		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_TURN_TIMEOUT must be >= 0")
+	}
+	if cfg.LiveMaxUnplayedDuration <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_UNPLAYED_MS must be > 0")
+	}
+	if cfg.LivePlaybackStopWait <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_PLAYBACK_STOP_WAIT_MS must be > 0")
+	}
+	if cfg.LiveToolTimeout <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_TOOL_TIMEOUT must be > 0")
+	}
+	if cfg.LiveMaxToolCallsPerTurn <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_TOOL_CALLS_PER_TURN must be > 0")
+	}
+	if cfg.LiveMaxModelCallsPerTurn <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_MODEL_CALLS_PER_TURN must be > 0")
+	}
+	if cfg.LiveMaxBackpressurePerMin <= 0 {
+		return Config{}, fmt.Errorf("VAI_PROXY_LIVE_MAX_BACKPRESSURE_RESETS_PER_MIN must be > 0")
 	}
 	if cfg.ReadHeaderTimeout <= 0 {
 		return Config{}, fmt.Errorf("VAI_PROXY_READ_HEADER_TIMEOUT must be > 0")
