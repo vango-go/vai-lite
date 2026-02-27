@@ -21,10 +21,12 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 	"github.com/vango-go/vai-lite/pkg/gateway/live/protocol"
 	"github.com/vango-go/vai-lite/pkg/gateway/runloop"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
 const (
-	talkToUserToolName = "talk_to_user"
+	talkToUserToolName  = "talk_to_user"
+	maxToolCallsPerTurn = 5
 
 	maxCanceledAssistantAudioIDs = 64
 	outboundPriorityQueueSize    = 8
@@ -167,33 +169,35 @@ type Config struct {
 }
 
 type Dependencies struct {
-	Conn      *websocket.Conn
-	Logger    *slog.Logger
-	Provider  core.Provider
-	STT       STTProvider
-	TTS       TTSProvider
-	Hello     protocol.ClientHello
-	SessionID string
-	RequestID string
-	ModelName string
-	Config    Config
-	StartTime time.Time
-	Now       func() time.Time
+	Conn        *websocket.Conn
+	Logger      *slog.Logger
+	Provider    core.Provider
+	STT         STTProvider
+	TTS         TTSProvider
+	ServerTools *servertools.Registry
+	Hello       protocol.ClientHello
+	SessionID   string
+	RequestID   string
+	ModelName   string
+	Config      Config
+	StartTime   time.Time
+	Now         func() time.Time
 }
 
 type LiveSession struct {
-	conn      *websocket.Conn
-	logger    *slog.Logger
-	provider  core.Provider
-	stt       STTProvider
-	tts       TTSProvider
-	hello     protocol.ClientHello
-	sessionID string
-	requestID string
-	modelName string
-	cfg       Config
-	startTime time.Time
-	now       func() time.Time
+	conn        *websocket.Conn
+	logger      *slog.Logger
+	provider    core.Provider
+	stt         STTProvider
+	tts         TTSProvider
+	serverTools *servertools.Registry
+	hello       protocol.ClientHello
+	sessionID   string
+	requestID   string
+	modelName   string
+	cfg         Config
+	startTime   time.Time
+	now         func() time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -287,6 +291,7 @@ func New(deps Dependencies) (*LiveSession, error) {
 		provider:         deps.Provider,
 		stt:              deps.STT,
 		tts:              deps.TTS,
+		serverTools:      deps.ServerTools,
 		hello:            deps.Hello,
 		sessionID:        deps.SessionID,
 		requestID:        deps.RequestID,
@@ -812,8 +817,17 @@ func (s *LiveSession) Run() error {
 					commitTurnNoAssistant()
 					continue
 				}
-				_ = s.sendWarning("provider_error", "language model stream failed")
-				commitTurnNoAssistant()
+				_ = s.sendWarning("provider_error", "language model turn failed")
+				apology := "Sorry, I ran into an issue with that request. Please try again."
+				assistantID := nextAssistantID()
+				activeAssistantID = assistantID
+				ttsCtx, cancel := context.WithCancel(s.ctx)
+				activeTTSCancel = cancel
+				wg.Add(1)
+				go func(turn int, aid, speakText string) {
+					defer wg.Done()
+					s.speakTurn(ttsCtx, turn, aid, speakText, ttsDoneCh)
+				}(turnID, assistantID, apology)
 				continue
 			}
 			text := normalizeSpace(rr.text)
@@ -855,39 +869,134 @@ func (s *LiveSession) Run() error {
 }
 
 func (s *LiveSession) runTurn(ctx context.Context, history []types.Message) (string, error) {
-	additionalProps := false
-	req := &types.MessageRequest{
-		Model:    s.modelName,
-		Messages: history,
-		System:   "You are a real-time voice assistant. You must respond by calling talk_to_user({text}). Do not emit markdown. Expand numbers, symbols, and abbreviations for speech.",
-		Tools: []types.Tool{
-			{
-				Type:        types.ToolTypeFunction,
-				Name:        talkToUserToolName,
-				Description: "Speak text to the end user.",
-				InputSchema: &types.JSONSchema{
-					Type: "object",
-					Properties: map[string]types.JSONSchema{
-						"text": {
-							Type:        "string",
-							Description: "Text to speak to the user. No markdown.",
-						},
-					},
-					Required:             []string{"text"},
-					AdditionalProperties: &additionalProps,
-				},
-			},
-		},
-		ToolChoice: types.ToolChoiceTool(talkToUserToolName),
-		Stream:     true,
-	}
+	turnHistory := make([]types.Message, len(history))
+	copy(turnHistory, history)
 
+	toolCalls := 0
+	for {
+		req := &types.MessageRequest{
+			Model:    s.modelName,
+			Messages: turnHistory,
+			System:   "You are a real-time voice assistant. Use tools when needed, and call talk_to_user({text}) for final speech output. Do not emit markdown. Expand numbers, symbols, and abbreviations for speech.",
+			Tools:    s.turnTools(),
+			Stream:   true,
+		}
+
+		earlyTalkText, resp, err := s.streamTurnWithEarlyTalk(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		if earlyTalkText != "" {
+			return normalizeSpace(earlyTalkText), nil
+		}
+		if resp == nil {
+			return "", nil
+		}
+
+		toolUses := resp.ToolUses()
+		if resp.StopReason != types.StopReasonToolUse || len(toolUses) == 0 {
+			return normalizeSpace(resp.TextContent()), nil
+		}
+
+		talkCalls := make([]types.ToolUseBlock, 0, 1)
+		serverCalls := make([]types.ToolUseBlock, 0, len(toolUses))
+		for _, call := range toolUses {
+			name := strings.TrimSpace(call.Name)
+			if strings.EqualFold(name, talkToUserToolName) {
+				talkCalls = append(talkCalls, call)
+				continue
+			}
+			serverCalls = append(serverCalls, call)
+		}
+
+		if len(talkCalls) > 0 && len(serverCalls) > 0 {
+			return "", fmt.Errorf("invalid tool plan: talk_to_user cannot be combined with other tool calls")
+		}
+		if len(talkCalls) > 0 {
+			text, ok := extractTalkToUserText(talkCalls[0].Input)
+			if !ok {
+				return "", fmt.Errorf("talk_to_user.text is required")
+			}
+			return normalizeSpace(text), nil
+		}
+		if len(serverCalls) == 0 {
+			return normalizeSpace(resp.TextContent()), nil
+		}
+
+		if toolCalls+len(serverCalls) > maxToolCallsPerTurn {
+			return "", fmt.Errorf("max tool calls exceeded")
+		}
+
+		toolResultBlocks := make([]types.ContentBlock, 0, len(serverCalls))
+		for _, call := range serverCalls {
+			if s.serverTools == nil || !s.serverTools.Has(call.Name) {
+				return "", fmt.Errorf("unknown tool %q", call.Name)
+			}
+
+			toolCtx := ctx
+			if deadline, ok := ctx.Deadline(); ok {
+				remaining := time.Until(deadline)
+				toolTimeout := 10 * time.Second
+				if remaining <= 0 {
+					return "", context.DeadlineExceeded
+				}
+				if remaining < toolTimeout {
+					toolTimeout = remaining
+				}
+				var cancel context.CancelFunc
+				toolCtx, cancel = context.WithTimeout(ctx, toolTimeout)
+				content, toolErr := s.serverTools.Execute(toolCtx, call.Name, call.Input)
+				cancel()
+				block := types.ToolResultBlock{Type: "tool_result", ToolUseID: call.ID, Content: content}
+				if toolErr != nil {
+					block.IsError = true
+					if len(content) == 0 {
+						msg := strings.TrimSpace(toolErr.Message)
+						if msg == "" {
+							msg = "tool execution failed"
+						}
+						block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: msg}}
+					}
+				} else if len(content) == 0 {
+					block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: ""}}
+				}
+				toolResultBlocks = append(toolResultBlocks, block)
+			} else {
+				toolCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				content, toolErr := s.serverTools.Execute(toolCtx, call.Name, call.Input)
+				cancel()
+				block := types.ToolResultBlock{Type: "tool_result", ToolUseID: call.ID, Content: content}
+				if toolErr != nil {
+					block.IsError = true
+					if len(content) == 0 {
+						msg := strings.TrimSpace(toolErr.Message)
+						if msg == "" {
+							msg = "tool execution failed"
+						}
+						block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: msg}}
+					}
+				} else if len(content) == 0 {
+					block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: ""}}
+				}
+				toolResultBlocks = append(toolResultBlocks, block)
+			}
+		}
+
+		toolCalls += len(serverCalls)
+		turnHistory = append(turnHistory,
+			types.Message{Role: "assistant", Content: resp.Content},
+			types.Message{Role: "user", Content: toolResultBlocks},
+		)
+	}
+}
+
+func (s *LiveSession) streamTurnWithEarlyTalk(ctx context.Context, req *types.MessageRequest) (string, *types.MessageResponse, error) {
 	turnCtx, stopEarly := context.WithCancel(ctx)
 	defer stopEarly()
 
 	stream, err := s.provider.StreamMessage(turnCtx, req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	closed := false
 	defer func() {
@@ -898,13 +1007,12 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message) (str
 
 	talkIdx := -1
 	var talkInput strings.Builder
-
 	acc := runloop.NewStreamAccumulator()
+
 	for {
 		event, nextErr := stream.Next()
 		if event != nil {
 			acc.Apply(event)
-
 			switch e := event.(type) {
 			case types.ContentBlockStartEvent:
 				if isTalkToUserToolUseBlock(e.ContentBlock) {
@@ -930,7 +1038,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message) (str
 						stopEarly()
 						closed = true
 						_ = stream.Close()
-						return normalizeSpace(text), nil
+						return text, nil, nil
 					}
 					talkIdx = -1
 					talkInput.Reset()
@@ -941,16 +1049,16 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message) (str
 						stopEarly()
 						closed = true
 						_ = stream.Close()
-						return normalizeSpace(text), nil
+						return text, nil, nil
 					}
 					talkIdx = -1
 					talkInput.Reset()
 				}
 			case types.ErrorEvent:
-				return "", fmt.Errorf("provider stream error: %s", strings.TrimSpace(e.Error.Message))
+				return "", nil, fmt.Errorf("provider stream error: %s", strings.TrimSpace(e.Error.Message))
 			case *types.ErrorEvent:
 				if e != nil {
-					return "", fmt.Errorf("provider stream error: %s", strings.TrimSpace(e.Error.Message))
+					return "", nil, fmt.Errorf("provider stream error: %s", strings.TrimSpace(e.Error.Message))
 				}
 			}
 		}
@@ -958,26 +1066,58 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message) (str
 			if errors.Is(nextErr, io.EOF) {
 				break
 			}
-			return "", nextErr
+			return "", nil, nextErr
 		}
 	}
 
-	resp := acc.Response()
-	if resp == nil {
-		return "", nil
+	return "", acc.Response(), nil
+}
+
+func (s *LiveSession) turnTools() []types.Tool {
+	additionalProps := false
+	tools := []types.Tool{
+		{
+			Type:        types.ToolTypeFunction,
+			Name:        talkToUserToolName,
+			Description: "Speak text to the end user.",
+			InputSchema: &types.JSONSchema{
+				Type: "object",
+				Properties: map[string]types.JSONSchema{
+					"text": {
+						Type:        "string",
+						Description: "Text to speak to the user. No markdown.",
+					},
+				},
+				Required:             []string{"text"},
+				AdditionalProperties: &additionalProps,
+			},
+		},
 	}
-	for _, call := range resp.ToolUses() {
-		if strings.EqualFold(strings.TrimSpace(call.Name), talkToUserToolName) {
-			if raw, ok := call.Input["text"]; ok {
-				if text, ok := raw.(string); ok {
-					return normalizeSpace(text), nil
-				}
-			}
+	if s.serverTools == nil {
+		return tools
+	}
+	for _, name := range s.serverTools.Names() {
+		if def, ok := s.serverTools.Definition(name); ok {
+			tools = append(tools, def)
 		}
 	}
+	return tools
+}
 
-	// Lenient fallback for plain text output.
-	return normalizeSpace(resp.TextContent()), nil
+func extractTalkToUserText(input map[string]any) (string, bool) {
+	if input == nil {
+		return "", false
+	}
+	raw, ok := input["text"]
+	if !ok {
+		return "", false
+	}
+	text, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	text = strings.TrimSpace(text)
+	return text, text != ""
 }
 
 func isTalkToUserToolUseBlock(block types.ContentBlock) bool {

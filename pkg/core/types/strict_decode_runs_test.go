@@ -102,6 +102,89 @@ func TestUnmarshalRunRequestStrict_Builtins(t *testing.T) {
 	}
 }
 
+func TestUnmarshalRunRequestStrict_ServerTools(t *testing.T) {
+	req, err := UnmarshalRunRequestStrict([]byte(`{
+		"request":{"model":"anthropic/x","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search"]
+	}`))
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(req.ServerTools) != 1 || req.ServerTools[0] != "vai_web_search" {
+		t.Fatalf("server_tools=%v", req.ServerTools)
+	}
+}
+
+func TestUnmarshalRunRequestStrict_ServerToolsRejectsDuplicates(t *testing.T) {
+	_, err := UnmarshalRunRequestStrict([]byte(`{
+		"request":{"model":"anthropic/x","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search", "vai_web_search"]
+	}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	se, ok := err.(*StrictDecodeError)
+	if !ok || se.Param != "server_tools[1]" {
+		t.Fatalf("err=%T %#v", err, err)
+	}
+}
+
+func TestUnmarshalRunRequestStrict_ServerToolConfigRejectsNonObject(t *testing.T) {
+	_, err := UnmarshalRunRequestStrict([]byte(`{
+		"request":{"model":"anthropic/x","messages":[{"role":"user","content":"hi"}]},
+		"server_tool_config":"nope"
+	}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	se, ok := err.(*StrictDecodeError)
+	if !ok || se.Param != "server_tool_config" {
+		t.Fatalf("err=%T %#v", err, err)
+	}
+}
+
+func TestUnmarshalRunRequestStrict_ServerToolConfigEntryRejectsNonObject(t *testing.T) {
+	_, err := UnmarshalRunRequestStrict([]byte(`{
+		"request":{"model":"anthropic/x","messages":[{"role":"user","content":"hi"}]},
+		"server_tool_config":{"vai_web_search":"nope"}
+	}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	se, ok := err.(*StrictDecodeError)
+	if !ok || se.Param != "server_tool_config.vai_web_search" {
+		t.Fatalf("err=%T %#v", err, err)
+	}
+}
+
+func TestUnmarshalRunRequestStrict_BuiltinsAndServerToolsConflict(t *testing.T) {
+	_, err := UnmarshalRunRequestStrict([]byte(`{
+		"request":{"model":"anthropic/x","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search"],
+		"builtins":["vai_web_fetch"]
+	}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	se, ok := err.(*StrictDecodeError)
+	if !ok || se.Param != "server_tools" {
+		t.Fatalf("err=%T %#v", err, err)
+	}
+}
+
+func TestUnmarshalRunRequestStrict_BuiltinsAliasPopulatesServerTools(t *testing.T) {
+	req, err := UnmarshalRunRequestStrict([]byte(`{
+		"request":{"model":"anthropic/x","messages":[{"role":"user","content":"hi"}]},
+		"builtins":["vai_web_search"]
+	}`))
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(req.ServerTools) != 1 || req.ServerTools[0] != "vai_web_search" {
+		t.Fatalf("server_tools=%v", req.ServerTools)
+	}
+}
+
 func TestUnmarshalRunRequestStrict_UnknownTopLevelField(t *testing.T) {
 	_, err := UnmarshalRunRequestStrict([]byte(`{
 		"request":{"model":"anthropic/x","messages":[{"role":"user","content":"hi"}]},

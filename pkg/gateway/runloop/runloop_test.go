@@ -165,7 +165,7 @@ func TestRunBlocking_NoToolCompletion(t *testing.T) {
 		Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "done"}},
 	}}}
 
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}, Tools: nil}, Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000}})
 	if err != nil {
 		t.Fatalf("err=%v", err)
@@ -204,7 +204,7 @@ func TestRunBlocking_ToolLoop(t *testing.T) {
 		},
 	}}
 
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}}, Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000}})
 	if err != nil {
 		t.Fatalf("err=%v", err)
@@ -247,7 +247,7 @@ func TestRunBlocking_ToolErrorAddsNonEmptyContent(t *testing.T) {
 		},
 	}}
 
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(failingExecutor{name: builtins.BuiltinWebSearch})}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(failingExecutor{name: builtins.BuiltinWebSearch})}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
 		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
 		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
@@ -287,7 +287,7 @@ func TestRunStream_OrderingAndEOFTerminal(t *testing.T) {
 		{event: delta, err: io.EOF},
 	}}}
 
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}), StreamIdleTimeout: time.Second, PublicModel: "anthropic/test", RequestID: "req_1"}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}), StreamIdleTimeout: time.Second, PublicModel: "anthropic/test", RequestID: "req_1"}
 	events := make([]string, 0, 16)
 	result, err := controller.RunStream(context.Background(), &types.RunRequest{Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}}, Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000}}, func(ev types.RunStreamEvent) error {
 		events = append(events, ev.EventType())
@@ -318,7 +318,7 @@ func TestRunStream_VoiceEventsAreTopLevelRunEvents(t *testing.T) {
 	pipeline := voice.NewPipelineWithProviders(nil, &fakeTTSProvider{})
 	controller := &Controller{
 		Provider:          provider,
-		Builtins:          builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}),
+		Tools:             builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}),
 		VoicePipeline:     pipeline,
 		StreamIdleTimeout: time.Second,
 		PublicModel:       "anthropic/test",
@@ -399,7 +399,7 @@ func TestRunBlocking_VoiceOutputAppended(t *testing.T) {
 	}}}
 
 	pipeline := voice.NewPipelineWithProviders(nil, &fakeTTSProvider{})
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}), VoicePipeline: pipeline}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}), VoicePipeline: pipeline}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}, Voice: &types.VoiceConfig{Output: &types.VoiceOutputConfig{Voice: "v", Format: "pcm"}}}, Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000}})
 	if err != nil {
 		t.Fatalf("err=%v", err)
@@ -423,7 +423,7 @@ func TestRunBlocking_StopReasonMaxTurns(t *testing.T) {
 		}},
 	}}}
 
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
 		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
 		Run:     types.RunConfig{MaxTurns: 1, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
@@ -451,7 +451,7 @@ func TestRunBlocking_StopReasonMaxToolCalls(t *testing.T) {
 		},
 	}}}
 
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
 		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
 		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 1, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
@@ -474,7 +474,7 @@ func TestRunBlocking_StopReasonMaxTokens(t *testing.T) {
 		Usage:      types.Usage{InputTokens: 4, OutputTokens: 6, TotalTokens: 10},
 	}}}
 
-	controller := &Controller{Provider: provider, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
 		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
 		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, MaxTokens: 10, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
@@ -488,7 +488,7 @@ func TestRunBlocking_StopReasonMaxTokens(t *testing.T) {
 }
 
 func TestRunBlocking_Timeout(t *testing.T) {
-	controller := &Controller{Provider: &timeoutProvider{}, Builtins: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	controller := &Controller{Provider: &timeoutProvider{}, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
 	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
 		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
 		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 20, ParallelTools: true, ToolTimeoutMS: 30000},
@@ -525,7 +525,7 @@ func TestRunBlocking_ParallelVsSequentialToolExecution(t *testing.T) {
 	}
 
 	parallelExec := &trackingExecutor{name: builtins.BuiltinWebSearch, delay: 20 * time.Millisecond}
-	parallelController := &Controller{Provider: newProvider(), Builtins: builtins.NewRegistry(parallelExec)}
+	parallelController := &Controller{Provider: newProvider(), Tools: builtins.NewRegistry(parallelExec)}
 	parallelResult, err := parallelController.RunBlocking(context.Background(), &types.RunRequest{
 		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
 		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
@@ -541,7 +541,7 @@ func TestRunBlocking_ParallelVsSequentialToolExecution(t *testing.T) {
 	}
 
 	seqExec := &trackingExecutor{name: builtins.BuiltinWebSearch, delay: 20 * time.Millisecond}
-	seqController := &Controller{Provider: newProvider(), Builtins: builtins.NewRegistry(seqExec)}
+	seqController := &Controller{Provider: newProvider(), Tools: builtins.NewRegistry(seqExec)}
 	seqResult, err := seqController.RunBlocking(context.Background(), &types.RunRequest{
 		Request: types.MessageRequest{Model: "m", Messages: []types.Message{{Role: "user", Content: "hi"}}},
 		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: false, ToolTimeoutMS: 30000},

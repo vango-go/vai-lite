@@ -12,18 +12,21 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 	"github.com/vango-go/vai-lite/pkg/core/voice"
-	"github.com/vango-go/vai-lite/pkg/gateway/tools/builtins"
 )
 
 type EmitFunc func(event types.RunStreamEvent) error
 
 type Controller struct {
 	Provider          core.Provider
-	Builtins          *builtins.Registry
+	Tools             ToolExecutor
 	VoicePipeline     *voice.Pipeline
 	StreamIdleTimeout time.Duration
 	RequestID         string
 	PublicModel       string
+}
+
+type ToolExecutor interface {
+	Execute(ctx context.Context, name string, input map[string]any) ([]types.ContentBlock, *types.Error)
 }
 
 type toolExecResult struct {
@@ -48,6 +51,9 @@ func (c *Controller) RunStream(ctx context.Context, req *types.RunRequest, emit 
 func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFunc) (*types.RunResult, error) {
 	if c == nil || c.Provider == nil {
 		return nil, fmt.Errorf("provider is required")
+	}
+	if c.Tools == nil {
+		return nil, fmt.Errorf("tool executor is required")
 	}
 	if req == nil {
 		return nil, fmt.Errorf("run request is required")
@@ -275,7 +281,7 @@ func (c *Controller) executeTools(ctx context.Context, uses []types.ToolUseBlock
 			defer cancel()
 		}
 
-		content, toolErr := c.Builtins.Execute(toolCtx, tu.Name, tu.Input)
+		content, toolErr := c.Tools.Execute(toolCtx, tu.Name, tu.Input)
 		res := types.RunToolResult{ToolUseID: tu.ID}
 		if toolErr != nil {
 			res.IsError = true

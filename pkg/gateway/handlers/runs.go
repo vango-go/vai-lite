@@ -25,10 +25,11 @@ import (
 	"github.com/vango-go/vai-lite/pkg/gateway/ratelimit"
 	"github.com/vango-go/vai-lite/pkg/gateway/runloop"
 	"github.com/vango-go/vai-lite/pkg/gateway/sse"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/exa"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/firecrawl"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/tavily"
-	"github.com/vango-go/vai-lite/pkg/gateway/tools/builtins"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/safety"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
 // RunsHandler handles /v1/runs and /v1/runs:stream requests.
@@ -100,8 +101,16 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	registry := h.newBuiltinsRegistry()
-	injectedTools, err := registry.ValidateAndInject(workingReq.Request.Tools, workingReq.Builtins)
+	effectiveServerTools := workingReq.ServerTools
+	if len(effectiveServerTools) == 0 {
+		effectiveServerTools = workingReq.Builtins
+	}
+	registry, err := h.newServerToolsRegistry(r, effectiveServerTools, workingReq.ServerToolConfig)
+	if err != nil {
+		h.writeErr(w, reqID, err, false)
+		return
+	}
+	injectedTools, err := registry.ValidateAndInject(workingReq.Request.Tools, effectiveServerTools)
 	if err != nil {
 		h.writeErr(w, reqID, err, false)
 		return
@@ -126,7 +135,7 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	controller := &runloop.Controller{
 		Provider:          provider,
-		Builtins:          registry,
+		Tools:             registry,
 		VoicePipeline:     voicePipeline,
 		StreamIdleTimeout: h.Config.StreamIdleTimeout,
 		RequestID:         reqID,
@@ -156,7 +165,7 @@ func (h RunsHandler) serveStream(
 	provider core.Provider,
 	runReq *types.RunRequest,
 	voicePipeline *voice.Pipeline,
-	registry *builtins.Registry,
+	registry *servertools.Registry,
 ) {
 	if h.Lifecycle != nil && h.Lifecycle.IsDraining() {
 		writeCoreErrorJSON(w, reqID, &core.Error{Type: core.ErrOverloaded, Message: "gateway is draining", Code: "draining", RequestID: reqID}, 529)
@@ -214,7 +223,7 @@ func (h RunsHandler) serveStream(
 
 	controller := &runloop.Controller{
 		Provider:          provider,
-		Builtins:          registry,
+		Tools:             registry,
 		VoicePipeline:     voicePipeline,
 		StreamIdleTimeout: h.Config.StreamIdleTimeout,
 		RequestID:         reqID,
@@ -277,14 +286,141 @@ func (h RunsHandler) resolveVoicePipeline(r *http.Request) *voice.Pipeline {
 	)
 }
 
-func (h RunsHandler) newBuiltinsRegistry() *builtins.Registry {
+func (h RunsHandler) newServerToolsRegistry(r *http.Request, enabled []string, rawConfig map[string]any) (*servertools.Registry, error) {
+	enabledSet := make(map[string]struct{}, len(enabled))
+	for i, name := range enabled {
+		name = strings.TrimSpace(name)
+		switch name {
+		case servertools.ToolWebSearch, servertools.ToolWebFetch:
+		default:
+			return nil, &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: fmt.Sprintf("unsupported server tool %q", name),
+				Param:   fmt.Sprintf("server_tools[%d]", i),
+				Code:    "unsupported_server_tool",
+			}
+		}
+		enabledSet[name] = struct{}{}
+	}
+	for name := range rawConfig {
+		if _, ok := enabledSet[name]; !ok {
+			return nil, &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: fmt.Sprintf("server tool config provided for disabled tool %q", name),
+				Param:   "server_tool_config." + name,
+				Code:    "run_validation_failed",
+			}
+		}
+	}
+
 	toolHTTPClient := safety.NewRestrictedHTTPClient(h.HTTPClient)
-	searchClient := tavily.NewClient(h.Config.TavilyAPIKey, h.Config.TavilyBaseURL, toolHTTPClient)
-	fetchClient := firecrawl.NewClient(h.Config.FirecrawlAPIKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
-	return builtins.NewRegistry(
-		builtins.NewWebSearchBuiltin(searchClient),
-		builtins.NewWebFetchBuiltin(fetchClient),
-	)
+	executors := make([]servertools.Executor, 0, len(enabled))
+
+	if _, ok := enabledSet[servertools.ToolWebSearch]; ok {
+		searchConfig, err := servertools.DecodeWebSearchConfig(rawConfig[servertools.ToolWebSearch])
+		if err != nil {
+			if strings.Contains(err.Error(), "unsupported provider") {
+				return nil, &core.Error{
+					Type:    core.ErrInvalidRequest,
+					Message: err.Error(),
+					Param:   "server_tool_config.vai_web_search.provider",
+					Code:    "unsupported_tool_provider",
+				}
+			}
+			return nil, &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: err.Error(),
+				Param:   "server_tool_config.vai_web_search",
+				Code:    "run_validation_failed",
+			}
+		}
+
+		if searchConfig.Provider == "" {
+			hasTavilyKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyTavily)) != ""
+			hasExaKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyExa)) != ""
+			if hasTavilyKey == hasExaKey {
+				msg := "server_tool_config.vai_web_search.provider is required"
+				if hasTavilyKey && hasExaKey {
+					msg = "ambiguous web search provider; set server_tool_config.vai_web_search.provider"
+				}
+				return nil, &core.Error{
+					Type:    core.ErrInvalidRequest,
+					Message: msg,
+					Param:   "server_tool_config.vai_web_search.provider",
+					Code:    "tool_provider_missing",
+				}
+			}
+			if hasTavilyKey {
+				searchConfig.Provider = servertools.ProviderTavily
+			} else {
+				searchConfig.Provider = servertools.ProviderExa
+			}
+		}
+
+		searchHeader := servertools.ProviderHeaderName(searchConfig.Provider)
+		searchKey := strings.TrimSpace(r.Header.Get(searchHeader))
+		if searchKey == "" {
+			return nil, &core.Error{
+				Type:    core.ErrAuthentication,
+				Message: "missing server tool provider key header",
+				Param:   searchHeader,
+				Code:    "provider_key_missing",
+			}
+		}
+		var tavilyClient *tavily.Client
+		var exaClient *exa.Client
+		switch searchConfig.Provider {
+		case servertools.ProviderTavily:
+			tavilyClient = tavily.NewClient(searchKey, h.Config.TavilyBaseURL, toolHTTPClient)
+		case servertools.ProviderExa:
+			exaClient = exa.NewClient(searchKey, h.Config.ExaBaseURL, toolHTTPClient)
+		default:
+			return nil, &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: fmt.Sprintf("unsupported web search provider %q", searchConfig.Provider),
+				Param:   "server_tool_config.vai_web_search.provider",
+				Code:    "unsupported_tool_provider",
+			}
+		}
+		executors = append(executors, servertools.NewWebSearchExecutor(searchConfig, tavilyClient, exaClient))
+	}
+
+	if _, ok := enabledSet[servertools.ToolWebFetch]; ok {
+		fetchConfig, err := servertools.DecodeWebFetchConfig(rawConfig[servertools.ToolWebFetch])
+		if err != nil {
+			if strings.Contains(err.Error(), "unsupported provider") {
+				return nil, &core.Error{
+					Type:    core.ErrInvalidRequest,
+					Message: err.Error(),
+					Param:   "server_tool_config.vai_web_fetch.provider",
+					Code:    "unsupported_tool_provider",
+				}
+			}
+			return nil, &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: err.Error(),
+				Param:   "server_tool_config.vai_web_fetch",
+				Code:    "run_validation_failed",
+			}
+		}
+		if fetchConfig.Provider == "" {
+			fetchConfig.Provider = servertools.ProviderFirecrawl
+		}
+		fetchHeader := servertools.ProviderHeaderName(fetchConfig.Provider)
+		fetchKey := strings.TrimSpace(r.Header.Get(fetchHeader))
+		if fetchKey == "" {
+			return nil, &core.Error{
+				Type:    core.ErrAuthentication,
+				Message: "missing server tool provider key header",
+				Param:   fetchHeader,
+				Code:    "provider_key_missing",
+			}
+		}
+		fetchClient := firecrawl.NewClient(fetchKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
+		executors = append(executors, servertools.NewWebFetchExecutor(fetchConfig, fetchClient))
+	}
+
+	return servertools.NewRegistry(executors...), nil
 }
 
 func (h RunsHandler) writeErr(w http.ResponseWriter, reqID string, err error, isStream bool) {

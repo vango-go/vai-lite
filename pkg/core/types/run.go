@@ -8,9 +8,11 @@ import (
 
 // RunRequest is the request body for /v1/runs and /v1/runs:stream.
 type RunRequest struct {
-	Request  MessageRequest `json:"request"`
-	Run      RunConfig      `json:"run,omitempty"`
-	Builtins []string       `json:"builtins,omitempty"`
+	Request          MessageRequest `json:"request"`
+	Run              RunConfig      `json:"run,omitempty"`
+	ServerTools      []string       `json:"server_tools,omitempty"`
+	ServerToolConfig map[string]any `json:"server_tool_config,omitempty"`
+	Builtins         []string       `json:"builtins,omitempty"`
 }
 
 // RunConfig controls server-side tool-loop limits.

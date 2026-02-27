@@ -65,9 +65,10 @@ Related docs (kept separate by design):
   - [8.1 Event framing](#81-event-framing)
   - [8.2 Event types](#82-event-types)
 - [9. Gateway-Managed Tools](#9-gateway-managed-tools)
-  - [9.1 Builtin tool categories](#91-builtin-tool-categories)
-  - [9.2 Builtin declaration and injection](#92-builtin-declaration-and-injection)
+  - [9.1 Tool categories](#91-tool-categories)
+  - [9.2 Server tool declaration and injection](#92-server-tool-declaration-and-injection)
   - [9.3 Client-executed function tools](#93-client-executed-function-tools)
+  - [9.4 VAI-native web tools (server tools): provider selection + BYOK keying](#94-vai-native-web-tools-server-tools-provider-selection--byok-keying)
 - [10. Voice Support on /v1/messages](#10-voice-support-on-v1messages)
   - [10.1 Voice input (STT)](#101-voice-input-stt)
   - [10.2 Voice output (TTS, non-streaming)](#102-voice-output-tts-non-streaming)
@@ -337,6 +338,8 @@ All "per-principal" limits in this spec refer to this resolved identity.
 
 Proxy v1 is **BYOK-first** (a standard proxy pattern where upstream credentials are passed per-request). Developers keep their own provider API keys (Anthropic, OpenAI, etc.) in their own secrets store or environment variables. On each request to the gateway, the caller's backend sets the appropriate `X-Provider-Key-*` header. The gateway uses the key for the upstream provider call and **never stores it** — it is a per-request passthrough. The gateway MAY hold the key in memory only for the lifetime of the request. It MUST NOT persist it to disk, database, or cache, and MUST redact it from all logs, traces, and error responses.
 
+This same BYOK mechanism is also used for **gateway-executed server tools** that call third-party APIs (e.g. VAI-native web search/fetch). The tool call input sent to the model MUST NOT contain any secrets; the gateway resolves tool provider credentials out-of-band (headers for HTTP, `hello.byok` for WebSocket Live).
+
 **How it works in practice:**
 
 ```
@@ -367,7 +370,7 @@ Content-Type: application/json
 {"model": "anthropic/claude-sonnet-4", "max_tokens": 1024, ...}
 ```
 
-The gateway MUST NOT forward provider key headers to any outbound destination other than the matched upstream provider (not to tool fetchers, webhooks, logging services, etc.).
+The gateway MUST NOT forward provider key headers to any outbound destination other than the matched upstream provider for that specific key (LLM providers, voice providers, or tool providers). It MUST NOT send `X-Provider-Key-*` headers to unrelated outbound destinations (webhooks, logging services, arbitrary fetchers, etc.), and it MUST never send them to the model.
 
 **Header mapping:**
 
@@ -381,6 +384,9 @@ The gateway MUST NOT forward provider key headers to any outbound destination ot
 | `X-Provider-Key-OpenRouter` | `openrouter/*` |
 | `X-Provider-Key-Cartesia` | Voice STT/TTS on `/v1/messages`; Live audio STT/TTS |
 | `X-Provider-Key-ElevenLabs` | Live audio TTS (when enabled) |
+| `X-Provider-Key-Tavily` | `vai_web_search` server tool when configured with `provider="tavily"` |
+| `X-Provider-Key-Exa` | `vai_web_search` server tool when configured with `provider="exa"` |
+| `X-Provider-Key-Firecrawl` | `vai_web_fetch` server tool when configured with `provider="firecrawl"` |
 
 Shared keys:
 - `X-Provider-Key-OpenAI` is used by both `openai/*` (Chat Completions) and `oai-resp/*` (Responses API).
@@ -561,14 +567,23 @@ Server-side tool loop. Returns a final result after the run completes.
     "parallel_tools": true,
     "tool_timeout_ms": 30000
   },
-  "builtins": ["vai_web_search"]
+  "server_tools": ["vai_web_search"],
+  "server_tool_config": {
+    "vai_web_search": {
+      "provider": "tavily",
+      "max_results": 8
+    }
+  }
 }
 ```
 
 - `request` is a `types.MessageRequest`. `request.stream` must be `false` or omitted.
 - `run` contains tool-loop stop conditions (mirrors Go SDK `RunOption`s).
-- `builtins` declares which gateway-managed builtin tools are enabled for this run (see [section 9](#9-gateway-managed-tools)).
-- The gateway injects canonical builtin tool definitions into `request.tools`. Do not trust caller-supplied schemas for builtins.
+- `server_tools` declares which gateway-managed **server tools** are enabled for this run (see [section 9](#9-gateway-managed-tools)).
+- `server_tool_config` configures those server tools (provider selection + tool-specific limits/policies).
+- Back-compat: `builtins` is a deprecated alias of `server_tools` (accepted for a transition period). If both are set, they must represent the same set.
+- The gateway injects canonical server tool definitions into `request.tools`. Do not trust caller-supplied schemas/descriptions for server tools.
+- **Credentials:** server tools that call third-party APIs require BYOK tool-provider keys via `X-Provider-Key-*` headers (e.g. `X-Provider-Key-Tavily`). The model/tool call inputs MUST NOT include secrets.
 
 **Response (JSON):**
 
@@ -617,9 +632,10 @@ Beyond standard `/v1/messages` request validation, `/v1/runs` endpoints enforce:
 - `run.max_tool_calls`: must be `1–256`.
 - `run.timeout_ms`: must be `1000–300000` (1 second to 5 minutes).
 - `run.tool_timeout_ms`: must be `1000–60000` (1 second to 1 minute).
-- `builtins`: must contain only allowlisted builtin names.
-- **Name collision rule:** if `request.tools` includes a `function` tool whose name matches a builtin in `builtins`, **reject** the request. This prevents ambiguity about whether the gateway or the caller owns tool execution.
-- `request.tools` + `builtins` merge: builtins are injected **in addition to** `request.tools` (which may include provider-native tools like `web_search`). Provider-native tools are passed through to the provider; builtins are executed by the gateway.
+- `server_tools` (or legacy `builtins`): must contain only allowlisted server tool names.
+- `server_tool_config`: must only contain keys for tools that appear in `server_tools`/`builtins` (no config for disabled tools).
+- **Name collision rule:** if `request.tools` includes a `function` tool whose name matches a server tool in `server_tools`/`builtins`, **reject** the request. This prevents ambiguity about whether the gateway or the caller owns tool execution.
+- `request.tools` + `server_tools` merge: server tools are injected **in addition to** `request.tools` (which may include provider-native tools like `web_search`). Provider-native tools are passed through to the provider; server tools are executed by the gateway.
 - `run.parallel_tools`: when `true` (default), the gateway executes multiple tool calls from the same model turn concurrently. When `false`, tool calls within a turn are executed sequentially in the order they appear.
 
 **Cancellation semantics (`/v1/runs` blocking):**
@@ -1201,7 +1217,7 @@ Wraps `pkg/core/types.StreamEvent` objects from the underlying provider stream. 
 
 #### `tool_call_start`
 
-Emitted when the gateway begins executing a function tool handler (gateway-managed builtin).
+Emitted when the gateway begins executing a function tool handler (gateway-managed server tool / legacy “builtin”).
 
 ```json
 {
@@ -1295,7 +1311,7 @@ Optional keepalive during long-running tool executions.
 
 ## 9. Gateway-Managed Tools
 
-### 9.1 Builtin tool categories
+### 9.1 Tool categories
 
 v1 supports three tool categories in `/v1/runs`:
 
@@ -1304,32 +1320,42 @@ v1 supports three tool categories in `/v1/runs`:
 - The provider executes it; the gateway does not run any local handler.
 - Passed through to the provider as-is.
 
-**2. Gateway-managed builtins:**
-- `tool.type: "function"` with a name from the builtin allowlist.
-- The gateway executes a small set of allowlisted builtins.
-- Initial builtin: `vai_web_search` (VAI-native web search via Tavily or configured adapter).
-- Optional: `vai_web_fetch` (VAI-native web fetch via Firecrawl or configured adapter).
+**2. Gateway-managed server tools (formerly “builtins”):**
+- `tool.type: "function"` with a name from the server-tool allowlist.
+- Enabled per-run via `server_tools` (preferred) or legacy `builtins` (deprecated; see [4.3](#43-post-v1runs-blocking)).
+- Configured via `server_tool_config` (provider selection + tool-specific limits/policies).
+- The gateway executes a small set of allowlisted server tools.
+- Initial server tool: `vai_web_search` (VAI-native web search via allowlisted adapters such as Tavily/Exa/etc.).
+- Optional: `vai_web_fetch` (VAI-native web fetch via allowlisted adapters such as Firecrawl/etc.).
+- **Keying/DX invariant:** v1 does **not** ship with any VAI-managed third-party web API keys. Callers must provide their own tool-provider key (BYOK) per request/session; the gateway uses it ephemerally and never stores it.
 
 **3. Client-executed function tools:**
 - Not supported in `/v1/runs` v1.
 - If the request references function tools outside the allowlist, reject with a clear error directing callers to use `/v1/messages` and execute tools in application code.
 
-### 9.2 Builtin declaration and injection
+### 9.2 Server tool declaration and injection
 
-Builtins are **referenced, not defined** in requests:
+Server tools are **referenced, not defined** in requests:
 
 ```json
 {
-  "builtins": ["vai_web_search"]
+  "server_tools": ["vai_web_search"],
+  "server_tool_config": {
+    "vai_web_search": {"provider": "tavily"}
+  }
 }
 ```
 
 The gateway:
-1. Validates that `builtins` contains only allowlisted names.
-2. Injects canonical tool definitions (schema, description) into the model request.
-3. Does **not** trust caller-supplied schemas/descriptions for builtin tools.
+1. Validates that `server_tools` contains only allowlisted names.
+2. Validates `server_tool_config` against those enabled tools.
+3. Injects canonical tool definitions (schema, description) into the model request.
+4. Does **not** trust caller-supplied schemas/descriptions for server tools.
 
-This keeps builtin behavior stable and prevents accidental schema weakening.
+This keeps server tool behavior stable and prevents accidental schema weakening.
+
+Back-compat:
+- `builtins` is accepted as a deprecated alias of `server_tools` for a transition period. If both are present, they must match.
 
 ### 9.3 Client-executed function tools
 
@@ -1339,6 +1365,46 @@ Not supported in v1. If needed, callers should:
 - Send a follow-up request with tool results.
 
 Future: "registered HTTP tools" where the gateway calls a customer-owned webhook URL.
+
+### 9.4 VAI-native web tools (server tools): provider selection + BYOK keying
+
+VAI-native web tools are intentionally provider-agnostic. The caller selects a specific web tool provider via `server_tool_config`, and supplies the matching provider API key via BYOK headers (HTTP) or in-band BYOK keys (Live WebSocket).
+
+#### `vai_web_search`
+
+Supported providers (initial):
+- `tavily` (requires `X-Provider-Key-Tavily`)
+- `exa` (requires `X-Provider-Key-Exa`)
+
+Example:
+```json
+{
+  "server_tools": ["vai_web_search"],
+  "server_tool_config": {
+    "vai_web_search": {"provider": "tavily", "max_results": 8}
+  }
+}
+```
+
+#### `vai_web_fetch`
+
+Supported providers (initial):
+- `firecrawl` (requires `X-Provider-Key-Firecrawl`)
+
+Example:
+```json
+{
+  "server_tools": ["vai_web_fetch"],
+  "server_tool_config": {
+    "vai_web_fetch": {"provider": "firecrawl", "format": "text"}
+  }
+}
+```
+
+#### Secret handling rules (normative)
+- Tool provider API keys MUST be provided out-of-band (headers / `hello.byok`) and MUST NOT appear in tool input JSON.
+- The gateway MUST redact tool provider keys from logs/traces/errors, and MUST NOT persist them.
+- The gateway MUST NOT forward tool provider BYOK keys to unrelated outbound destinations.
 
 ---
 
@@ -1511,6 +1577,9 @@ When enabled:
   - `X-Provider-Key-OpenRouter`
   - `X-Provider-Key-Cartesia`
   - `X-Provider-Key-ElevenLabs`
+  - `X-Provider-Key-Tavily`
+  - `X-Provider-Key-Exa`
+  - `X-Provider-Key-Firecrawl`
 
   Browsers do not support wildcard patterns like `X-Provider-Key-*` in `Access-Control-Allow-Headers`, so the gateway enumerates concrete allowed headers. Only requested headers that appear in this allowlist are reflected. When a new provider is added, its `X-Provider-Key-*` header must be added to this list.
 - `Vary: Origin, Access-Control-Request-Headers` — required when reflecting origin/headers to prevent cache poisoning by intermediary proxies.
@@ -1549,7 +1618,7 @@ Minimum useful set:
 OpenTelemetry integration:
 - Trace for each HTTP request and WS session.
 - Spans for upstream provider calls.
-- Spans for tool execution (gateway-managed builtins).
+- Spans for tool execution (gateway-managed server tools / legacy “builtins”).
 - Propagate `traceparent` header.
 
 ### 13.4 Logging
@@ -1727,7 +1796,8 @@ const result = await vai.runs.create({
     messages: [{ role: "user", content: "Search for latest Go release" }],
   },
   run: { max_turns: 8, max_tool_calls: 20 },
-  builtins: ["vai_web_search"],
+  server_tools: ["vai_web_search"],
+  server_tool_config: { vai_web_search: { provider: "tavily" } },
 });
 ```
 
@@ -1737,7 +1807,8 @@ const result = await vai.runs.create({
 const stream = await vai.runs.stream({
   request: { ... },
   run: { max_turns: 8 },
-  builtins: ["vai_web_search"],
+  server_tools: ["vai_web_search"],
+  server_tool_config: { vai_web_search: { provider: "tavily" } },
 });
 
 for await (const event of stream) {
@@ -1815,13 +1886,8 @@ class VAITransportError extends Error {
 - `/healthz` and `/readyz` endpoints.
 
 **Not yet implemented:**
-- `/v1/runs` and `/v1/runs:stream` (server-side tool loop).
-- `/v1/models` (model discovery).
-- `/v1/live` (WebSocket live audio).
-- Gateway-managed builtin tools (`vai_web_search`, `vai_web_fetch`).
 - Redis-backed distributed rate limiting.
 - Postgres tenant/key storage.
-- Go SDK proxy transport mode.
 - TypeScript SDK.
 - Python SDK.
 - Rust SDK.
@@ -1857,20 +1923,20 @@ flowchart LR
 **Phase 04: /v1/messages (SSE Streaming)** — DONE
 - Remaining SSE hardening tracked in Phase 02.
 
-**Phase 05: Provider Compatibility Validation + /v1/models** — NOT STARTED
+**Phase 05: Provider Compatibility Validation + /v1/models** — DONE
 - Feature compatibility validator.
 - `/v1/models` endpoint.
 
-**Phase 06: /v1/runs + /v1/runs:stream** — NOT STARTED
+**Phase 06: /v1/runs + /v1/runs:stream** — DONE
 - Server-side run controller: `pkg/gateway/runloop/`.
-- Gateway-managed builtins: `pkg/gateway/tools/builtins/`.
+- Gateway-managed server tools (legacy “builtins”, now documented as server tools): `pkg/gateway/tools/servertools/`.
 - Run event SSE streaming.
 - Strict request validation for run requests.
 
 **Phase 07: OpenAPI and Docs** — NOT STARTED
 - `api/openapi.yaml` covering all endpoints.
 
-**Phase 08: Go SDK Proxy Transport** — NOT STARTED
+**Phase 08: Go SDK Proxy Transport** — DONE
 - Objective: allow existing Go call sites to route through the hosted/self-hosted gateway with minimal code changes, while preserving today’s direct-mode behavior for local dev.
 - Public SDK options (additive, backwards compatible):
   - `WithBaseURL(url string)` — enables proxy mode when set (route through gateway instead of calling providers directly).
@@ -1930,11 +1996,11 @@ flowchart LR
   - Non-streaming: accept gateway-appended audio blocks.
   - Streaming: forward gateway-emitted `audio_chunk` and `audio_unavailable` events (do not synthesize audio client-side).
 - Run behavior in proxy mode (be explicit about tool execution locus):
-  - `/v1/runs` v1 supports provider-native tools and gateway-managed builtins only (no client-executed function tools; see [9.3](#93-client-executed-function-tools)).
+  - `/v1/runs` v1 supports provider-native tools and gateway-managed server tools only (legacy “builtins”; no client-executed function tools; see [9.3](#93-client-executed-function-tools)).
   - Recommended SDK strategy:
     - Keep the existing client-side tool loop (`sdk/run.go`) available (direct mode and proxy mode); do not change the meaning of today’s `Messages.Run` / `Messages.RunStream` by default.
     - Add a distinct, additive server-run surface (recommended: a new `Runs` service with `client.Runs.Create(...)` and `client.Runs.Stream(...)`) that calls `/v1/runs` and `/v1/runs:stream`.
-    - Add an explicit “server-run” option/path that calls `/v1/runs` and `/v1/runs:stream` when callers want gateway-managed builtins and do not need client-executed function tools.
+    - Add an explicit “server-run” option/path that calls `/v1/runs` and `/v1/runs:stream` when callers want gateway-managed server tools and do not need client-executed function tools.
     - If a caller attempts a server-run while providing function tools/handlers, fail fast with a clear `invalid_request_error` explaining the constraint (do not silently fall back to client-side execution).
 - Test plan (SDK-focused; all should be hermetic using `httptest`):
   - Header construction:
@@ -2161,7 +2227,7 @@ Implement and validate this *minimum* schema (allow unknown fields for forward-c
   },
   "audio_in": {"encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1},
   "audio_out":{"encoding":"pcm_s16le","sample_rate_hz":24000,"channels":1},
-  "voice": {                     // 9A-required for TTS unless you choose a global default
+  "voice": {                     // 9A-required for TTS; clients/SDKs should provide defaults (do not rely on hosted gateway defaults)
     "language": "en",
     "voice_id": "cartesia_voice_id",
     "speed": 1.0,
@@ -2551,8 +2617,8 @@ Scenarios:
     - multi-context support (respect provider caps; e.g. context limit)
     - best-effort hard-stop on interrupt (close/cancel context)
     - optional alignment (`sync_alignment`) when available
-  - Provider selection:
-    - Default: ElevenLabs TTS, Cartesia STT (per `LIVE_AUDIO_MODE_DESIGN.md` §12.1).
+- Provider selection:
+    - Recommended baseline: ElevenLabs TTS, Cartesia STT (per `LIVE_AUDIO_MODE_DESIGN.md` §12.1), when credentials/policy allow.
     - Explicit fallback to Cartesia TTS (tenant/session policy), never a silent runtime surprise.
   - Keepalive rules for provider WS connections (avoid provider idle disconnect).
 - Credential resolution (Live mode, hosted-friendly):

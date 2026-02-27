@@ -2,7 +2,7 @@
 
 This document proposes a **provider-agnostic**, **proxy-friendly**, **WebSocket-based** “Live Audio Mode” built on top of the existing `RunStream` tool-loop semantics.
 
-It is written to support the end goal: **VAI as a hosted proxy AI gateway** (with SDKs in multiple languages) that exposes a stable public Live API while allowing VAI to swap/extend STT/TTS providers behind the scenes.
+It is written to support the end goal: **VAI as a hosted proxy AI gateway** (with SDKs in multiple languages) that exposes a stable public Live API while allowing the gateway to swap/extend STT/TTS provider adapters behind the scenes (without changing the wire protocol or requiring VAI-managed upstream API keys in v1).
 
 The design assumes:
 - **Streaming STT** (always-on) + endpointing at **600ms silence**
@@ -899,13 +899,13 @@ This gives you a principled way to handle interruptions without hacking the prov
 
 ## 12. Provider Selection Policy
 
-### 12.1 Default recommendation
+### 12.1 Recommended baseline
 - STT: **Cartesia** (already present, streaming WS)
 - TTS: **ElevenLabs** for realism + alignment (multi-context WS + `sync_alignment`)
 
 ### 12.2 Optional / fallback
 - TTS: **Cartesia** when:
-  - ElevenLabs isn’t configured for the tenant
+  - ElevenLabs isn’t enabled for the tenant/session policy or no ElevenLabs BYOK key is provided
   - the tenant prioritizes cost/latency over alignment
   - regional residency requires it
 

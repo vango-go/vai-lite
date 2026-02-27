@@ -171,7 +171,8 @@ client := vai.NewClient(
 Proxy mode notes:
 - `Messages.Run` / `Messages.RunStream` remain client-side loops.
 - `Runs.Create` / `Runs.Stream` call gateway server-side loops.
-- Server-side runs reject client function tools (use gateway builtins/provider-native tools instead).
+- Server-side runs reject client function tools (use provider-native tools and/or gateway-managed **server tools** instead).
+- Gateway server tools are enabled via `server_tools` + `server_tool_config` (legacy `builtins` remains accepted as a compatibility alias).
 - For non-streaming proxy calls, pass request contexts with explicit deadlines in production.
 
 ### 3.1 OpenAI-Compatible Chat Providers
@@ -755,10 +756,10 @@ import (
     "github.com/vango-go/vai-lite/sdk/adapters/firecrawl"
 )
 
-// VAI-native web search via Tavily
+// VAI-native web search via Tavily (BYOK: you provide the Tavily API key)
 search := vai.VAIWebSearch(tavily.NewSearch(os.Getenv("TAVILY_API_KEY")))
 
-// VAI-native web fetch via Firecrawl
+// VAI-native web fetch via Firecrawl (BYOK: you provide the Firecrawl API key)
 fetch := vai.VAIWebFetch(firecrawl.NewScrape(os.Getenv("FIRECRAWL_API_KEY")))
 
 // Use with any provider — even those without native search support
@@ -812,6 +813,25 @@ fetch := vai.VAIWebFetch(firecrawl.NewScrape(apiKey), vai.VAIWebFetchConfig{
     Format:   "text",
 })
 ```
+
+DX sugar helpers are available for adapter setup: `tavily.FromEnv()`, `firecrawl.FromEnv()`, and `exa.FromEnv()` (plus `tavily.ExtractFromEnv()` / `exa.ContentsFromEnv()` for fetch-style adapters).
+
+### 8.2 Gateway-Executed VAI-Native Web Tools (`/v1/runs`)
+
+When you use the gateway server-side tool loop (`Runs.Create` / `Runs.Stream` → `/v1/runs`), the gateway executes tools instead of your process.
+
+That means you cannot send a Go adapter object like `tavily.NewSearch(...)` to the gateway. Instead, you:
+
+1. Enable a gateway server tool by name (e.g. `vai_web_search`, `vai_web_fetch`).
+2. Select which web provider adapter the gateway should use (e.g. Tavily vs Exa vs Firecrawl).
+3. Provide the tool provider API key as BYOK **out-of-band** (never in model-visible tool inputs).
+
+Current wire contract:
+- Request fields: `server_tools` + `server_tool_config`.
+- Tool provider BYOK headers (examples): `X-Provider-Key-Tavily`, `X-Provider-Key-Exa`, `X-Provider-Key-Firecrawl`.
+- Legacy alias: `builtins` (deprecated) is still accepted; if both are present they must match.
+
+**Important:** the LLM/tool call input must never include API keys. Keys are provided to the gateway via headers (HTTP) or `hello.byok` (Live WebSocket), and the gateway uses them ephemerally.
 
 ---
 
@@ -1204,7 +1224,7 @@ These are *recommended starting points* for a live gateway; validate against rea
   - keepalive when needed: send `{"text":"", "context_id":"..."}` periodically
 
 Credential policy:
-- If a tenant selects `voice_provider=elevenlabs` but has no ElevenLabs credential configured, fail fast during handshake with a clear error. Do not silently fall back to Cartesia unless that is an explicit tenant policy.
+- If the session/deployment selects `voice_provider=elevenlabs` but no ElevenLabs BYOK credential is provided, fail fast during the handshake with a clear error. Do not silently fall back to Cartesia unless that is an explicit tenant/session policy.
 
 Operational notes:
 - Prefer `audio_out=pcm_*` for v1 so timing/backpressure math is correct; compressed audio output is possible later but requires `sent_ms` to be computed from decoded PCM duration.

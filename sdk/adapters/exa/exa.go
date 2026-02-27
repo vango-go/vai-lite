@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 
 	vai "github.com/vango-go/vai-lite/sdk"
 )
@@ -70,6 +72,11 @@ func NewSearch(apiKey string, opts ...Option) *Search {
 		baseURL: o.baseURL,
 		client:  o.httpClient,
 	}
+}
+
+// FromEnv creates an Exa Search provider using EXA_API_KEY.
+func FromEnv(opts ...Option) *Search {
+	return NewSearch(strings.TrimSpace(os.Getenv("EXA_API_KEY")), opts...)
 }
 
 // exaSearchRequest is the Exa /search request body.
@@ -208,6 +215,11 @@ func NewContents(apiKey string, opts ...Option) *Contents {
 		baseURL: o.baseURL,
 		client:  o.httpClient,
 	}
+}
+
+// ContentsFromEnv creates an Exa Contents provider using EXA_API_KEY.
+func ContentsFromEnv(opts ...Option) *Contents {
+	return NewContents(strings.TrimSpace(os.Getenv("EXA_API_KEY")), opts...)
 }
 
 // exaContentsRequest is the Exa /contents request body.

@@ -84,6 +84,11 @@ type HelloFeatures struct {
 	ClientHasAEC           bool   `json:"client_has_aec,omitempty"`
 }
 
+type HelloTools struct {
+	ServerTools      []string       `json:"server_tools,omitempty"`
+	ServerToolConfig map[string]any `json:"server_tool_config,omitempty"`
+}
+
 type ClientHello struct {
 	Type               string        `json:"type"`
 	ProtocolVersion    string        `json:"protocol_version"`
@@ -94,6 +99,7 @@ type ClientHello struct {
 	AudioIn            AudioFormat   `json:"audio_in"`
 	AudioOut           AudioFormat   `json:"audio_out"`
 	Voice              *HelloVoice   `json:"voice,omitempty"`
+	Tools              *HelloTools   `json:"tools,omitempty"`
 	Features           HelloFeatures `json:"features,omitempty"`
 	ResumeSessionID    string        `json:"resume_session_id,omitempty"`
 	LastClientAudioSeq *int64        `json:"last_client_audio_seq,omitempty"`
@@ -111,6 +117,17 @@ func (h ClientHello) RedactedForLog() map[string]any {
 	sort.Strings(byokKeyNames)
 	if len(byokKeyNames) > 32 {
 		byokKeyNames = byokKeyNames[:32]
+	}
+	serverTools := make([]string, 0)
+	if h.Tools != nil {
+		for _, name := range h.Tools.ServerTools {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			serverTools = append(serverTools, name)
+		}
+		sort.Strings(serverTools)
 	}
 
 	return map[string]any{
@@ -131,8 +148,10 @@ func (h ClientHello) RedactedForLog() map[string]any {
 			"cartesia":   strings.TrimSpace(h.BYOK.Cartesia) != "",
 			"elevenlabs": strings.TrimSpace(h.BYOK.ElevenLabs) != "",
 		},
-		"has_byok_keys":  len(h.BYOK.Keys) > 0,
-		"byok_key_names": byokKeyNames,
+		"has_byok_keys":    len(h.BYOK.Keys) > 0,
+		"byok_key_names":   byokKeyNames,
+		"has_server_tools": h.Tools != nil && len(serverTools) > 0,
+		"server_tools":     serverTools,
 	}
 }
 
@@ -283,6 +302,9 @@ func ValidateHello(msg ClientHello) error {
 	if msg.AudioOut.Channels <= 0 {
 		return badRequest("hello.audio_out.channels must be > 0", "audio_out.channels")
 	}
+	if err := validateHelloTools(msg.Tools); err != nil {
+		return err
+	}
 
 	transport := strings.TrimSpace(msg.Features.AudioTransport)
 	if transport == "" {
@@ -295,6 +317,37 @@ func ValidateHello(msg ClientHello) error {
 	default:
 		return unsupported("unsupported audio transport", "features.audio_transport")
 	}
+}
+
+func validateHelloTools(tools *HelloTools) error {
+	if tools == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tools.ServerTools))
+	for i, name := range tools.ServerTools {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			return badRequest("hello.tools.server_tools entries must be non-empty", fmt.Sprintf("tools.server_tools[%d]", i))
+		}
+		if _, exists := seen[trimmed]; exists {
+			return badRequest("hello.tools.server_tools entries must be unique", fmt.Sprintf("tools.server_tools[%d]", i))
+		}
+		seen[trimmed] = struct{}{}
+	}
+	for name, raw := range tools.ServerToolConfig {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			return badRequest("hello.tools.server_tool_config keys must be non-empty", "tools.server_tool_config")
+		}
+		if _, ok := seen[trimmed]; !ok {
+			return badRequest("hello.tools.server_tool_config must only include enabled server tools", "tools.server_tool_config."+trimmed)
+		}
+		obj, ok := raw.(map[string]any)
+		if !ok || obj == nil {
+			return badRequest("hello.tools.server_tool_config entries must be objects", "tools.server_tool_config."+trimmed)
+		}
+	}
+	return nil
 }
 
 type HelloAckFeatures struct {

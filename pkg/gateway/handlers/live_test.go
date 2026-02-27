@@ -348,6 +348,87 @@ func TestLiveHandler_HandshakeUnsupportedProviderIsUnsupported(t *testing.T) {
 	}
 }
 
+func TestLiveHandler_ServerTools_InferSearchProviderFromBYOK(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	hello["tools"] = map[string]any{
+		"server_tools": []any{"vai_web_search"},
+	}
+	hello["byok"] = map[string]any{
+		"anthropic": "sk-ant-test",
+		"cartesia":  "sk-car-test",
+		"keys": map[string]any{
+			"tavily": "tvly-test",
+		},
+	}
+	mustWriteJSON(t, conn, hello)
+
+	ack := mustReadJSON(t, conn, 2*time.Second)
+	if ack["type"] != "hello_ack" {
+		t.Fatalf("ack type=%v payload=%+v", ack["type"], ack)
+	}
+}
+
+func TestLiveHandler_ServerTools_ExplicitExaWithoutKeyUnauthorized(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	hello["tools"] = map[string]any{
+		"server_tools": []any{"vai_web_search"},
+		"server_tool_config": map[string]any{
+			"vai_web_search": map[string]any{"provider": "exa"},
+		},
+	}
+	mustWriteJSON(t, conn, hello)
+
+	msg := mustReadJSON(t, conn, 2*time.Second)
+	if msg["type"] != "error" {
+		t.Fatalf("type=%v payload=%+v", msg["type"], msg)
+	}
+	if msg["code"] != "unauthorized" {
+		t.Fatalf("code=%v payload=%+v", msg["code"], msg)
+	}
+}
+
+func TestLiveHandler_ServerTools_AmbiguousInferenceBadRequest(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	hello["tools"] = map[string]any{
+		"server_tools": []any{"vai_web_search"},
+	}
+	hello["byok"] = map[string]any{
+		"anthropic": "sk-ant-test",
+		"cartesia":  "sk-car-test",
+		"keys": map[string]any{
+			"tavily": "tvly-test",
+			"exa":    "exa-test",
+		},
+	}
+	mustWriteJSON(t, conn, hello)
+
+	msg := mustReadJSON(t, conn, 2*time.Second)
+	if msg["type"] != "error" {
+		t.Fatalf("type=%v payload=%+v", msg["type"], msg)
+	}
+	if msg["code"] != "bad_request" {
+		t.Fatalf("code=%v payload=%+v", msg["code"], msg)
+	}
+}
+
 func TestByokForProvider_AliasesAndKeyPrecedence(t *testing.T) {
 	byok := protocol.HelloBYOK{
 		OpenAI: "sk-openai-typed",

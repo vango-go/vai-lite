@@ -77,6 +77,7 @@ func baseRunsConfig() config.Config {
 		SSEMaxStreamDuration:      time.Minute,
 		StreamIdleTimeout:         time.Second,
 		TavilyBaseURL:             "https://api.tavily.com",
+		ExaBaseURL:                "https://api.exa.ai",
 		FirecrawlBaseURL:          "https://api.firecrawl.dev",
 		LimitMaxConcurrentStreams: 4,
 	}
@@ -110,19 +111,107 @@ func TestRunsHandler_MissingProviderHeader(t *testing.T) {
 	}
 }
 
-func TestRunsHandler_BuiltinMissingConfigFailFast(t *testing.T) {
+func TestRunsHandler_ServerToolMissingProvider_Fails(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search"]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"tool_provider_missing"`) {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestRunsHandler_ServerToolInferProviderFromHeader_Succeeds(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search"]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	req.Header.Set("X-Provider-Key-Tavily", "tvly-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRunsHandler_BuiltinsAliasStillWorks(t *testing.T) {
 	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
 	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
 		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
 		"builtins":["vai_web_search"]
 	}`)))
 	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	req.Header.Set("X-Provider-Key-Tavily", "tvly-test")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
-	if rr.Code != http.StatusInternalServerError {
+	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), `"code":"builtin_not_configured"`) {
+}
+
+func TestRunsHandler_ServerToolMissingKey_Fails401(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search"],
+		"server_tool_config":{"vai_web_search":{"provider":"tavily"}}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"provider_key_missing"`) {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"param":"X-Provider-Key-Tavily"`) {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestRunsHandler_ServerToolAmbiguousInference_Fails(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search"]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	req.Header.Set("X-Provider-Key-Tavily", "tvly-test")
+	req.Header.Set("X-Provider-Key-Exa", "exa-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"tool_provider_missing"`) {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestRunsHandler_ServerToolExaMissingKey_Fails401(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_search"],
+		"server_tool_config":{"vai_web_search":{"provider":"exa"}}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"param":"X-Provider-Key-Exa"`) {
 		t.Fatalf("body=%s", rr.Body.String())
 	}
 }

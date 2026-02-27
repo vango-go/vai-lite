@@ -117,6 +117,97 @@ func TestRunsCreate_RejectsClientFunctionTools(t *testing.T) {
 	}
 }
 
+func TestRunsCreate_AttachesServerToolProviderHeaderForExplicitProvider(t *testing.T) {
+	t.Parallel()
+
+	var gotTavily string
+	var gotExa string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTavily = r.Header.Get("X-Provider-Key-Tavily")
+		gotExa = r.Header.Get("X-Provider-Key-Exa")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.RunResultEnvelope{
+			Result: &types.RunResult{
+				Steps:      []types.RunStep{},
+				StopReason: types.RunStopReasonEndTurn,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("anthropic", "sk-ant"),
+		WithProviderKey("exa", "sk-exa"),
+		WithProviderKey("tavily", "sk-tvly"),
+		WithHTTPClient(server.Client()),
+	)
+
+	_, err := client.Runs.Create(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model:    "anthropic/claude-sonnet-4",
+			Messages: []types.Message{{Role: "user", Content: "hello"}},
+		},
+		ServerTools: []string{"vai_web_search"},
+		ServerToolConfig: map[string]any{
+			"vai_web_search": map[string]any{"provider": "exa"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Runs.Create() error = %v", err)
+	}
+	if gotExa != "sk-exa" {
+		t.Fatalf("X-Provider-Key-Exa=%q", gotExa)
+	}
+	if gotTavily != "" {
+		t.Fatalf("X-Provider-Key-Tavily=%q, want empty", gotTavily)
+	}
+}
+
+func TestRunsCreate_AttachesBothSearchHeadersWhenProviderOmitted(t *testing.T) {
+	t.Parallel()
+
+	var gotTavily string
+	var gotExa string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTavily = r.Header.Get("X-Provider-Key-Tavily")
+		gotExa = r.Header.Get("X-Provider-Key-Exa")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.RunResultEnvelope{
+			Result: &types.RunResult{
+				Steps:      []types.RunStep{},
+				StopReason: types.RunStopReasonEndTurn,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("anthropic", "sk-ant"),
+		WithProviderKey("exa", "sk-exa"),
+		WithProviderKey("tavily", "sk-tvly"),
+		WithHTTPClient(server.Client()),
+	)
+
+	_, err := client.Runs.Create(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model:    "anthropic/claude-sonnet-4",
+			Messages: []types.Message{{Role: "user", Content: "hello"}},
+		},
+		ServerTools: []string{"vai_web_search"},
+	})
+	if err != nil {
+		t.Fatalf("Runs.Create() error = %v", err)
+	}
+	if gotExa != "sk-exa" {
+		t.Fatalf("X-Provider-Key-Exa=%q", gotExa)
+	}
+	if gotTavily != "sk-tvly" {
+		t.Fatalf("X-Provider-Key-Tavily=%q", gotTavily)
+	}
+}
+
 func TestRunsStream_ParsesEventCatalogAndNestedStreamEvents(t *testing.T) {
 	t.Parallel()
 

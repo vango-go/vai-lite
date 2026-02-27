@@ -38,9 +38,8 @@ var gatewayEnvKeys = []string{
 	"VAI_PROXY_LIVE_TURN_TIMEOUT",
 	"VAI_PROXY_CONNECT_TIMEOUT",
 	"VAI_PROXY_RESPONSE_HEADER_TIMEOUT",
-	"VAI_PROXY_TAVILY_API_KEY",
 	"VAI_PROXY_TAVILY_BASE_URL",
-	"VAI_PROXY_FIRECRAWL_API_KEY",
+	"VAI_PROXY_EXA_BASE_URL",
 	"VAI_PROXY_FIRECRAWL_BASE_URL",
 	"VAI_PROXY_TOTAL_REQUEST_TIMEOUT",
 	"VAI_PROXY_RATE_LIMIT_RPS",
@@ -176,14 +175,11 @@ func TestLoadFromEnv_DefaultsMatchSpec(t *testing.T) {
 	if cfg.UpstreamResponseHeaderTimeout != 30*time.Second {
 		t.Fatalf("UpstreamResponseHeaderTimeout = %v, want 30s", cfg.UpstreamResponseHeaderTimeout)
 	}
-	if cfg.TavilyAPIKey != "" {
-		t.Fatalf("TavilyAPIKey = %q, want empty", cfg.TavilyAPIKey)
-	}
 	if cfg.TavilyBaseURL != "https://api.tavily.com" {
 		t.Fatalf("TavilyBaseURL = %q", cfg.TavilyBaseURL)
 	}
-	if cfg.FirecrawlAPIKey != "" {
-		t.Fatalf("FirecrawlAPIKey = %q, want empty", cfg.FirecrawlAPIKey)
+	if cfg.ExaBaseURL != "https://api.exa.ai" {
+		t.Fatalf("ExaBaseURL = %q", cfg.ExaBaseURL)
 	}
 	if cfg.FirecrawlBaseURL != "https://api.firecrawl.dev" {
 		t.Fatalf("FirecrawlBaseURL = %q", cfg.FirecrawlBaseURL)
@@ -236,9 +232,8 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	t.Setenv("VAI_PROXY_SHUTDOWN_GRACE_PERIOD", "31s")
 	t.Setenv("VAI_PROXY_CONNECT_TIMEOUT", "7s")
 	t.Setenv("VAI_PROXY_RESPONSE_HEADER_TIMEOUT", "29s")
-	t.Setenv("VAI_PROXY_TAVILY_API_KEY", "tvly")
 	t.Setenv("VAI_PROXY_TAVILY_BASE_URL", "https://t.example")
-	t.Setenv("VAI_PROXY_FIRECRAWL_API_KEY", "fcr")
+	t.Setenv("VAI_PROXY_EXA_BASE_URL", "https://e.example")
 	t.Setenv("VAI_PROXY_FIRECRAWL_BASE_URL", "https://f.example")
 	t.Setenv("VAI_PROXY_MODEL_ALLOWLIST", "anthropic/a,openai/b")
 
@@ -289,11 +284,14 @@ func TestLoadFromEnv_UsesProxyEnvOverrides(t *testing.T) {
 	if cfg.UpstreamConnectTimeout != 7*time.Second || cfg.UpstreamResponseHeaderTimeout != 29*time.Second {
 		t.Fatalf("upstream timeouts mismatch: %v/%v", cfg.UpstreamConnectTimeout, cfg.UpstreamResponseHeaderTimeout)
 	}
-	if cfg.TavilyAPIKey != "tvly" || cfg.TavilyBaseURL != "https://t.example" {
-		t.Fatalf("tavily mismatch: %q/%q", cfg.TavilyAPIKey, cfg.TavilyBaseURL)
+	if cfg.TavilyBaseURL != "https://t.example" {
+		t.Fatalf("tavily base mismatch: %q", cfg.TavilyBaseURL)
 	}
-	if cfg.FirecrawlAPIKey != "fcr" || cfg.FirecrawlBaseURL != "https://f.example" {
-		t.Fatalf("firecrawl mismatch: %q/%q", cfg.FirecrawlAPIKey, cfg.FirecrawlBaseURL)
+	if cfg.ExaBaseURL != "https://e.example" {
+		t.Fatalf("exa base mismatch: %q", cfg.ExaBaseURL)
+	}
+	if cfg.FirecrawlBaseURL != "https://f.example" {
+		t.Fatalf("firecrawl base mismatch: %q", cfg.FirecrawlBaseURL)
 	}
 	if len(cfg.APIKeys) != 2 {
 		t.Fatalf("APIKeys len=%d, want 2", len(cfg.APIKeys))

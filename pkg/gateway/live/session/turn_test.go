@@ -9,6 +9,7 @@ import (
 
 	"github.com/vango-go/vai-lite/pkg/core"
 	"github.com/vango-go/vai-lite/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
 type fakeProvider struct {
@@ -155,5 +156,106 @@ func TestRunTurn_PropagatesDeadlineExceeded(t *testing.T) {
 	}
 	if err != context.DeadlineExceeded {
 		t.Fatalf("err=%v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
+type fakeServerToolExecutor struct {
+	name string
+}
+
+func (f fakeServerToolExecutor) Name() string { return f.name }
+func (f fakeServerToolExecutor) Definition() types.Tool {
+	return types.Tool{
+		Type:        types.ToolTypeFunction,
+		Name:        f.name,
+		Description: "d",
+		InputSchema: &types.JSONSchema{Type: "object"},
+	}
+}
+func (f fakeServerToolExecutor) Execute(ctx context.Context, input map[string]any) ([]types.ContentBlock, *types.Error) {
+	_ = ctx
+	_ = input
+	return []types.ContentBlock{types.TextBlock{Type: "text", Text: "search result"}}, nil
+}
+
+func TestRunTurn_ServerToolThenTalkToUser(t *testing.T) {
+	var callCount int
+	p := &fakeProvider{
+		streamFn: func(ctx context.Context, req *types.MessageRequest) core.EventStream {
+			_ = ctx
+			callCount++
+			if callCount == 1 {
+				msgDelta := types.MessageDeltaEvent{Type: "message_delta"}
+				msgDelta.Delta.StopReason = types.StopReasonToolUse
+				return &countingStream{events: []types.StreamEvent{
+					types.MessageStartEvent{Type: "message_start", Message: types.MessageResponse{ID: "msg_1", Type: "message", Role: "assistant", Model: "test"}},
+					types.ContentBlockStartEvent{Type: "content_block_start", Index: 0, ContentBlock: types.ToolUseBlock{Type: "tool_use", ID: "tool_search", Name: "vai_web_search"}},
+					types.ContentBlockDeltaEvent{Type: "content_block_delta", Index: 0, Delta: types.InputJSONDelta{Type: "input_json_delta", PartialJSON: `{"query":"go 1.23"}`}},
+					types.ContentBlockStopEvent{Type: "content_block_stop", Index: 0},
+					msgDelta,
+					types.MessageStopEvent{Type: "message_stop"},
+				}}
+			}
+			msgDelta := types.MessageDeltaEvent{Type: "message_delta"}
+			msgDelta.Delta.StopReason = types.StopReasonToolUse
+			return &countingStream{events: []types.StreamEvent{
+				types.MessageStartEvent{Type: "message_start", Message: types.MessageResponse{ID: "msg_2", Type: "message", Role: "assistant", Model: "test"}},
+				types.ContentBlockStartEvent{Type: "content_block_start", Index: 0, ContentBlock: types.ToolUseBlock{Type: "tool_use", ID: "tool_talk", Name: "talk_to_user"}},
+				types.ContentBlockDeltaEvent{Type: "content_block_delta", Index: 0, Delta: types.InputJSONDelta{Type: "input_json_delta", PartialJSON: `{"text":"Go one point two three is available"}`}},
+				types.ContentBlockStopEvent{Type: "content_block_stop", Index: 0},
+				msgDelta,
+				types.MessageStopEvent{Type: "message_stop"},
+			}}
+		},
+	}
+
+	s := &LiveSession{
+		provider:    p,
+		modelName:   "test",
+		serverTools: servertools.NewRegistry(fakeServerToolExecutor{name: "vai_web_search"}),
+	}
+
+	text, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}})
+	if err != nil {
+		t.Fatalf("runTurn error = %v", err)
+	}
+	if text != "Go one point two three is available" {
+		t.Fatalf("text=%q", text)
+	}
+	if callCount != 2 {
+		t.Fatalf("callCount=%d, want 2", callCount)
+	}
+}
+
+func TestRunTurn_MaxToolCallsExceeded(t *testing.T) {
+	p := &fakeProvider{
+		streamFn: func(ctx context.Context, req *types.MessageRequest) core.EventStream {
+			_ = ctx
+			_ = req
+			msgDelta := types.MessageDeltaEvent{Type: "message_delta"}
+			msgDelta.Delta.StopReason = types.StopReasonToolUse
+			return &countingStream{events: []types.StreamEvent{
+				types.MessageStartEvent{Type: "message_start", Message: types.MessageResponse{ID: "msg_1", Type: "message", Role: "assistant", Model: "test"}},
+				types.ContentBlockStartEvent{Type: "content_block_start", Index: 0, ContentBlock: types.ToolUseBlock{Type: "tool_use", ID: "tool_search", Name: "vai_web_search"}},
+				types.ContentBlockDeltaEvent{Type: "content_block_delta", Index: 0, Delta: types.InputJSONDelta{Type: "input_json_delta", PartialJSON: `{"query":"loop"}`}},
+				types.ContentBlockStopEvent{Type: "content_block_stop", Index: 0},
+				msgDelta,
+				types.MessageStopEvent{Type: "message_stop"},
+			}}
+		},
+	}
+
+	s := &LiveSession{
+		provider:    p,
+		modelName:   "test",
+		serverTools: servertools.NewRegistry(fakeServerToolExecutor{name: "vai_web_search"}),
+	}
+
+	_, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if err.Error() != "max tool calls exceeded" {
+		t.Fatalf("err=%v", err)
 	}
 }

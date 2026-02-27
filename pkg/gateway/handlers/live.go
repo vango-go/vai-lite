@@ -23,6 +23,11 @@ import (
 	"github.com/vango-go/vai-lite/pkg/gateway/mw"
 	"github.com/vango-go/vai-lite/pkg/gateway/principal"
 	"github.com/vango-go/vai-lite/pkg/gateway/ratelimit"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/exa"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/firecrawl"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/adapters/tavily"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/safety"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
 type LiveSTTFactory func(apiKey string, httpClient *http.Client) session.STTProvider
@@ -172,6 +177,11 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeWSError(conn, "session", "unauthorized", "missing cartesia key", true, map[string]any{"requires_byok_header": "X-Provider-Key-Cartesia"})
 		return
 	}
+	serverToolRegistry, liveServerToolErr := h.newLiveServerToolsRegistry(hello)
+	if liveServerToolErr != nil {
+		h.writeWSError(conn, "session", liveServerToolErr.Code, liveServerToolErr.Message, true, liveServerToolErr.Details)
+		return
+	}
 
 	provider, err := h.Upstreams.New(providerName, llmKey)
 	if err != nil {
@@ -230,16 +240,17 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = conn.SetReadDeadline(time.Time{})
 
 	s, err := session.New(session.Dependencies{
-		Conn:      conn,
-		Logger:    h.Logger,
-		Provider:  provider,
-		STT:       sttProvider,
-		TTS:       ttsProvider,
-		Hello:     hello,
-		SessionID: sessionID,
-		RequestID: requestIDFromContext(r.Context()),
-		ModelName: modelName,
-		StartTime: startAt,
+		Conn:        conn,
+		Logger:      h.Logger,
+		Provider:    provider,
+		STT:         sttProvider,
+		TTS:         ttsProvider,
+		ServerTools: serverToolRegistry,
+		Hello:       hello,
+		SessionID:   sessionID,
+		RequestID:   requestIDFromContext(r.Context()),
+		ModelName:   modelName,
+		StartTime:   startAt,
 		Config: session.Config{
 			MaxAudioFrameBytes:         h.Config.LiveMaxAudioFrameBytes,
 			MaxJSONMessageBytes:        h.Config.LiveMaxJSONMessageBytes,
@@ -391,6 +402,144 @@ func byokForProvider(byok protocol.HelloBYOK, provider string) string {
 	default:
 		return strings.TrimSpace(byok.Keys[provider])
 	}
+}
+
+type liveServerToolError struct {
+	Code    string
+	Message string
+	Details map[string]any
+}
+
+func (h LiveHandler) newLiveServerToolsRegistry(hello protocol.ClientHello) (*servertools.Registry, *liveServerToolError) {
+	if hello.Tools == nil || len(hello.Tools.ServerTools) == 0 {
+		return servertools.NewRegistry(), nil
+	}
+
+	enabledSet := make(map[string]struct{}, len(hello.Tools.ServerTools))
+	for _, name := range hello.Tools.ServerTools {
+		trimmed := strings.TrimSpace(name)
+		switch trimmed {
+		case servertools.ToolWebSearch, servertools.ToolWebFetch:
+		default:
+			return nil, &liveServerToolError{
+				Code:    "bad_request",
+				Message: fmt.Sprintf("unsupported server tool %q", trimmed),
+				Details: map[string]any{"error_code": "unsupported_server_tool"},
+			}
+		}
+		enabledSet[trimmed] = struct{}{}
+	}
+
+	for name := range hello.Tools.ServerToolConfig {
+		if _, ok := enabledSet[name]; !ok {
+			return nil, &liveServerToolError{
+				Code:    "bad_request",
+				Message: fmt.Sprintf("server tool config provided for disabled tool %q", name),
+				Details: map[string]any{"error_code": "run_validation_failed"},
+			}
+		}
+	}
+
+	toolHTTPClient := safety.NewRestrictedHTTPClient(h.HTTPClient)
+	executors := make([]servertools.Executor, 0, len(hello.Tools.ServerTools))
+
+	if _, ok := enabledSet[servertools.ToolWebSearch]; ok {
+		searchCfg, err := servertools.DecodeWebSearchConfig(hello.Tools.ServerToolConfig[servertools.ToolWebSearch])
+		if err != nil {
+			errorCode := "run_validation_failed"
+			if strings.Contains(err.Error(), "unsupported provider") {
+				errorCode = "unsupported_tool_provider"
+			}
+			return nil, &liveServerToolError{
+				Code:    "bad_request",
+				Message: err.Error(),
+				Details: map[string]any{"error_code": errorCode},
+			}
+		}
+
+		tavilyKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderTavily))
+		exaKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderExa))
+		if searchCfg.Provider == "" {
+			hasTavily := tavilyKey != ""
+			hasExa := exaKey != ""
+			if hasTavily == hasExa {
+				msg := "server_tool_config.vai_web_search.provider is required"
+				if hasTavily && hasExa {
+					msg = "ambiguous web search provider; set server_tool_config.vai_web_search.provider"
+				}
+				return nil, &liveServerToolError{
+					Code:    "bad_request",
+					Message: msg,
+					Details: map[string]any{"error_code": "tool_provider_missing"},
+				}
+			}
+			if hasTavily {
+				searchCfg.Provider = servertools.ProviderTavily
+			} else {
+				searchCfg.Provider = servertools.ProviderExa
+			}
+		}
+
+		var tavilyClient *tavily.Client
+		var exaClient *exa.Client
+		switch searchCfg.Provider {
+		case servertools.ProviderTavily:
+			if tavilyKey == "" {
+				return nil, &liveServerToolError{
+					Code:    "unauthorized",
+					Message: "missing tavily key",
+					Details: map[string]any{"error_code": "provider_key_missing", "requires_byok_header": servertools.HeaderProviderKeyTavily},
+				}
+			}
+			tavilyClient = tavily.NewClient(tavilyKey, h.Config.TavilyBaseURL, toolHTTPClient)
+		case servertools.ProviderExa:
+			if exaKey == "" {
+				return nil, &liveServerToolError{
+					Code:    "unauthorized",
+					Message: "missing exa key",
+					Details: map[string]any{"error_code": "provider_key_missing", "requires_byok_header": servertools.HeaderProviderKeyExa},
+				}
+			}
+			exaClient = exa.NewClient(exaKey, h.Config.ExaBaseURL, toolHTTPClient)
+		default:
+			return nil, &liveServerToolError{
+				Code:    "bad_request",
+				Message: fmt.Sprintf("unsupported web search provider %q", searchCfg.Provider),
+				Details: map[string]any{"error_code": "unsupported_tool_provider"},
+			}
+		}
+		executors = append(executors, servertools.NewWebSearchExecutor(searchCfg, tavilyClient, exaClient))
+	}
+
+	if _, ok := enabledSet[servertools.ToolWebFetch]; ok {
+		fetchCfg, err := servertools.DecodeWebFetchConfig(hello.Tools.ServerToolConfig[servertools.ToolWebFetch])
+		if err != nil {
+			errorCode := "run_validation_failed"
+			if strings.Contains(err.Error(), "unsupported provider") {
+				errorCode = "unsupported_tool_provider"
+			}
+			return nil, &liveServerToolError{
+				Code:    "bad_request",
+				Message: err.Error(),
+				Details: map[string]any{"error_code": errorCode},
+			}
+		}
+		if fetchCfg.Provider == "" {
+			fetchCfg.Provider = servertools.ProviderFirecrawl
+		}
+		firecrawlKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderFirecrawl))
+		if firecrawlKey == "" {
+			return nil, &liveServerToolError{
+				Code:    "unauthorized",
+				Message: "missing firecrawl key",
+				Details: map[string]any{"error_code": "provider_key_missing", "requires_byok_header": servertools.HeaderProviderKeyFirecrawl},
+			}
+		}
+		firecrawlClient := firecrawl.NewClient(firecrawlKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
+		executors = append(executors, servertools.NewWebFetchExecutor(fetchCfg, firecrawlClient))
+	}
+
+	return servertools.NewRegistry(executors...), nil
 }
 
 func (h LiveHandler) writeWSError(conn *websocket.Conn, scope, code, message string, close bool, details map[string]any) {

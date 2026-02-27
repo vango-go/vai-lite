@@ -21,6 +21,9 @@ var corsAllowedHeaderAllowlist = map[string]struct{}{
 	"X-Provider-Key-OpenRouter": {},
 	"X-Provider-Key-Cartesia":   {},
 	"X-Provider-Key-ElevenLabs": {},
+	"X-Provider-Key-Tavily":     {},
+	"X-Provider-Key-Exa":        {},
+	"X-Provider-Key-Firecrawl":  {},
 }
 
 var corsExposedHeaders = strings.Join([]string{

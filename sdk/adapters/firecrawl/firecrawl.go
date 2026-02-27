@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 
 	vai "github.com/vango-go/vai-lite/sdk"
 )
@@ -65,6 +67,11 @@ func NewScrape(apiKey string, opts ...Option) *Scrape {
 		baseURL: o.baseURL,
 		client:  o.httpClient,
 	}
+}
+
+// FromEnv creates a Firecrawl Scrape provider using FIRECRAWL_API_KEY.
+func FromEnv(opts ...Option) *Scrape {
+	return NewScrape(strings.TrimSpace(os.Getenv("FIRECRAWL_API_KEY")), opts...)
 }
 
 // firecrawlScrapeRequest is the Firecrawl /v2/scrape request body.

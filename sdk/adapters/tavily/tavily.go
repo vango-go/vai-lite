@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 
 	vai "github.com/vango-go/vai-lite/sdk"
 )
@@ -70,6 +72,11 @@ func NewSearch(apiKey string, opts ...Option) *Search {
 		baseURL: o.baseURL,
 		client:  o.httpClient,
 	}
+}
+
+// FromEnv creates a Tavily Search provider using TAVILY_API_KEY.
+func FromEnv(opts ...Option) *Search {
+	return NewSearch(strings.TrimSpace(os.Getenv("TAVILY_API_KEY")), opts...)
 }
 
 // tavilySearchRequest is the Tavily /search request body.
@@ -183,6 +190,11 @@ func NewExtract(apiKey string, opts ...Option) *Extract {
 		baseURL: o.baseURL,
 		client:  o.httpClient,
 	}
+}
+
+// ExtractFromEnv creates a Tavily Extract provider using TAVILY_API_KEY.
+func ExtractFromEnv(opts ...Option) *Extract {
+	return NewExtract(strings.TrimSpace(os.Getenv("TAVILY_API_KEY")), opts...)
 }
 
 // tavilyExtractRequest is the Tavily /extract request body.

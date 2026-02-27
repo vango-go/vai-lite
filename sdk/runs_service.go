@@ -2,9 +2,11 @@ package vai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/vango-go/vai-lite/pkg/core"
@@ -40,6 +42,7 @@ func (s *RunsService) Create(ctx context.Context, req *types.RunRequest) (*types
 	if err != nil {
 		return nil, err
 	}
+	s.client.attachServerToolProviderHeaders(headers, &requestCopy)
 
 	resp, endpoint, err := s.client.postGatewayJSON(ctx, "/v1/runs", &requestCopy, headers)
 	if err != nil {
@@ -90,6 +93,7 @@ func (s *RunsService) Stream(ctx context.Context, req *types.RunRequest) (*RunsS
 	if err != nil {
 		return nil, err
 	}
+	s.client.attachServerToolProviderHeaders(headers, &requestCopy)
 
 	resp, endpoint, err := s.client.postGatewayJSON(ctx, "/v1/runs:stream", &requestCopy, headers)
 	if err != nil {
@@ -111,12 +115,92 @@ func validateServerRunRequest(req *types.RunRequest) error {
 		}
 		return &core.Error{
 			Type:    core.ErrInvalidRequest,
-			Message: "server-side runs do not support caller function tools; use builtins or Messages.Run/RunStream",
+			Message: "server-side runs do not support caller function tools; use server_tools or Messages.Run/RunStream",
 			Param:   fmt.Sprintf("request.tools[%d]", i),
 			Code:    "client_function_tools_not_supported",
 		}
 	}
 	return nil
+}
+
+func (c *Client) attachServerToolProviderHeaders(headers http.Header, req *types.RunRequest) {
+	if c == nil || headers == nil || req == nil {
+		return
+	}
+	enabled := req.ServerTools
+	if len(enabled) == 0 {
+		enabled = req.Builtins
+	}
+	if len(enabled) == 0 {
+		return
+	}
+
+	toolEnabled := make(map[string]struct{}, len(enabled))
+	for _, name := range enabled {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		toolEnabled[name] = struct{}{}
+	}
+
+	if _, ok := toolEnabled["vai_web_search"]; ok {
+		if provider, hasProvider := extractServerToolProvider(req.ServerToolConfig, "vai_web_search"); hasProvider {
+			c.setProviderHeader(headers, provider)
+		} else {
+			c.setProviderHeader(headers, "tavily")
+			c.setProviderHeader(headers, "exa")
+		}
+	}
+
+	if _, ok := toolEnabled["vai_web_fetch"]; ok {
+		if provider, hasProvider := extractServerToolProvider(req.ServerToolConfig, "vai_web_fetch"); hasProvider {
+			c.setProviderHeader(headers, provider)
+		} else {
+			c.setProviderHeader(headers, "firecrawl")
+		}
+	}
+}
+
+func (c *Client) setProviderHeader(headers http.Header, provider string) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return
+	}
+	headerName, ok := providerByokHeaders[provider]
+	if !ok {
+		return
+	}
+	key := c.providerKeyForProvider(provider)
+	if key == "" {
+		return
+	}
+	headers.Set(headerName, key)
+}
+
+func extractServerToolProvider(config map[string]any, toolName string) (string, bool) {
+	if len(config) == 0 {
+		return "", false
+	}
+	rawTool, ok := config[toolName]
+	if !ok || rawTool == nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(rawTool)
+	if err != nil {
+		return "", false
+	}
+	var decoded struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return "", false
+	}
+	provider := strings.ToLower(strings.TrimSpace(decoded.Provider))
+	if provider == "" {
+		return "", false
+	}
+	return provider, true
 }
 
 // RunsStream is an SSE stream from /v1/runs:stream.

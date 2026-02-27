@@ -34,7 +34,7 @@ func UnmarshalRunRequestStrict(data []byte) (*RunRequest, error) {
 
 	for k := range top {
 		switch k {
-		case "request", "run", "builtins":
+		case "request", "run", "builtins", "server_tools", "server_tool_config":
 		default:
 			return nil, strictErr(k, fmt.Sprintf("unknown field %q", k))
 		}
@@ -121,24 +121,90 @@ func UnmarshalRunRequestStrict(data []byte) (*RunRequest, error) {
 		Run:     runCfg,
 	}
 
-	if builtinsRaw, ok := top["builtins"]; ok && !isNullOrEmptyJSON(builtinsRaw) {
-		var builtins []string
-		if err := json.Unmarshal(builtinsRaw, &builtins); err != nil {
-			return nil, strictErr("builtins", "builtins must be an array of strings")
+	if serverToolsRaw, ok := top["server_tools"]; ok && !isNullOrEmptyJSON(serverToolsRaw) {
+		serverTools, err := parseRunToolNames(serverToolsRaw, "server_tools")
+		if err != nil {
+			return nil, err
 		}
-		seen := make(map[string]struct{}, len(builtins))
-		for i, name := range builtins {
-			name = strings.TrimSpace(name)
-			if name == "" {
-				return nil, strictErr(fmt.Sprintf("builtins[%d]", i), "builtin name must be non-empty")
+		out.ServerTools = serverTools
+	}
+
+	if builtinsRaw, ok := top["builtins"]; ok && !isNullOrEmptyJSON(builtinsRaw) {
+		builtins, err := parseRunToolNames(builtinsRaw, "builtins")
+		if err != nil {
+			return nil, err
+		}
+		out.Builtins = builtins
+	}
+
+	if len(out.ServerTools) > 0 && len(out.Builtins) > 0 && !equivalentToolSets(out.ServerTools, out.Builtins) {
+		return nil, strictErr("server_tools", "server_tools and builtins must match when both are provided")
+	}
+	if len(out.ServerTools) == 0 && len(out.Builtins) > 0 {
+		out.ServerTools = append([]string(nil), out.Builtins...)
+	}
+
+	if cfgRaw, ok := top["server_tool_config"]; ok && !isNullOrEmptyJSON(cfgRaw) {
+		var rawCfg map[string]json.RawMessage
+		if err := json.Unmarshal(cfgRaw, &rawCfg); err != nil {
+			return nil, strictErr("server_tool_config", "server_tool_config must be an object")
+		}
+		out.ServerToolConfig = make(map[string]any, len(rawCfg))
+		for name, value := range rawCfg {
+			toolName := strings.TrimSpace(name)
+			if toolName == "" {
+				return nil, strictErr("server_tool_config", "server_tool_config keys must be non-empty")
 			}
-			if _, exists := seen[name]; exists {
-				return nil, strictErr(fmt.Sprintf("builtins[%d]", i), "duplicate builtin name")
+			if isNullOrEmptyJSON(value) {
+				return nil, strictErr("server_tool_config."+toolName, "server_tool_config entries must be objects")
 			}
-			seen[name] = struct{}{}
-			out.Builtins = append(out.Builtins, name)
+			var obj map[string]any
+			if err := json.Unmarshal(value, &obj); err != nil {
+				return nil, strictErr("server_tool_config."+toolName, "server_tool_config entries must be objects")
+			}
+			if obj == nil {
+				return nil, strictErr("server_tool_config."+toolName, "server_tool_config entries must be objects")
+			}
+			out.ServerToolConfig[toolName] = obj
 		}
 	}
 
 	return out, nil
+}
+
+func parseRunToolNames(raw json.RawMessage, field string) ([]string, error) {
+	var names []string
+	if err := json.Unmarshal(raw, &names); err != nil {
+		return nil, strictErr(field, field+" must be an array of strings")
+	}
+	out := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for i, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, strictErr(fmt.Sprintf("%s[%d]", field, i), "tool name must be non-empty")
+		}
+		if _, exists := seen[name]; exists {
+			return nil, strictErr(fmt.Sprintf("%s[%d]", field, i), "duplicate tool name")
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+func equivalentToolSets(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	set := make(map[string]struct{}, len(left))
+	for _, name := range left {
+		set[name] = struct{}{}
+	}
+	for _, name := range right {
+		if _, ok := set[name]; !ok {
+			return false
+		}
+	}
+	return true
 }

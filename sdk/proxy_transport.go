@@ -32,6 +32,9 @@ var providerByokHeaders = map[string]string{
 	"groq":         "X-Provider-Key-Groq",
 	"cerebras":     "X-Provider-Key-Cerebras",
 	"openrouter":   "X-Provider-Key-OpenRouter",
+	"tavily":       "X-Provider-Key-Tavily",
+	"exa":          "X-Provider-Key-Exa",
+	"firecrawl":    "X-Provider-Key-Firecrawl",
 }
 
 func (c *Client) initProxyProviders() {
