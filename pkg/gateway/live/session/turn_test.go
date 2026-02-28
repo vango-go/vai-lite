@@ -99,12 +99,12 @@ func TestRunTurn_EarlyStopsOnTalkToUserContentBlockStop(t *testing.T) {
 		modelName: "test",
 	}
 
-	text, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1)
+	res, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1, runTurnDeps{})
 	if err != nil {
 		t.Fatalf("runTurn error = %v", err)
 	}
-	if text != "hello" {
-		t.Fatalf("text=%q, want %q", text, "hello")
+	if res.text != "hello" {
+		t.Fatalf("text=%q, want %q", res.text, "hello")
 	}
 	if stream == nil {
 		t.Fatalf("expected stream to be created")
@@ -150,7 +150,7 @@ func TestRunTurn_PropagatesDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 
-	_, err := s.runTurn(ctx, []types.Message{{Role: "user", Content: "hi"}}, 1)
+	_, err := s.runTurn(ctx, []types.Message{{Role: "user", Content: "hi"}}, 1, runTurnDeps{})
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -215,12 +215,12 @@ func TestRunTurn_ServerToolThenTalkToUser(t *testing.T) {
 		serverTools: servertools.NewRegistry(fakeServerToolExecutor{name: "vai_web_search"}),
 	}
 
-	text, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1)
+	res, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1, runTurnDeps{})
 	if err != nil {
 		t.Fatalf("runTurn error = %v", err)
 	}
-	if text != "Go one point two three is available" {
-		t.Fatalf("text=%q", text)
+	if res.text != "Go one point two three is available" {
+		t.Fatalf("text=%q", res.text)
 	}
 	if callCount != 2 {
 		t.Fatalf("callCount=%d, want 2", callCount)
@@ -251,7 +251,7 @@ func TestRunTurn_MaxToolCallsExceeded(t *testing.T) {
 		serverTools: servertools.NewRegistry(fakeServerToolExecutor{name: "vai_web_search"}),
 	}
 
-	_, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1)
+	_, err := s.runTurn(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, 1, runTurnDeps{})
 	if err == nil {
 		t.Fatalf("expected error")
 	}

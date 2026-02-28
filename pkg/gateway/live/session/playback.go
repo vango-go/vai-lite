@@ -32,6 +32,24 @@ func newSpeechSegment(id, fullText string) *speechSegment {
 	}
 }
 
+func (s *speechSegment) setFullText(text string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.fullText = strings.TrimSpace(text)
+	s.mu.Unlock()
+}
+
+func (s *speechSegment) fullTextSnapshot() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fullText
+}
+
 func (s *speechSegment) addChunk(audio []byte, alignment *protocol.Alignment, sampleRate int) {
 	if s == nil {
 		return
@@ -111,6 +129,21 @@ func (s *speechSegment) unplayedMS(sampleRate int) int64 {
 		playedMS = sentMS
 	}
 	return sentMS - playedMS
+}
+
+func (s *speechSegment) lastPlayedMS() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasMark {
+		return 0
+	}
+	if s.lastMark.PlayedMS < 0 {
+		return 0
+	}
+	return s.lastMark.PlayedMS
 }
 
 func (s *speechSegment) shouldFinalizeFromMark() bool {

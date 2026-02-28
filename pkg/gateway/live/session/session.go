@@ -213,6 +213,7 @@ type LiveSession struct {
 	outboundNormal   chan outboundFrame
 
 	canceledAssistant atomic.Value // canceledAssistantState
+	assistantCounter  atomic.Int64
 
 	clockHaveClient          atomic.Bool
 	clockMaxClientMS         atomic.Int64
@@ -245,9 +246,11 @@ type inboundFrame struct {
 }
 
 type runResult struct {
-	turnID int
-	text   string
-	err    error
+	turnID      int
+	text        string
+	assistantID string
+	segment     *speechSegment
+	err         error
 }
 
 type ttsResult struct {
@@ -257,6 +260,26 @@ type ttsResult struct {
 	completed   bool
 	canceled    bool
 	err         error
+}
+
+type assistantStart struct {
+	turnID      int
+	assistantID string
+	segment     *speechSegment
+	ttsCancel   context.CancelFunc
+}
+
+type runTurnDeps struct {
+	assistantStartCh chan<- assistantStart
+	ttsDoneCh        chan<- ttsResult
+	voiceProvider    string
+	elevenConn       *elevenLabsLiveConn
+}
+
+type runTurnResult struct {
+	text        string
+	assistantID string
+	segment     *speechSegment
 }
 
 func New(deps Dependencies) (*LiveSession, error) {
@@ -423,6 +446,7 @@ func (s *LiveSession) Run() error {
 
 	runResultCh := make(chan runResult, 4)
 	ttsDoneCh := make(chan ttsResult, 4)
+	assistantStartCh := make(chan assistantStart, 4)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -454,7 +478,6 @@ func (s *LiveSession) Run() error {
 		activeSegment         *speechSegment
 		pendingFinalize       *speechSegment
 		pendingFinalizeAt     time.Time
-		assistantCounter      int64
 		utteranceCounter      int64
 		inboundSeq            int64
 		binaryStreamStarted   bool
@@ -543,10 +566,6 @@ func (s *LiveSession) Run() error {
 		utteranceCounter++
 		return fmt.Sprintf("u_%d", utteranceCounter)
 	}
-	nextAssistantID := func() string {
-		assistantCounter++
-		return fmt.Sprintf("a_%d", assistantCounter)
-	}
 
 	commitTurnNoAssistant := func() {
 		activeTurnInterrupted = false
@@ -619,9 +638,14 @@ func (s *LiveSession) Run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			text, runErr := s.runTurn(runCtx, historyCopy, currentTurnID)
+			res, runErr := s.runTurn(runCtx, historyCopy, currentTurnID, runTurnDeps{
+				assistantStartCh: assistantStartCh,
+				ttsDoneCh:        ttsDoneCh,
+				voiceProvider:    voiceProvider,
+				elevenConn:       elevenConn,
+			})
 			select {
-			case runResultCh <- runResult{turnID: currentTurnID, text: text, err: runErr}:
+			case runResultCh <- runResult{turnID: currentTurnID, text: res.text, assistantID: res.assistantID, segment: res.segment, err: runErr}:
 			case <-s.ctx.Done():
 			}
 		}()
@@ -911,6 +935,18 @@ func (s *LiveSession) Run() error {
 		case <-graceCh():
 			graceActive = false
 			graceDeadlineMS = 0
+		case started := <-assistantStartCh:
+			if started.turnID != turnID {
+				continue
+			}
+			activeAssistantID = strings.TrimSpace(started.assistantID)
+			activeTTSCancel = started.ttsCancel
+			activeSegment = started.segment
+			if activeSegment != nil {
+				if mark, ok := playbackMarks[activeAssistantID]; ok {
+					activeSegment.updateMark(mark)
+				}
+			}
 		case rr := <-runResultCh:
 			if rr.turnID != turnID {
 				continue
@@ -927,7 +963,7 @@ func (s *LiveSession) Run() error {
 				}
 				_ = s.sendWarning("provider_error", "language model turn failed")
 				apology := "Sorry, I ran into an issue with that request. Please try again."
-				assistantID := nextAssistantID()
+				assistantID := s.nextAssistantID()
 				activeAssistantID = assistantID
 				history.appendAssistantCanonical(apology)
 				seg := newSpeechSegment(assistantID, apology)
@@ -946,7 +982,21 @@ func (s *LiveSession) Run() error {
 				commitTurnNoAssistant()
 				continue
 			}
-			assistantID := nextAssistantID()
+			if strings.TrimSpace(rr.assistantID) != "" {
+				history.appendAssistantCanonical(text)
+				if activeAssistantID == "" {
+					activeAssistantID = strings.TrimSpace(rr.assistantID)
+				}
+				if activeSegment == nil && rr.segment != nil {
+					activeSegment = rr.segment
+				}
+				if activeSegment != nil && activeSegment.id == strings.TrimSpace(rr.assistantID) {
+					activeSegment.setFullText(text)
+				}
+				continue
+			}
+
+			assistantID := s.nextAssistantID()
 			activeAssistantID = assistantID
 			history.appendAssistantCanonical(text)
 			seg := newSpeechSegment(assistantID, text)
@@ -968,7 +1018,19 @@ func (s *LiveSession) Run() error {
 			activeTTSCancel = nil
 			if tr.err != nil {
 				if !tr.canceled {
-					_ = s.sendWarning("provider_error", "tts stream failed")
+					msg := strings.TrimSpace(tr.err.Error())
+					msg = strings.ReplaceAll(msg, "\n", " ")
+					msg = strings.ReplaceAll(msg, "\r", " ")
+					msg = strings.Join(strings.Fields(msg), " ")
+					if len(msg) > 240 {
+						msg = msg[:240] + "…"
+					}
+					if msg == "" {
+						msg = "tts stream failed"
+					} else {
+						msg = "tts stream failed: " + msg
+					}
+					_ = s.sendWarning("provider_error", msg)
 				}
 				if errors.Is(tr.err, errAudioWindowBackpressure) || errors.Is(tr.err, errBackpressure) {
 					if err := s.handleBackpressure(tr.assistantID, &activeTTSCancel, &activeRunCancel); err != nil {
@@ -994,6 +1056,13 @@ func (s *LiveSession) Run() error {
 					pendingFinalizeAt = time.Time{}
 				}
 			}
+			// If the assistant fully finished speaking during the grace window, treat any subsequent
+			// speech as a new turn (do not append-on-resume). This avoids rewriting a completed
+			// conversation turn after the user already heard the full assistant response.
+			if tr.completed && !tr.canceled && graceActive {
+				stopTimer(&graceTimer, &graceActive)
+				graceDeadlineMS = 0
+			}
 			if activeSegment != nil && activeSegment.id == tr.assistantID {
 				activeSegment = nil
 			}
@@ -1006,7 +1075,7 @@ func (s *LiveSession) Run() error {
 	}
 }
 
-func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turnID int) (string, error) {
+func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turnID int, deps runTurnDeps) (runTurnResult, error) {
 	turnHistory := make([]types.Message, len(history))
 	copy(turnHistory, history)
 
@@ -1046,7 +1115,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 					Code:    "model_budget_exceeded",
 				},
 			})
-			return "", fmt.Errorf("max model calls exceeded")
+			return runTurnResult{}, fmt.Errorf("max model calls exceeded")
 		}
 
 		req := &types.MessageRequest{
@@ -1061,23 +1130,23 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 			_ = s.emitRunEvent(turnID, types.RunStepStartEvent{Type: "step_start", Index: stepIndex})
 		}
 
-		earlyTalkText, resp, err := s.streamTurnWithEarlyTalk(ctx, req)
+		talk, resp, err := s.streamTurnWithStreamingTalk(ctx, req, turnID, deps)
 		if err != nil {
 			_ = s.emitRunEvent(turnID, types.RunErrorEvent{Type: "error", Error: types.Error{
 				Type:      string(core.ErrAPI),
 				Message:   err.Error(),
 				RequestID: s.requestID,
 			}})
-			return "", err
+			return runTurnResult{}, err
 		}
-		if earlyTalkText != "" {
+		if talk != nil {
 			_ = s.emitRunEvent(turnID, types.RunCompleteEvent{
 				Type: "run_complete",
 				Result: &types.RunResult{
 					StopReason: types.RunStopReasonEndTurn,
 				},
 			})
-			return normalizeSpace(earlyTalkText), nil
+			return runTurnResult{text: normalizeSpace(talk.text), assistantID: talk.assistantID, segment: talk.segment}, nil
 		}
 		if resp == nil {
 			_ = s.emitRunEvent(turnID, types.RunCompleteEvent{
@@ -1086,7 +1155,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 					StopReason: types.RunStopReasonEndTurn,
 				},
 			})
-			return "", nil
+			return runTurnResult{}, nil
 		}
 		_ = s.emitRunEvent(turnID, types.RunStepCompleteEvent{Type: "step_complete", Index: stepIndex, Response: resp})
 
@@ -1099,7 +1168,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 					StopReason: types.RunStopReasonEndTurn,
 				},
 			})
-			return normalizeSpace(resp.TextContent()), nil
+			return runTurnResult{text: normalizeSpace(resp.TextContent())}, nil
 		}
 
 		talkCalls := make([]types.ToolUseBlock, 0, 1)
@@ -1114,12 +1183,12 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 		}
 
 		if len(talkCalls) > 0 && len(serverCalls) > 0 {
-			return "", fmt.Errorf("invalid tool plan: talk_to_user cannot be combined with other tool calls")
+			return runTurnResult{}, fmt.Errorf("invalid tool plan: talk_to_user cannot be combined with other tool calls")
 		}
 		if len(talkCalls) > 0 {
 			text, ok := extractTalkToUserText(talkCalls[0].Input)
 			if !ok {
-				return "", fmt.Errorf("talk_to_user.text is required")
+				return runTurnResult{}, fmt.Errorf("talk_to_user.text is required")
 			}
 			_ = s.emitRunEvent(turnID, types.RunCompleteEvent{
 				Type: "run_complete",
@@ -1128,7 +1197,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 					StopReason: types.RunStopReasonEndTurn,
 				},
 			})
-			return normalizeSpace(text), nil
+			return runTurnResult{text: normalizeSpace(text)}, nil
 		}
 		if len(serverCalls) == 0 {
 			_ = s.emitRunEvent(turnID, types.RunCompleteEvent{
@@ -1138,7 +1207,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 					StopReason: types.RunStopReasonEndTurn,
 				},
 			})
-			return normalizeSpace(resp.TextContent()), nil
+			return runTurnResult{text: normalizeSpace(resp.TextContent())}, nil
 		}
 
 		if toolCalls+len(serverCalls) > maxToolCalls {
@@ -1147,13 +1216,13 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 				Message: "max tool calls per turn exceeded",
 				Code:    "tool_budget_exceeded",
 			}})
-			return "", fmt.Errorf("max tool calls exceeded")
+			return runTurnResult{}, fmt.Errorf("max tool calls exceeded")
 		}
 
 		toolResultBlocks := make([]types.ContentBlock, 0, len(serverCalls))
 		for _, call := range serverCalls {
 			if s.serverTools == nil || !s.serverTools.Has(call.Name) {
-				return "", fmt.Errorf("unknown tool %q", call.Name)
+				return runTurnResult{}, fmt.Errorf("unknown tool %q", call.Name)
 			}
 			_ = s.emitRunEvent(turnID, types.RunToolCallStartEvent{
 				Type:  "tool_call_start",
@@ -1167,7 +1236,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 			if deadline, ok := ctx.Deadline(); ok {
 				remaining := time.Until(deadline)
 				if remaining <= 0 {
-					return "", context.DeadlineExceeded
+					return runTurnResult{}, context.DeadlineExceeded
 				}
 				if remaining < toolTimeout {
 					toolTimeout = remaining
@@ -1236,6 +1305,308 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 			Append:      []types.Message{assistantMsg, toolMsg},
 		})
 		stepIndex++
+	}
+}
+
+type talkOutcome struct {
+	assistantID string
+	segment     *speechSegment
+	text        string
+}
+
+func (s *LiveSession) streamTurnWithStreamingTalk(ctx context.Context, req *types.MessageRequest, turnID int, deps runTurnDeps) (*talkOutcome, *types.MessageResponse, error) {
+	// If we don't have the wiring to stream TTS/captions, fall back to the old early-stop behavior.
+	if deps.assistantStartCh == nil || deps.ttsDoneCh == nil {
+		text, resp, err := s.streamTurnWithEarlyTalk(ctx, req)
+		if strings.TrimSpace(text) != "" {
+			return &talkOutcome{text: text}, nil, nil
+		}
+		return nil, resp, err
+	}
+
+	turnCtx, stopEarly := context.WithCancel(ctx)
+	defer stopEarly()
+
+	stream, err := s.provider.StreamMessage(turnCtx, req)
+	if err != nil {
+		return nil, nil, err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = stream.Close()
+		}
+	}()
+
+	acc := runloop.NewStreamAccumulator()
+
+	talkIdx := -1
+	var extractor TalkTextExtractor
+
+	var assistantID string
+	var segment *speechSegment
+	var ttsCancel context.CancelFunc
+
+	appendCh := make(chan string, 64)
+	chunkCh := make(chan string, 64)
+
+	var appendClosed atomic.Bool
+	closeAppend := func() {
+		if appendClosed.Swap(true) {
+			return
+		}
+		close(appendCh)
+	}
+
+	startedSpeech := false
+	startSpeech := func() error {
+		if startedSpeech {
+			return nil
+		}
+		startedSpeech = true
+
+		assistantID = s.nextAssistantID()
+		segment = newSpeechSegment(assistantID, "")
+
+		ttsCtx, cancel := context.WithCancel(s.ctx)
+		ttsCancel = cancel
+
+		select {
+		case deps.assistantStartCh <- assistantStart{
+			turnID:      turnID,
+			assistantID: assistantID,
+			segment:     segment,
+			ttsCancel:   ttsCancel,
+		}:
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+
+		chunker := NewTextChunker(DefaultTextChunkConfig(), nil)
+		go chunker.Run(ttsCtx, appendCh, chunkCh)
+		go s.speakTurnStreaming(ttsCtx, turnID, assistantID, segment, deps.voiceProvider, deps.elevenConn, chunkCh, deps.ttsDoneCh)
+		return nil
+	}
+
+	sendTextDelta := func(delta string) {
+		if delta == "" || assistantID == "" {
+			return
+		}
+		if !s.hello.Features.WantAssistantText {
+			return
+		}
+		_ = s.sendAssistantJSON(assistantID, protocol.ServerAssistantTextDelta{
+			Type:             "assistant_text_delta",
+			AssistantAudioID: assistantID,
+			Delta:            delta,
+		})
+	}
+	sendTextFinal := func(text string) {
+		if assistantID == "" {
+			return
+		}
+		if !s.hello.Features.WantAssistantText {
+			return
+		}
+		_ = s.sendAssistantJSON(assistantID, protocol.ServerAssistantTextFinal{
+			Type:             "assistant_text_final",
+			AssistantAudioID: assistantID,
+			Text:             text,
+		})
+	}
+
+	for {
+		event, nextErr := stream.Next()
+		if event != nil {
+			acc.Apply(event)
+			switch e := event.(type) {
+			case types.ContentBlockStartEvent:
+				if isTalkToUserToolUseBlock(e.ContentBlock) {
+					talkIdx = e.Index
+					if err := startSpeech(); err != nil {
+						return nil, nil, err
+					}
+				} else if talkIdx >= 0 && isToolUseBlock(e.ContentBlock) {
+					return nil, nil, fmt.Errorf("invalid tool plan: talk_to_user cannot be combined with other tool calls")
+				}
+			case *types.ContentBlockStartEvent:
+				if e != nil && isTalkToUserToolUseBlock(e.ContentBlock) {
+					talkIdx = e.Index
+					if err := startSpeech(); err != nil {
+						return nil, nil, err
+					}
+				} else if e != nil && talkIdx >= 0 && isToolUseBlock(e.ContentBlock) {
+					return nil, nil, fmt.Errorf("invalid tool plan: talk_to_user cannot be combined with other tool calls")
+				}
+			case types.ContentBlockDeltaEvent:
+				if e.Index == talkIdx {
+					if err := startSpeech(); err != nil {
+						return nil, nil, err
+					}
+					var raw strings.Builder
+					appendInputJSONDelta(&raw, e.Delta)
+					if raw.Len() > 0 {
+						newText, err := extractor.Feed(raw.String())
+						if err != nil {
+							if ttsCancel != nil {
+								ttsCancel()
+							}
+							return nil, nil, err
+						}
+						if newText != "" {
+							sendTextDelta(newText)
+							if segment != nil {
+								segment.setFullText(extractor.FullText())
+							}
+							select {
+							case appendCh <- newText:
+							case <-s.ctx.Done():
+								return nil, nil, s.ctx.Err()
+							}
+						}
+					}
+				}
+			case *types.ContentBlockDeltaEvent:
+				if e != nil && e.Index == talkIdx {
+					if err := startSpeech(); err != nil {
+						return nil, nil, err
+					}
+					var raw strings.Builder
+					appendInputJSONDelta(&raw, e.Delta)
+					if raw.Len() > 0 {
+						newText, err := extractor.Feed(raw.String())
+						if err != nil {
+							if ttsCancel != nil {
+								ttsCancel()
+							}
+							return nil, nil, err
+						}
+						if newText != "" {
+							sendTextDelta(newText)
+							if segment != nil {
+								segment.setFullText(extractor.FullText())
+							}
+							select {
+							case appendCh <- newText:
+							case <-s.ctx.Done():
+								return nil, nil, s.ctx.Err()
+							}
+						}
+					}
+				}
+			case types.ContentBlockStopEvent:
+				if e.Index == talkIdx {
+					finalText := extractor.FullText()
+					// Fallback: if we didn't decode incrementally, try the accumulated tool input.
+					if strings.TrimSpace(finalText) == "" {
+						if resp := acc.Response(); resp != nil {
+							for _, call := range resp.ToolUses() {
+								if strings.EqualFold(strings.TrimSpace(call.Name), talkToUserToolName) {
+									if text, ok := extractTalkToUserText(call.Input); ok {
+										finalText = text
+										sendTextDelta(text)
+										select {
+										case appendCh <- text:
+										case <-s.ctx.Done():
+											return nil, nil, s.ctx.Err()
+										}
+									}
+								}
+							}
+						}
+					}
+					if strings.TrimSpace(finalText) == "" {
+						if ttsCancel != nil {
+							ttsCancel()
+						}
+						closeAppend()
+						return nil, nil, fmt.Errorf("talk_to_user.text is required")
+					}
+					if segment != nil {
+						segment.setFullText(finalText)
+					}
+					sendTextFinal(finalText)
+					closeAppend()
+					stopEarly()
+					closed = true
+					_ = stream.Close()
+					return &talkOutcome{assistantID: assistantID, segment: segment, text: finalText}, nil, nil
+				}
+			case *types.ContentBlockStopEvent:
+				if e != nil && e.Index == talkIdx {
+					finalText := extractor.FullText()
+					if strings.TrimSpace(finalText) == "" {
+						if resp := acc.Response(); resp != nil {
+							for _, call := range resp.ToolUses() {
+								if strings.EqualFold(strings.TrimSpace(call.Name), talkToUserToolName) {
+									if text, ok := extractTalkToUserText(call.Input); ok {
+										finalText = text
+										sendTextDelta(text)
+										select {
+										case appendCh <- text:
+										case <-s.ctx.Done():
+											return nil, nil, s.ctx.Err()
+										}
+									}
+								}
+							}
+						}
+					}
+					if strings.TrimSpace(finalText) == "" {
+						if ttsCancel != nil {
+							ttsCancel()
+						}
+						closeAppend()
+						return nil, nil, fmt.Errorf("talk_to_user.text is required")
+					}
+					if segment != nil {
+						segment.setFullText(finalText)
+					}
+					sendTextFinal(finalText)
+					closeAppend()
+					stopEarly()
+					closed = true
+					_ = stream.Close()
+					return &talkOutcome{assistantID: assistantID, segment: segment, text: finalText}, nil, nil
+				}
+			case types.ErrorEvent:
+				if ttsCancel != nil {
+					ttsCancel()
+				}
+				closeAppend()
+				return nil, nil, fmt.Errorf("provider stream error: %s", strings.TrimSpace(e.Error.Message))
+			case *types.ErrorEvent:
+				if e != nil {
+					if ttsCancel != nil {
+						ttsCancel()
+					}
+					closeAppend()
+					return nil, nil, fmt.Errorf("provider stream error: %s", strings.TrimSpace(e.Error.Message))
+				}
+			}
+		}
+		if nextErr != nil {
+			if errors.Is(nextErr, io.EOF) {
+				break
+			}
+			if ttsCancel != nil {
+				ttsCancel()
+			}
+			closeAppend()
+			return nil, nil, nextErr
+		}
+	}
+
+	closeAppend()
+	return nil, acc.Response(), nil
+}
+
+func isToolUseBlock(block types.ContentBlock) bool {
+	switch block.(type) {
+	case types.ToolUseBlock, *types.ToolUseBlock, types.ServerToolUseBlock, *types.ServerToolUseBlock:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1463,6 +1834,73 @@ func (s *LiveSession) speakTurn(
 		return time.Duration(unplayedMS)*time.Millisecond > s.cfg.MaxUnplayedDuration
 	}
 
+	// ElevenLabs (and sometimes other providers) can deliver audio faster than realtime. If we forward
+	// too far ahead, the gateway will (correctly) enforce the unplayed window and reset. To avoid
+	// spurious resets, pace outbound audio by blocking until the client catches up, and split large
+	// provider chunks into smaller parts.
+	waitForUnplayedWindow := func(chunkBytes int) error {
+		if chunkBytes <= 0 {
+			return nil
+		}
+		if !s.hello.Features.SendPlaybackMarks || segment == nil || s.cfg.MaxUnplayedDuration <= 0 {
+			return nil
+		}
+
+		sampleRate := s.hello.AudioOut.SampleRateHz
+		if sampleRate <= 0 {
+			sampleRate = 24000
+		}
+		// PCM16 mono => 2 bytes per sample. (Live v1 negotiates pcm_s16le @ 24kHz mono)
+		chunkSamples := int64(chunkBytes / 2)
+		chunkMS := (chunkSamples * 1000) / int64(sampleRate)
+		if chunkMS <= 0 {
+			chunkMS = 1
+		}
+
+		maxMS := int64(s.cfg.MaxUnplayedDuration / time.Millisecond)
+		if maxMS <= 0 {
+			return nil
+		}
+		initialUnplayedMS := segment.unplayedMS(sampleRate)
+		needDropMS := (initialUnplayedMS + chunkMS) - maxMS
+		if needDropMS < 0 {
+			needDropMS = 0
+		}
+		// Budget enough wall time for the client to advance `played_ms` in realtime plus a bit of slack,
+		// but cap it so we don't stall forever if the client stops sending marks.
+		budget := time.Duration(needDropMS+500) * time.Millisecond
+		if budget < 2*time.Second {
+			budget = 2 * time.Second
+		}
+		if budget > 10*time.Second {
+			budget = 10 * time.Second
+		}
+		deadline := time.Now().Add(budget)
+		for {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			unplayedMS := segment.unplayedMS(sampleRate)
+			if unplayedMS+chunkMS <= maxMS {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("%w (unplayed_ms=%d played_ms=%d max_ms=%d)", errAudioWindowBackpressure, unplayedMS, segment.lastPlayedMS(), maxMS)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	bytesPerSecond := int64(s.hello.AudioOut.SampleRateHz * s.hello.AudioOut.Channels * 2)
+	if bytesPerSecond <= 0 {
+		bytesPerSecond = int64(24000 * 1 * 2)
+	}
+	maxPartMS := int64(200)
+	maxPartBytes := int((bytesPerSecond * maxPartMS) / 1000)
+	if maxPartBytes < 960 {
+		maxPartBytes = 960
+	}
+
 	if strings.EqualFold(strings.TrimSpace(voiceProvider), protocol.VoiceProviderElevenLabs) {
 		if elevenConn == nil {
 			res.err = fmt.Errorf("elevenlabs tts connection is not available")
@@ -1496,18 +1934,51 @@ func (s *LiveSession) speakTurn(
 					continue
 				}
 				if len(chunk.Audio) > 0 {
-					if segment != nil {
-						segment.addChunk(chunk.Audio, chunk.Alignment, s.hello.AudioOut.SampleRateHz)
+					// When splitting, only attach alignment to the first part (best effort).
+					pcm := chunk.Audio
+					firstAlign := chunk.Alignment
+					if len(pcm) > maxPartBytes {
+						firstAlign = nil
 					}
-					if err := s.sendAssistantChunk(assistantID, seq, chunk.Audio, chunk.Alignment); err != nil {
+					if err := waitForUnplayedWindow(min(len(pcm), maxPartBytes)); err != nil {
 						res.err = err
 						return
 					}
-					if shouldBackpressureReset() {
-						res.err = errAudioWindowBackpressure
+					if segment != nil {
+						segment.addChunk(pcm[:min(len(pcm), maxPartBytes)], firstAlign, s.hello.AudioOut.SampleRateHz)
+					}
+					if err := s.sendAssistantChunk(assistantID, seq, pcm[:min(len(pcm), maxPartBytes)], firstAlign); err != nil {
+						res.err = err
 						return
 					}
 					seq++
+					if len(pcm) > maxPartBytes {
+						// Send remaining parts without alignment.
+						for off := maxPartBytes; off < len(pcm); {
+							end := off + maxPartBytes
+							if end > len(pcm) {
+								end = len(pcm)
+							}
+							part := pcm[off:end]
+							off = end
+							if err := waitForUnplayedWindow(len(part)); err != nil {
+								res.err = err
+								return
+							}
+							if segment != nil {
+								segment.addChunk(part, nil, s.hello.AudioOut.SampleRateHz)
+							}
+							if err := s.sendAssistantChunk(assistantID, seq, part, nil); err != nil {
+								res.err = err
+								return
+							}
+							seq++
+							if shouldBackpressureReset() {
+								res.err = errAudioWindowBackpressure
+								return
+							}
+						}
+					}
 				}
 				if chunk.Final {
 					if err := s.sendAssistantJSON(assistantID, protocol.ServerAssistantAudioEnd{Type: "assistant_audio_end", AssistantAudioID: assistantID}); err != nil {
@@ -1572,18 +2043,358 @@ func (s *LiveSession) speakTurn(
 			if len(chunk) == 0 {
 				continue
 			}
-			if segment != nil {
-				segment.addChunk(chunk, nil, s.hello.AudioOut.SampleRateHz)
+			// Split and pace.
+			for off := 0; off < len(chunk); {
+				end := off + maxPartBytes
+				if end > len(chunk) {
+					end = len(chunk)
+				}
+				part := chunk[off:end]
+				off = end
+				if err := waitForUnplayedWindow(len(part)); err != nil {
+					res.err = err
+					return
+				}
+				if segment != nil {
+					segment.addChunk(part, nil, s.hello.AudioOut.SampleRateHz)
+				}
+				if err := s.sendAssistantChunk(assistantID, seq, part, nil); err != nil {
+					res.err = err
+					return
+				}
+				if shouldBackpressureReset() {
+					res.err = errAudioWindowBackpressure
+					return
+				}
+				seq++
 			}
-			if err := s.sendAssistantChunk(assistantID, seq, chunk, nil); err != nil {
+		}
+	}
+}
+
+func (s *LiveSession) speakTurnStreaming(
+	ctx context.Context,
+	turnID int,
+	assistantID string,
+	segment *speechSegment,
+	voiceProvider string,
+	elevenConn *elevenLabsLiveConn,
+	textChunks <-chan string,
+	out chan<- ttsResult,
+) {
+	res := ttsResult{turnID: turnID, assistantID: assistantID}
+	defer func() {
+		select {
+		case out <- res:
+		case <-s.ctx.Done():
+		}
+	}()
+
+	startMsg := protocol.ServerAssistantAudioStart{
+		Type:             "assistant_audio_start",
+		AssistantAudioID: assistantID,
+		Format: protocol.AudioFormat{
+			Encoding:     s.hello.AudioOut.Encoding,
+			SampleRateHz: s.hello.AudioOut.SampleRateHz,
+			Channels:     s.hello.AudioOut.Channels,
+		},
+	}
+	if err := s.sendAssistantJSON(assistantID, startMsg); err != nil {
+		res.err = err
+		return
+	}
+
+	shouldBackpressureReset := func() bool {
+		if !s.hello.Features.SendPlaybackMarks {
+			return false
+		}
+		if segment == nil {
+			return false
+		}
+		if s.cfg.MaxUnplayedDuration <= 0 {
+			return false
+		}
+		unplayedMS := segment.unplayedMS(s.hello.AudioOut.SampleRateHz)
+		return time.Duration(unplayedMS)*time.Millisecond > s.cfg.MaxUnplayedDuration
+	}
+
+	waitForUnplayedWindow := func(chunkBytes int) error {
+		if chunkBytes <= 0 {
+			return nil
+		}
+		if !s.hello.Features.SendPlaybackMarks || segment == nil || s.cfg.MaxUnplayedDuration <= 0 {
+			return nil
+		}
+
+		sampleRate := s.hello.AudioOut.SampleRateHz
+		if sampleRate <= 0 {
+			sampleRate = 24000
+		}
+		chunkSamples := int64(chunkBytes / 2)
+		chunkMS := (chunkSamples * 1000) / int64(sampleRate)
+		if chunkMS <= 0 {
+			chunkMS = 1
+		}
+
+		maxMS := int64(s.cfg.MaxUnplayedDuration / time.Millisecond)
+		if maxMS <= 0 {
+			return nil
+		}
+		initialUnplayedMS := segment.unplayedMS(sampleRate)
+		needDropMS := (initialUnplayedMS + chunkMS) - maxMS
+		if needDropMS < 0 {
+			needDropMS = 0
+		}
+		budget := time.Duration(needDropMS+500) * time.Millisecond
+		if budget < 2*time.Second {
+			budget = 2 * time.Second
+		}
+		if budget > 10*time.Second {
+			budget = 10 * time.Second
+		}
+		deadline := time.Now().Add(budget)
+		for {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			unplayedMS := segment.unplayedMS(sampleRate)
+			if unplayedMS+chunkMS <= maxMS {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("%w (unplayed_ms=%d played_ms=%d max_ms=%d)", errAudioWindowBackpressure, unplayedMS, segment.lastPlayedMS(), maxMS)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	bytesPerSecond := int64(s.hello.AudioOut.SampleRateHz * s.hello.AudioOut.Channels * 2)
+	if bytesPerSecond <= 0 {
+		bytesPerSecond = int64(24000 * 1 * 2)
+	}
+	maxPartMS := int64(200)
+	maxPartBytes := int((bytesPerSecond * maxPartMS) / 1000)
+	if maxPartBytes < 960 {
+		maxPartBytes = 960
+	}
+
+	if strings.EqualFold(strings.TrimSpace(voiceProvider), protocol.VoiceProviderElevenLabs) {
+		if elevenConn == nil {
+			res.err = fmt.Errorf("elevenlabs tts connection is not available")
+			return
+		}
+		if err := elevenConn.StartContext(ctx, assistantID); err != nil {
+			res.err = err
+			return
+		}
+
+		sendErrCh := make(chan error, 1)
+		go func() {
+			for chunk := range textChunks {
+				if ctx.Err() != nil {
+					return
+				}
+				if strings.TrimSpace(chunk) == "" {
+					continue
+				}
+				if err := elevenConn.SendText(ctx, assistantID, chunk, true); err != nil {
+					select {
+					case sendErrCh <- err:
+					default:
+					}
+					return
+				}
+			}
+			_ = elevenConn.CloseContext(context.Background(), assistantID)
+		}()
+
+		seq := int64(1)
+		for {
+			select {
+			case <-ctx.Done():
+				_ = elevenConn.CloseContext(context.Background(), assistantID)
+				res.canceled = true
+				return
+			case err := <-sendErrCh:
+				if err != nil {
+					res.err = err
+					return
+				}
+			case chunk, ok := <-elevenConn.Chunks():
+				if !ok {
+					if err := s.sendAssistantJSON(assistantID, protocol.ServerAssistantAudioEnd{Type: "assistant_audio_end", AssistantAudioID: assistantID}); err != nil {
+						res.err = err
+						return
+					}
+					res.completed = true
+					if segment != nil {
+						res.text = segment.fullTextSnapshot()
+					}
+					return
+				}
+				if strings.TrimSpace(chunk.ContextID) != assistantID {
+					continue
+				}
+				if len(chunk.Audio) > 0 {
+					pcm := chunk.Audio
+					firstAlign := chunk.Alignment
+					if len(pcm) > maxPartBytes {
+						firstAlign = nil
+					}
+					if err := waitForUnplayedWindow(min(len(pcm), maxPartBytes)); err != nil {
+						res.err = err
+						return
+					}
+					if segment != nil {
+						segment.addChunk(pcm[:min(len(pcm), maxPartBytes)], firstAlign, s.hello.AudioOut.SampleRateHz)
+					}
+					if err := s.sendAssistantChunk(assistantID, seq, pcm[:min(len(pcm), maxPartBytes)], firstAlign); err != nil {
+						res.err = err
+						return
+					}
+					seq++
+					if len(pcm) > maxPartBytes {
+						for off := maxPartBytes; off < len(pcm); {
+							end := off + maxPartBytes
+							if end > len(pcm) {
+								end = len(pcm)
+							}
+							part := pcm[off:end]
+							off = end
+							if err := waitForUnplayedWindow(len(part)); err != nil {
+								res.err = err
+								return
+							}
+							if segment != nil {
+								segment.addChunk(part, nil, s.hello.AudioOut.SampleRateHz)
+							}
+							if err := s.sendAssistantChunk(assistantID, seq, part, nil); err != nil {
+								res.err = err
+								return
+							}
+							seq++
+							if shouldBackpressureReset() {
+								res.err = errAudioWindowBackpressure
+								return
+							}
+						}
+					}
+				}
+				if chunk.Final {
+					if err := s.sendAssistantJSON(assistantID, protocol.ServerAssistantAudioEnd{Type: "assistant_audio_end", AssistantAudioID: assistantID}); err != nil {
+						res.err = err
+						return
+					}
+					res.completed = true
+					if segment != nil {
+						res.text = segment.fullTextSnapshot()
+					}
+					return
+				}
+			}
+		}
+	}
+
+	ttsCtx, err := s.tts.NewContext(ctx, TTSConfig{
+		Voice:            strings.TrimSpace(s.hello.Voice.VoiceID),
+		Language:         strings.TrimSpace(s.hello.Voice.Language),
+		Speed:            s.hello.Voice.Speed,
+		Volume:           s.hello.Voice.Volume,
+		Emotion:          strings.TrimSpace(s.hello.Voice.Emotion),
+		Format:           "pcm",
+		SampleRate:       s.hello.AudioOut.SampleRateHz,
+		MaxBufferDelayMS: 200,
+	})
+	if err != nil {
+		res.err = err
+		return
+	}
+	defer ttsCtx.Close()
+
+	sendErrCh := make(chan error, 1)
+	go func() {
+		for chunk := range textChunks {
+			if ctx.Err() != nil {
+				return
+			}
+			if strings.TrimSpace(chunk) == "" {
+				continue
+			}
+			if err := ttsCtx.SendText(chunk, false); err != nil {
+				select {
+				case sendErrCh <- err:
+				default:
+				}
+				return
+			}
+		}
+		if err := ttsCtx.Flush(); err != nil {
+			select {
+			case sendErrCh <- err:
+			default:
+			}
+			return
+		}
+	}()
+
+	seq := int64(1)
+	for {
+		select {
+		case <-ctx.Done():
+			res.canceled = true
+			return
+		case err := <-sendErrCh:
+			if err != nil {
 				res.err = err
 				return
 			}
-			if shouldBackpressureReset() {
-				res.err = errAudioWindowBackpressure
+		case chunk, ok := <-ttsCtx.Audio():
+			if !ok {
+				if err := ttsCtx.Err(); err != nil && !errors.Is(err, context.Canceled) {
+					res.err = err
+					return
+				}
+				if ctx.Err() != nil {
+					res.canceled = true
+					return
+				}
+				if err := s.sendAssistantJSON(assistantID, protocol.ServerAssistantAudioEnd{Type: "assistant_audio_end", AssistantAudioID: assistantID}); err != nil {
+					res.err = err
+					return
+				}
+				res.completed = true
+				if segment != nil {
+					res.text = segment.fullTextSnapshot()
+				}
 				return
 			}
-			seq++
+			if len(chunk) == 0 {
+				continue
+			}
+			for off := 0; off < len(chunk); {
+				end := off + maxPartBytes
+				if end > len(chunk) {
+					end = len(chunk)
+				}
+				part := chunk[off:end]
+				off = end
+				if err := waitForUnplayedWindow(len(part)); err != nil {
+					res.err = err
+					return
+				}
+				if segment != nil {
+					segment.addChunk(part, nil, s.hello.AudioOut.SampleRateHz)
+				}
+				if err := s.sendAssistantChunk(assistantID, seq, part, nil); err != nil {
+					res.err = err
+					return
+				}
+				if shouldBackpressureReset() {
+					res.err = errAudioWindowBackpressure
+					return
+				}
+				seq++
+			}
 		}
 	}
 }
@@ -1756,6 +2567,14 @@ func (s *LiveSession) observeClientTimestampMS(ts int64) {
 			return
 		}
 	}
+}
+
+func (s *LiveSession) nextAssistantID() string {
+	if s == nil {
+		return ""
+	}
+	n := s.assistantCounter.Add(1)
+	return fmt.Sprintf("a_%d", n)
 }
 
 func (s *LiveSession) Cancel() {

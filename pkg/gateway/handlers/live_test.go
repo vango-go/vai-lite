@@ -205,6 +205,308 @@ func TestLiveHandler_AudioFrameToTranscriptAndAssistantAudio(t *testing.T) {
 	}
 }
 
+func TestLiveHandler_EarlyTalkToUserStreamingStartsAudioAndCaptionsBeforeToolStop(t *testing.T) {
+	gate := make(chan struct{})
+	provider := &gatedTalkToUserProvider{
+		gates: map[int]<-chan struct{}{
+			3: gate, // block before the second delta (and therefore before tool stop)
+		},
+		events: streamingTalkToUserEvents([]string{
+			`{"text":"Hello you `,
+			`there."}`,
+		}),
+	}
+
+	h, serverURL := newLiveTestServer(t, liveTestOptions{
+		sttDeltasPerAudioFrame: [][]stt.TranscriptDelta{{{Text: "hello", IsFinal: true}}},
+		ttsSlow:                false,
+		provider:               provider,
+	})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	mustWriteJSON(t, conn, baseHello("1"))
+	_ = mustReadJSON(t, conn, 2*time.Second) // hello_ack
+
+	_ = conn.SetReadDeadline(time.Time{})
+	msgCh, errCh := startWSJSONReader(conn)
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":     "audio_frame",
+		"seq":      1,
+		"data_b64": base64.StdEncoding.EncodeToString([]byte("pcm")),
+	})
+
+	var (
+		assistantID string
+		deltas      strings.Builder
+		seenStart   bool
+		seenDelta   bool
+		seenChunk   bool
+		seenFinal   bool
+		seenTypes   = make(map[string]int)
+	)
+
+	earlyDeadline := time.NewTimer(2 * time.Second)
+	defer earlyDeadline.Stop()
+	for !(seenStart && seenDelta && seenChunk) {
+		select {
+		case <-earlyDeadline.C:
+			t.Fatalf("missing early events start=%v delta=%v audio_chunk=%v assistant_id=%q deltas=%q seen=%v ws_err=%v", seenStart, seenDelta, seenChunk, assistantID, deltas.String(), seenTypes, drainErr(errCh))
+		case msg, ok := <-msgCh:
+			if !ok {
+				t.Fatalf("websocket closed while waiting for early events: ws_err=%v seen=%v", drainErr(errCh), seenTypes)
+			}
+			typ, _ := msg["type"].(string)
+			if typ != "" {
+				seenTypes[typ]++
+			}
+			id := assistantIDFromMsg(msg)
+			if assistantID == "" && id != "" {
+				assistantID = id
+			}
+			switch typ {
+			case "assistant_audio_start":
+				if assistantID == "" {
+					t.Fatalf("missing assistant_audio_id on assistant_audio_start: %+v", msg)
+				}
+				if txt, ok := msg["text"].(string); ok && txt != "" {
+					t.Fatalf("assistant_audio_start.text=%q, want empty/omitted for early captions", txt)
+				}
+				seenStart = true
+			case "assistant_text_delta":
+				if assistantID == "" || id != assistantID {
+					continue
+				}
+				delta, _ := msg["delta"].(string)
+				deltas.WriteString(delta)
+				seenDelta = true
+			case "assistant_audio_chunk", "assistant_audio_chunk_header":
+				if assistantID == "" || id != assistantID {
+					continue
+				}
+				seenChunk = true
+			case "assistant_text_final":
+				if assistantID == "" || id != assistantID {
+					continue
+				}
+				seenFinal = true
+			}
+		}
+	}
+	if seenFinal {
+		t.Fatalf("saw assistant_text_final before tool stop was allowed")
+	}
+
+	close(gate) // allow the tool JSON to complete and tool block to stop
+
+	var finalText string
+	finalDeadline := time.NewTimer(2 * time.Second)
+	defer finalDeadline.Stop()
+	for finalText == "" {
+		select {
+		case <-finalDeadline.C:
+			t.Fatalf("did not observe assistant_text_final: assistant_id=%q deltas=%q seen=%v ws_err=%v", assistantID, deltas.String(), seenTypes, drainErr(errCh))
+		case msg, ok := <-msgCh:
+			if !ok {
+				t.Fatalf("websocket closed while waiting for assistant_text_final: ws_err=%v", drainErr(errCh))
+			}
+			if assistantIDFromMsg(msg) != assistantID {
+				continue
+			}
+			typ, _ := msg["type"].(string)
+			if typ == "assistant_text_delta" {
+				if delta, ok := msg["delta"].(string); ok {
+					deltas.WriteString(delta)
+				}
+			}
+			if typ == "assistant_text_final" {
+				if text, ok := msg["text"].(string); ok {
+					finalText = text
+				}
+			}
+		}
+	}
+
+	if finalText != deltas.String() {
+		t.Fatalf("assistant_text_final.text=%q, want concatenation of deltas=%q", finalText, deltas.String())
+	}
+	if finalText != "Hello you there." {
+		t.Fatalf("assistant_text_final.text=%q, want %q", finalText, "Hello you there.")
+	}
+}
+
+func TestLiveHandler_EarlyTalkToUserStreaming_InterruptCancelsStreamingAudio(t *testing.T) {
+	gate := make(chan struct{})
+	provider := &gatedTalkToUserProvider{
+		gates: map[int]<-chan struct{}{
+			3: gate,
+		},
+		events: streamingTalkToUserEvents([]string{
+			`{"text":"Hello you `,
+			`there."}`,
+		}),
+	}
+
+	h, serverURL := newLiveTestServer(t, liveTestOptions{
+		sttDeltasPerAudioFrame: [][]stt.TranscriptDelta{{{Text: "interrupt", IsFinal: true}}},
+		ttsSlow:                false,
+		provider:               provider,
+	})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	mustWriteJSON(t, conn, baseHello("1"))
+	_ = mustReadJSON(t, conn, 2*time.Second) // hello_ack
+
+	_ = conn.SetReadDeadline(time.Time{})
+	msgCh, errCh := startWSJSONReader(conn)
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":     "audio_frame",
+		"seq":      1,
+		"data_b64": base64.StdEncoding.EncodeToString([]byte("pcm")),
+	})
+
+	var assistantID string
+	startDeadline := time.NewTimer(2 * time.Second)
+	defer startDeadline.Stop()
+	for assistantID == "" {
+		select {
+		case <-startDeadline.C:
+			t.Fatalf("did not observe assistant_audio_start with assistant_audio_id: ws_err=%v", drainErr(errCh))
+		case msg, ok := <-msgCh:
+			if !ok {
+				t.Fatalf("websocket closed while waiting for assistant_audio_start: ws_err=%v", drainErr(errCh))
+			}
+			if msg["type"] != "assistant_audio_start" {
+				continue
+			}
+			assistantID = assistantIDFromMsg(msg)
+		}
+	}
+
+	mustWriteJSON(t, conn, map[string]any{"type": "control", "op": "interrupt"})
+
+	seenReset := false
+	resetDeadline := time.NewTimer(2 * time.Second)
+	defer resetDeadline.Stop()
+	for !seenReset {
+		select {
+		case <-resetDeadline.C:
+			t.Fatalf("did not observe audio_reset: assistant_id=%q ws_err=%v", assistantID, drainErr(errCh))
+		case msg, ok := <-msgCh:
+			if !ok {
+				t.Fatalf("websocket closed while waiting for audio_reset: ws_err=%v", drainErr(errCh))
+			}
+			if msg["type"] != "audio_reset" {
+				continue
+			}
+			if msg["assistant_audio_id"] != assistantID {
+				t.Fatalf("assistant_audio_id=%v want %v", msg["assistant_audio_id"], assistantID)
+			}
+			seenReset = true
+		}
+	}
+	if !seenReset {
+		t.Fatalf("did not observe audio_reset")
+	}
+
+	close(gate)
+
+	window := time.NewTimer(300 * time.Millisecond)
+	defer window.Stop()
+	for {
+		select {
+		case <-window.C:
+			return
+		case msg, ok := <-msgCh:
+			if !ok {
+				return
+			}
+			if assistantIDFromMsg(msg) != assistantID {
+				continue
+			}
+			switch msg["type"] {
+			case "assistant_audio_chunk", "assistant_audio_chunk_header", "assistant_audio_end", "assistant_text_delta", "assistant_text_final":
+				t.Fatalf("received stale assistant output after audio_reset: %+v", msg)
+			}
+		}
+	}
+}
+
+func TestLiveHandler_GraceStopsAppendingAfterAssistantFinishes(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{
+		liveGraceDuration: 2 * time.Second,
+		sttDeltasPerAudioFrame: [][]stt.TranscriptDelta{
+			{{Text: "hello world", IsFinal: true}},
+			{{Text: "more", IsFinal: true}},
+		},
+		ttsSlow: false,
+	})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	mustWriteJSON(t, conn, baseHello("1"))
+	_ = mustReadJSON(t, conn, 2*time.Second) // hello_ack
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":     "audio_frame",
+		"seq":      1,
+		"data_b64": base64.StdEncoding.EncodeToString([]byte("pcm")),
+	})
+
+	var firstFinal string
+	seenAssistantEnd := false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg := mustReadJSON(t, conn, 2*time.Second)
+		if msg["type"] == "utterance_final" && firstFinal == "" {
+			if text, ok := msg["text"].(string); ok {
+				firstFinal = text
+			}
+		}
+		if msg["type"] == "assistant_audio_end" {
+			seenAssistantEnd = true
+			break
+		}
+	}
+	if firstFinal != "hello world" {
+		t.Fatalf("first utterance_final text=%q, want %q", firstFinal, "hello world")
+	}
+	if !seenAssistantEnd {
+		t.Fatalf("did not observe assistant_audio_end for first turn")
+	}
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":     "audio_frame",
+		"seq":      2,
+		"data_b64": base64.StdEncoding.EncodeToString([]byte("pcm")),
+	})
+
+	var secondFinal string
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg := mustReadJSON(t, conn, 2*time.Second)
+		if msg["type"] != "utterance_final" {
+			continue
+		}
+		if text, ok := msg["text"].(string); ok {
+			secondFinal = text
+		}
+		break
+	}
+	if secondFinal != "more" {
+		t.Fatalf("second utterance_final text=%q, want %q", secondFinal, "more")
+	}
+}
+
 func TestLiveHandler_AudioInAckTimestampReflectsClientTimestamp(t *testing.T) {
 	h, serverURL := newLiveTestServer(t, liveTestOptions{})
 	defer h.close()
@@ -707,10 +1009,12 @@ type liveTestOptions struct {
 	ttsSlow                 bool
 	wsMaxSessions           int
 	liveTurnTimeout         time.Duration
+	liveGraceDuration       time.Duration
 	liveMaxAudioFPS         *int
 	liveMaxAudioBPS         *int64
 	liveInboundBurstSeconds *int
 	liveElevenLabsWSBaseURL string
+	provider                core.Provider
 }
 
 func newLiveTestServer(t *testing.T, opts liveTestOptions) (*liveHarness, string) {
@@ -721,7 +1025,11 @@ func newLiveTestServer(t *testing.T, opts liveTestOptions) (*liveHarness, string
 
 	sttProvider := &fakeSTTProvider{deltasPerAudioFrame: opts.sttDeltasPerAudioFrame}
 	ttsProvider := &fakeTTSProvider{slow: opts.ttsSlow}
-	factory := fakeProviderFactory{provider: newTalkToUserProvider("test audio")}
+	provider := opts.provider
+	if provider == nil {
+		provider = newTalkToUserProvider("test audio")
+	}
+	factory := fakeProviderFactory{provider: provider}
 	tracker := sessions.NewTracker()
 
 	cfg := config.Config{
@@ -752,6 +1060,9 @@ func newLiveTestServer(t *testing.T, opts liveTestOptions) (*liveHarness, string
 		LiveElevenLabsWSBaseURL:       opts.liveElevenLabsWSBaseURL,
 		UpstreamConnectTimeout:        2 * time.Second,
 		UpstreamResponseHeaderTimeout: 2 * time.Second,
+	}
+	if opts.liveGraceDuration > 0 {
+		cfg.LiveGraceDuration = opts.liveGraceDuration
 	}
 	if opts.liveMaxAudioFPS != nil {
 		cfg.LiveMaxAudioFPS = *opts.liveMaxAudioFPS
@@ -844,6 +1155,50 @@ func readJSON(conn *websocket.Conn, timeout time.Duration) (map[string]any, erro
 	return out, nil
 }
 
+func startWSJSONReader(conn *websocket.Conn) (<-chan map[string]any, <-chan error) {
+	out := make(chan map[string]any, 64)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errCh)
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			var msg map[string]any
+			if err := json.Unmarshal(data, &msg); err != nil {
+				continue
+			}
+			out <- msg
+		}
+	}()
+	return out, errCh
+}
+
+func assistantIDFromMsg(msg map[string]any) string {
+	if msg == nil {
+		return ""
+	}
+	if v, ok := msg["assistant_audio_id"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func drainErr(ch <-chan error) error {
+	select {
+	case err, ok := <-ch:
+		if !ok {
+			return nil
+		}
+		return err
+	default:
+		return nil
+	}
+}
+
 type fakeProviderFactory struct {
 	provider core.Provider
 }
@@ -904,6 +1259,76 @@ func talkToUserEvents(text string) []types.StreamEvent {
 		msgDelta,
 		types.MessageStopEvent{Type: "message_stop"},
 	}
+}
+
+type gatedTalkToUserProvider struct {
+	events []types.StreamEvent
+	gates  map[int]<-chan struct{}
+}
+
+func (p *gatedTalkToUserProvider) Name() string { return "gated_fake" }
+
+func (p *gatedTalkToUserProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	return nil, io.EOF
+}
+
+func (p *gatedTalkToUserProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	_ = req
+	return &gatedEventStream{ctx: ctx, events: p.events, gates: p.gates}, nil
+}
+
+func (p *gatedTalkToUserProvider) Capabilities() core.ProviderCapabilities {
+	return core.ProviderCapabilities{Tools: true, ToolStreaming: true}
+}
+
+type gatedEventStream struct {
+	ctx    context.Context
+	events []types.StreamEvent
+	gates  map[int]<-chan struct{}
+	idx    int
+}
+
+func (s *gatedEventStream) Next() (types.StreamEvent, error) {
+	if s.idx >= len(s.events) {
+		return nil, io.EOF
+	}
+	if ch := s.gates[s.idx]; ch != nil {
+		select {
+		case <-ch:
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
+	}
+	ev := s.events[s.idx]
+	s.idx++
+	return ev, nil
+}
+
+func (s *gatedEventStream) Close() error { return nil }
+
+func streamingTalkToUserEvents(parts []string) []types.StreamEvent {
+	msg := types.MessageResponse{ID: "msg_1", Type: "message", Role: "assistant", Model: "test", Content: []types.ContentBlock{}}
+	toolStart := types.ContentBlockStartEvent{Type: "content_block_start", Index: 0, ContentBlock: types.ToolUseBlock{Type: "tool_use", ID: "tool_1", Name: "talk_to_user", Input: map[string]any{}}}
+	msgDelta := types.MessageDeltaEvent{Type: "message_delta", Usage: types.Usage{}}
+	msgDelta.Delta.StopReason = types.StopReasonToolUse
+
+	events := []types.StreamEvent{
+		types.MessageStartEvent{Type: "message_start", Message: msg},
+		toolStart,
+	}
+	for _, part := range parts {
+		events = append(events, types.ContentBlockDeltaEvent{
+			Type:  "content_block_delta",
+			Index: 0,
+			Delta: types.InputJSONDelta{Type: "input_json_delta", PartialJSON: part},
+		})
+	}
+	events = append(events,
+		types.ContentBlockStopEvent{Type: "content_block_stop", Index: 0},
+		msgDelta,
+		types.MessageStopEvent{Type: "message_stop"},
+	)
+	return events
 }
 
 type fakeSTTProvider struct {

@@ -32,7 +32,7 @@ This repo intentionally **does not** include:
 - Standalone audio service endpoints (`client.Audio.*`)
 - Additional gateway SDK surfaces beyond messages + runs in this phase
 
-Note: the **gateway** in this repo (`cmd/vai-proxy`) *does* implement Live Audio Mode at `GET /v1/live` (WebSocket). The SDK does not yet ship a `Live` client wrapper.
+Note: the **gateway server** code in this repo (`pkg/gateway/handlers/live.go` + `pkg/gateway/live/session`) implements Live Audio Mode at `GET /v1/live` (WebSocket). The SDK does not yet ship a `Live` client wrapper.
 
 ---
 
@@ -1113,7 +1113,7 @@ For OpenAI-compatible Chat Completions providers, prefer composing `pkg/core/pro
 
 ## 13. Live Audio Mode (Gateway WebSocket)
 
-This section documents the Live Audio Mode WebSocket implemented by the gateway binary (`cmd/vai-proxy`) at `GET /v1/live`.
+This section documents the Live Audio Mode WebSocket implemented by the gateway handler at `GET /v1/live` (see `pkg/gateway/handlers/live.go` and `pkg/gateway/live/session`).
 
 Canonical design doc (more detailed): `LIVE_AUDIO_MODE_DESIGN.md`.
 
@@ -1137,6 +1137,7 @@ Canonical design doc (more detailed): `LIVE_AUDIO_MODE_DESIGN.md`.
 - **Noise vs real speech:** the gateway must not cancel the assistant due to noise/echo-only activity; it should require “confirmed speech” before cancelling during grace/interrupt detection.
 - **User timestamps:** user messages should carry the timestamp of when the user finished speaking (session-relative `end_ms`).
 - **Timebase:** client timestamps should be session-relative and monotonic (see `LIVE_AUDIO_MODE_DESIGN.md`).
+- **Assistant captions (streaming):** if `hello.features.want_assistant_text=true`, the gateway streams captions via `assistant_text_delta` (append-only) and finalizes with `assistant_text_final`. For early `talk_to_user` streaming, clients should not rely on `assistant_audio_start.text` (it may be omitted/empty) and should instead use the caption events.
 
 ### 13.2.1 Handshake requirements (v1 / Phase 9B)
 
@@ -1213,6 +1214,9 @@ V1 requirement:
 Terminal semantics:
 - After `talk_to_user` runs, the live turn is considered complete (no follow-up “assistant text message” turn).
 - A clean way to implement this is a `RunOption` like `WithTerminalTools("talk_to_user")` so the tool loop stops immediately after executing that tool.
+
+Low-latency requirement:
+- The gateway should start speaking as soon as the model begins streaming the `talk_to_user` tool input (do not wait for the tool JSON to fully close). Captions should be streamed in lockstep via `assistant_text_delta` / `assistant_text_final`.
 
 ### 13.4 Interrupt truncation + played history
 

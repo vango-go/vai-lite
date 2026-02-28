@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -15,7 +16,9 @@ import (
 	"github.com/vango-go/vai-lite/pkg/gateway/live/protocol"
 )
 
-const defaultElevenLabsWSBase = "wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
+// multi-stream-input supports per-message `context_id`, which our live gateway relies on
+// (we map one assistant_audio_id == one ElevenLabs context_id).
+const defaultElevenLabsWSBase = "wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/multi-stream-input"
 
 type elevenLabsLiveConfig struct {
 	APIKey     string
@@ -36,11 +39,15 @@ type elevenLabsLiveConn struct {
 
 	writeMu sync.Mutex
 	metaMu  sync.Mutex
+	errMu   sync.Mutex
 
 	activeContextID string
 	chunks          chan elevenLabsLiveChunk
 	closed          chan struct{}
 	closeOnce       sync.Once
+
+	lastServerError string
+	lastClose       string
 }
 
 func newElevenLabsLiveConn(ctx context.Context, cfg elevenLabsLiveConfig) (*elevenLabsLiveConn, error) {
@@ -136,6 +143,7 @@ func (c *elevenLabsLiveConn) Close() error {
 	}
 	c.closeOnce.Do(func() {
 		close(c.closed)
+		c.setLastClose("closed")
 		_ = c.conn.Close()
 	})
 	return nil
@@ -146,6 +154,12 @@ func (c *elevenLabsLiveConn) readLoop() {
 	for {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) {
+				c.setLastClose(fmt.Sprintf("code=%d msg=%s", closeErr.Code, strings.TrimSpace(closeErr.Text)))
+			} else {
+				c.setLastClose(strings.TrimSpace(err.Error()))
+			}
 			return
 		}
 
@@ -153,6 +167,15 @@ func (c *elevenLabsLiveConn) readLoop() {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+
+		if serverErr := decodeString(msg["error"]); serverErr != "" {
+			c.setLastServerError(serverErr)
+		} else if serverErr := decodeString(msg["message"]); serverErr != "" {
+			c.setLastServerError(serverErr)
+		} else if serverErr := decodeString(msg["detail"]); serverErr != "" {
+			c.setLastServerError(serverErr)
+		}
+
 		contextID := decodeString(msg["context_id"])
 		if contextID == "" {
 			contextID = decodeString(msg["contextId"])
@@ -161,7 +184,11 @@ func (c *elevenLabsLiveConn) readLoop() {
 		audioB64 := decodeString(msg["audio"])
 		var audio []byte
 		if audioB64 != "" {
-			audio, _ = base64.StdEncoding.DecodeString(audioB64)
+			audio, err = decodeBase64Any(audioB64)
+			if err != nil {
+				c.setLastServerError("invalid audio base64")
+				audio = nil
+			}
 		}
 		final := decodeBool(msg["isFinal"]) || decodeBool(msg["is_final"])
 		alignment := parseElevenLabsAlignment(msg)
@@ -217,7 +244,14 @@ func (c *elevenLabsLiveConn) writeJSON(ctx context.Context, payload any) error {
 	} else {
 		_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	}
-	return c.conn.WriteJSON(payload)
+	if err := c.conn.WriteJSON(payload); err != nil {
+		reason := strings.TrimSpace(c.failureReason())
+		if reason == "" {
+			return err
+		}
+		return fmt.Errorf("%w (elevenlabs %s)", err, reason)
+	}
+	return nil
 }
 
 func buildElevenLabsWSURL(base, voiceID string) (string, error) {
@@ -233,7 +267,7 @@ func buildElevenLabsWSURL(base, voiceID string) (string, error) {
 		u.Scheme = "wss"
 	}
 	if u.Path == "" || u.Path == "/" {
-		u.Path = "/v1/text-to-speech/" + url.PathEscape(voiceID) + "/stream-input"
+		u.Path = "/v1/text-to-speech/" + url.PathEscape(voiceID) + "/multi-stream-input"
 	}
 	q := u.Query()
 	if q.Get("model_id") == "" {
@@ -306,4 +340,82 @@ func decodeBool(raw json.RawMessage) bool {
 		return false
 	}
 	return out
+}
+
+func decodeBase64Any(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+
+	// ElevenLabs typically uses standard base64 but may omit padding.
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+
+	// Be defensive in case the upstream switches encodings.
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return nil, fmt.Errorf("invalid base64")
+}
+
+func (c *elevenLabsLiveConn) setLastServerError(msg string) {
+	if c == nil {
+		return
+	}
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	msg = strings.ReplaceAll(msg, "\r", " ")
+	msg = strings.Join(strings.Fields(msg), " ")
+	if len(msg) > 300 {
+		msg = msg[:300] + "…"
+	}
+	c.errMu.Lock()
+	c.lastServerError = msg
+	c.errMu.Unlock()
+}
+
+func (c *elevenLabsLiveConn) setLastClose(msg string) {
+	if c == nil {
+		return
+	}
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	msg = strings.ReplaceAll(msg, "\r", " ")
+	msg = strings.Join(strings.Fields(msg), " ")
+	if len(msg) > 300 {
+		msg = msg[:300] + "…"
+	}
+	c.errMu.Lock()
+	c.lastClose = msg
+	c.errMu.Unlock()
+}
+
+func (c *elevenLabsLiveConn) failureReason() string {
+	if c == nil {
+		return ""
+	}
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+	parts := make([]string, 0, 2)
+	if strings.TrimSpace(c.lastServerError) != "" {
+		parts = append(parts, "server_error="+c.lastServerError)
+	}
+	if strings.TrimSpace(c.lastClose) != "" {
+		parts = append(parts, "close="+c.lastClose)
+	}
+	return strings.Join(parts, " ")
 }

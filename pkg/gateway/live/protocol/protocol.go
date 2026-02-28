@@ -477,6 +477,22 @@ type ServerAssistantAudioEnd struct {
 	AssistantAudioID string `json:"assistant_audio_id"`
 }
 
+// ServerAssistantTextDelta streams append-only caption text for an assistant audio segment.
+// Clients should append Delta to the accumulated caption for the given AssistantAudioID.
+type ServerAssistantTextDelta struct {
+	Type             string `json:"type"`
+	AssistantAudioID string `json:"assistant_audio_id"`
+	Delta            string `json:"delta"`
+}
+
+// ServerAssistantTextFinal provides the authoritative final caption text for an assistant audio segment.
+// It must equal the concatenation of all prior ServerAssistantTextDelta.Delta values.
+type ServerAssistantTextFinal struct {
+	Type             string `json:"type"`
+	AssistantAudioID string `json:"assistant_audio_id"`
+	Text             string `json:"text"`
+}
+
 type ServerAudioReset struct {
 	Type             string `json:"type"`
 	Reason           string `json:"reason"`
