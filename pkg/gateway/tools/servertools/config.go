@@ -61,7 +61,7 @@ func DecodeWebFetchConfig(raw any) (WebFetchConfig, error) {
 	}
 	cfg.Provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
 	switch cfg.Provider {
-	case "", ProviderFirecrawl:
+	case "", ProviderFirecrawl, ProviderTavily:
 	default:
 		return WebFetchConfig{}, fmt.Errorf("unsupported provider %q", cfg.Provider)
 	}

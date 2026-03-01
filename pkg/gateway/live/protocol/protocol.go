@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 const (
@@ -94,6 +96,7 @@ type HelloFeatures struct {
 type HelloTools struct {
 	ServerTools      []string       `json:"server_tools,omitempty"`
 	ServerToolConfig map[string]any `json:"server_tool_config,omitempty"`
+	ClientTools      []types.Tool   `json:"client_tools,omitempty"`
 }
 
 type ClientHello struct {
@@ -102,6 +105,8 @@ type ClientHello struct {
 	Client             HelloClient   `json:"client,omitempty"`
 	Auth               *HelloAuth    `json:"auth,omitempty"`
 	Model              string        `json:"model"`
+	System             string        `json:"system,omitempty"`
+	Messages           []types.Message `json:"messages,omitempty"`
 	BYOK               HelloBYOK     `json:"byok,omitempty"`
 	AudioIn            AudioFormat   `json:"audio_in"`
 	AudioOut           AudioFormat   `json:"audio_out"`
@@ -126,6 +131,7 @@ func (h ClientHello) RedactedForLog() map[string]any {
 		byokKeyNames = byokKeyNames[:32]
 	}
 	serverTools := make([]string, 0)
+	clientTools := make([]string, 0)
 	if h.Tools != nil {
 		for _, name := range h.Tools.ServerTools {
 			name = strings.TrimSpace(name)
@@ -135,6 +141,14 @@ func (h ClientHello) RedactedForLog() map[string]any {
 			serverTools = append(serverTools, name)
 		}
 		sort.Strings(serverTools)
+		for _, tool := range h.Tools.ClientTools {
+			name := strings.TrimSpace(tool.Name)
+			if name == "" {
+				continue
+			}
+			clientTools = append(clientTools, name)
+		}
+		sort.Strings(clientTools)
 	}
 
 	return map[string]any{
@@ -159,6 +173,10 @@ func (h ClientHello) RedactedForLog() map[string]any {
 		"byok_key_names":   byokKeyNames,
 		"has_server_tools": h.Tools != nil && len(serverTools) > 0,
 		"server_tools":     serverTools,
+		"has_client_tools": h.Tools != nil && len(clientTools) > 0,
+		"client_tools":     clientTools,
+		"message_count":    len(h.Messages),
+		"has_system":       strings.TrimSpace(h.System) != "",
 	}
 }
 
@@ -194,6 +212,15 @@ type ClientPlaybackMark struct {
 type ClientControl struct {
 	Type string `json:"type"`
 	Op   string `json:"op"`
+}
+
+type ClientToolResult struct {
+	Type    string               `json:"type"`
+	TurnID  int                  `json:"turn_id"`
+	ID      string               `json:"id"`
+	Content []types.ContentBlock `json:"content,omitempty"`
+	IsError bool                 `json:"is_error,omitempty"`
+	Error   *types.Error         `json:"error,omitempty"`
 }
 
 func DecodeClientMessage(data []byte) (any, error) {
@@ -279,6 +306,42 @@ func DecodeClientMessage(data []byte) (any, error) {
 		}
 		msg.Op = op
 		return msg, nil
+	case "tool_result":
+		var raw struct {
+			Type    string          `json:"type"`
+			TurnID  int             `json:"turn_id"`
+			ID      string          `json:"id"`
+			Content json.RawMessage `json:"content,omitempty"`
+			IsError bool            `json:"is_error,omitempty"`
+			Error   *types.Error    `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, badRequest("invalid tool_result", "")
+		}
+		if raw.TurnID <= 0 {
+			return nil, badRequest("tool_result.turn_id must be > 0", "turn_id")
+		}
+		if strings.TrimSpace(raw.ID) == "" {
+			return nil, badRequest("tool_result.id is required", "id")
+		}
+
+		content := make([]types.ContentBlock, 0)
+		if len(strings.TrimSpace(string(raw.Content))) > 0 && strings.TrimSpace(string(raw.Content)) != "null" {
+			decoded, err := types.UnmarshalContentBlocks(raw.Content)
+			if err != nil {
+				return nil, badRequest("invalid tool_result.content", "content")
+			}
+			content = decoded
+		}
+
+		return ClientToolResult{
+			Type:    raw.Type,
+			TurnID:  raw.TurnID,
+			ID:      strings.TrimSpace(raw.ID),
+			Content: content,
+			IsError: raw.IsError,
+			Error:   raw.Error,
+		}, nil
 	default:
 		return nil, badRequest("unsupported message type", "type")
 	}
@@ -308,6 +371,9 @@ func ValidateHello(msg ClientHello) error {
 	}
 	if msg.AudioOut.Channels <= 0 {
 		return badRequest("hello.audio_out.channels must be > 0", "audio_out.channels")
+	}
+	if err := validateHelloMessages(msg.Messages); err != nil {
+		return err
 	}
 	if err := validateHelloTools(msg.Tools); err != nil {
 		return err
@@ -347,22 +413,68 @@ func validateHelloTools(tools *HelloTools) error {
 		if trimmed == "" {
 			return badRequest("hello.tools.server_tools entries must be non-empty", fmt.Sprintf("tools.server_tools[%d]", i))
 		}
-		if _, exists := seen[trimmed]; exists {
+		key := strings.ToLower(trimmed)
+		if _, exists := seen[key]; exists {
 			return badRequest("hello.tools.server_tools entries must be unique", fmt.Sprintf("tools.server_tools[%d]", i))
 		}
-		seen[trimmed] = struct{}{}
+		seen[key] = struct{}{}
 	}
 	for name, raw := range tools.ServerToolConfig {
 		trimmed := strings.TrimSpace(name)
 		if trimmed == "" {
 			return badRequest("hello.tools.server_tool_config keys must be non-empty", "tools.server_tool_config")
 		}
-		if _, ok := seen[trimmed]; !ok {
+		if _, ok := seen[strings.ToLower(trimmed)]; !ok {
 			return badRequest("hello.tools.server_tool_config must only include enabled server tools", "tools.server_tool_config."+trimmed)
 		}
 		obj, ok := raw.(map[string]any)
 		if !ok || obj == nil {
 			return badRequest("hello.tools.server_tool_config entries must be objects", "tools.server_tool_config."+trimmed)
+		}
+	}
+
+	reserved := map[string]struct{}{
+		"talk_to_user":   {},
+		"vai_web_search": {},
+		"vai_web_fetch":  {},
+	}
+	for i, tool := range tools.ClientTools {
+		if strings.TrimSpace(tool.Type) != types.ToolTypeFunction {
+			return badRequest("hello.tools.client_tools entries must be function tools", fmt.Sprintf("tools.client_tools[%d].type", i))
+		}
+		name := strings.TrimSpace(tool.Name)
+		if name == "" {
+			return badRequest("hello.tools.client_tools entries must have a name", fmt.Sprintf("tools.client_tools[%d].name", i))
+		}
+		key := strings.ToLower(name)
+		if _, exists := seen[key]; exists {
+			return badRequest("hello.tools.client_tools name collides with another tool", fmt.Sprintf("tools.client_tools[%d].name", i))
+		}
+		if _, blocked := reserved[key]; blocked {
+			return badRequest("hello.tools.client_tools contains a reserved tool name", fmt.Sprintf("tools.client_tools[%d].name", i))
+		}
+		if tool.InputSchema == nil {
+			return badRequest("hello.tools.client_tools entries must include input_schema", fmt.Sprintf("tools.client_tools[%d].input_schema", i))
+		}
+		seen[key] = struct{}{}
+	}
+
+	return nil
+}
+
+func validateHelloMessages(messages []types.Message) error {
+	for i, message := range messages {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if role == "" {
+			return badRequest("hello.messages entries must include role", fmt.Sprintf("messages[%d].role", i))
+		}
+		switch role {
+		case "user", "assistant":
+		default:
+			return badRequest("hello.messages role must be user or assistant", fmt.Sprintf("messages[%d].role", i))
+		}
+		if message.Content == nil {
+			return badRequest("hello.messages entries must include content", fmt.Sprintf("messages[%d].content", i))
 		}
 	}
 	return nil
@@ -503,4 +615,19 @@ type ServerRunEvent struct {
 	Type   string          `json:"type"`
 	TurnID int             `json:"turn_id"`
 	Event  json.RawMessage `json:"event"`
+}
+
+type ServerToolCall struct {
+	Type   string         `json:"type"`
+	TurnID int            `json:"turn_id"`
+	ID     string         `json:"id"`
+	Name   string         `json:"name"`
+	Input  map[string]any `json:"input,omitempty"`
+}
+
+type ServerToolCancel struct {
+	Type   string `json:"type"`
+	TurnID int    `json:"turn_id"`
+	ID     string `json:"id"`
+	Reason string `json:"reason,omitempty"`
 }

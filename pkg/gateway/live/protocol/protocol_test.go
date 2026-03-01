@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 func TestDecodeClientMessage_Hello(t *testing.T) {
@@ -137,6 +139,75 @@ func TestDecodeClientMessage_UnsupportedControlOp(t *testing.T) {
 	}
 	if decErr.Code != "unsupported" {
 		t.Fatalf("code=%q", decErr.Code)
+	}
+}
+
+func TestDecodeClientMessage_ToolResult(t *testing.T) {
+	raw := []byte(`{
+		"type":"tool_result",
+		"turn_id":2,
+		"id":"call_1",
+		"content":[{"type":"text","text":"ok"}]
+	}`)
+
+	msg, err := DecodeClientMessage(raw)
+	if err != nil {
+		t.Fatalf("DecodeClientMessage() error = %v", err)
+	}
+	result, ok := msg.(ClientToolResult)
+	if !ok {
+		t.Fatalf("decoded type = %T, want ClientToolResult", msg)
+	}
+	if result.TurnID != 2 {
+		t.Fatalf("turn_id=%d", result.TurnID)
+	}
+	if result.ID != "call_1" {
+		t.Fatalf("id=%q", result.ID)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("len(content)=%d", len(result.Content))
+	}
+}
+
+func TestValidateHello_RejectsReservedClientToolName(t *testing.T) {
+	err := ValidateHello(ClientHello{
+		Type:            "hello",
+		ProtocolVersion: "1",
+		Model:           "anthropic/claude-sonnet-4",
+		AudioIn:         AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
+		AudioOut:        AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 24000, Channels: 1},
+		Voice:           &HelloVoice{Provider: "cartesia", VoiceID: "voice_1"},
+		Tools: &HelloTools{
+			ClientTools: []types.Tool{
+				{Type: types.ToolTypeFunction, Name: "talk_to_user", InputSchema: &types.JSONSchema{Type: "object"}},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateHello_RejectsInvalidSeedMessages(t *testing.T) {
+	err := ValidateHello(ClientHello{
+		Type:            "hello",
+		ProtocolVersion: "1",
+		Model:           "anthropic/claude-sonnet-4",
+		AudioIn:         AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 16000, Channels: 1},
+		AudioOut:        AudioFormat{Encoding: "pcm_s16le", SampleRateHz: 24000, Channels: 1},
+		Voice:           &HelloVoice{Provider: "cartesia", VoiceID: "voice_1"},
+		Messages: []types.Message{
+			{Role: "system", Content: "bad"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "messages") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

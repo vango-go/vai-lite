@@ -404,7 +404,25 @@ func (h RunsHandler) newServerToolsRegistry(r *http.Request, enabled []string, r
 			}
 		}
 		if fetchConfig.Provider == "" {
-			fetchConfig.Provider = servertools.ProviderFirecrawl
+			hasTavilyKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyTavily)) != ""
+			hasFirecrawlKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyFirecrawl)) != ""
+			if hasTavilyKey == hasFirecrawlKey {
+				msg := "server_tool_config.vai_web_fetch.provider is required"
+				if hasTavilyKey && hasFirecrawlKey {
+					msg = "ambiguous web fetch provider; set server_tool_config.vai_web_fetch.provider"
+				}
+				return nil, &core.Error{
+					Type:    core.ErrInvalidRequest,
+					Message: msg,
+					Param:   "server_tool_config.vai_web_fetch.provider",
+					Code:    "tool_provider_missing",
+				}
+			}
+			if hasTavilyKey {
+				fetchConfig.Provider = servertools.ProviderTavily
+			} else {
+				fetchConfig.Provider = servertools.ProviderFirecrawl
+			}
 		}
 		fetchHeader := servertools.ProviderHeaderName(fetchConfig.Provider)
 		fetchKey := strings.TrimSpace(r.Header.Get(fetchHeader))
@@ -416,8 +434,22 @@ func (h RunsHandler) newServerToolsRegistry(r *http.Request, enabled []string, r
 				Code:    "provider_key_missing",
 			}
 		}
-		fetchClient := firecrawl.NewClient(fetchKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
-		executors = append(executors, servertools.NewWebFetchExecutor(fetchConfig, fetchClient))
+		var firecrawlClient *firecrawl.Client
+		var tavilyClient *tavily.Client
+		switch fetchConfig.Provider {
+		case servertools.ProviderFirecrawl:
+			firecrawlClient = firecrawl.NewClient(fetchKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
+		case servertools.ProviderTavily:
+			tavilyClient = tavily.NewClient(fetchKey, h.Config.TavilyBaseURL, toolHTTPClient)
+		default:
+			return nil, &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: fmt.Sprintf("unsupported web fetch provider %q", fetchConfig.Provider),
+				Param:   "server_tool_config.vai_web_fetch.provider",
+				Code:    "unsupported_tool_provider",
+			}
+		}
+		executors = append(executors, servertools.NewWebFetchExecutor(fetchConfig, firecrawlClient, tavilyClient))
 	}
 
 	return servertools.NewRegistry(executors...), nil

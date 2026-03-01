@@ -15,6 +15,9 @@ The high-level primitives are:
 - Agent loop:
   - `Messages.Run()` — blocking tool-loop execution
   - `Messages.RunStream()` — streaming tool-loop execution with interrupts/cancel and deterministic history deltas
+- Live mode:
+  - `Live.Connect()` — low-level WebSocket session for `/v1/live`
+  - `Live.RunStream()` — RunStream-like live session wrapper with event mapping and client tool callbacks
 
 `Run`/`RunStream` are still the core agent APIs; the single-turn methods are useful when you don’t want loop orchestration.
 
@@ -28,11 +31,8 @@ Everything else is in service of these primitives:
 
 This repo intentionally **does not** include:
 
-- Live/WebSocket server mode in SDK (`client.Live.*`)
 - Standalone audio service endpoints (`client.Audio.*`)
-- Additional gateway SDK surfaces beyond messages + runs in this phase
-
-Note: the **gateway server** code in this repo (`pkg/gateway/handlers/live.go` + `pkg/gateway/live/session`) implements Live Audio Mode at `GET /v1/live` (WebSocket). The SDK does not yet ship a `Live` client wrapper.
+- Additional gateway SDK surfaces beyond messages + runs + live in this phase
 
 ---
 
@@ -68,6 +68,7 @@ Note: the **gateway server** code in this repo (`pkg/gateway/handlers/live.go` +
   - [9.2 Helper extractors](#92-helper-extractors)
   - [9.3 `RunStream.Process` convenience](#93-runstreamprocess-convenience)
   - [9.4 `Messages.Stream` audio side channel](#94-messagesstream-audio-side-channel)
+  - [9.5 Live SDK client (`/v1/live`)](#95-live-sdk-client-v1live)
 - [10. Errors and Observability](#10-errors-and-observability)
 - [11. Testing and Local Dev](#11-testing-and-local-dev)
   - [11.1 Integration provider filtering + reliability controls](#111-integration-provider-filtering--reliability-controls)
@@ -91,6 +92,7 @@ Key directories you’ll touch:
   - `sdk/client.go` — client construction, mode switch (direct vs proxy), provider registration
   - `sdk/messages.go` — `Create` / `Stream` / `CreateStream` / `Extract` / `Run` / `RunStream`
   - `sdk/runs_service.go` — gateway server-run surface: `Runs.Create` / `Runs.Stream`
+  - `sdk/live.go` — gateway live websocket surface: `Live.Connect` / `Live.RunStream`
   - `sdk/run.go` — the tool loop implementation
   - `sdk/tools.go` — tool builders (`MakeTool`, `ToolSet`, native tool constructors)
   - `sdk/stream.go` — stream wrapper that accumulates final responses
@@ -173,6 +175,7 @@ client := vai.NewClient(
 Proxy mode notes:
 - `Messages.Run` / `Messages.RunStream` remain client-side loops.
 - `Runs.Create` / `Runs.Stream` call gateway server-side loops.
+- `Live.Connect` / `Live.RunStream` call gateway live websocket sessions at `/v1/live`.
 - Server-side runs reject client function tools (use provider-native tools and/or gateway-managed **server tools** instead).
 - Gateway server tools are enabled via `server_tools` + `server_tool_config` (legacy `builtins` remains accepted as a compatibility alias).
 - For non-streaming proxy calls, pass request contexts with explicit deadlines in production.
@@ -909,6 +912,60 @@ For single-turn streaming:
 - `Response()` includes a final `audio` content block when synthesis succeeded.
 - If voice output is not enabled, `AudioEvents()` is closed immediately.
 - TTS streaming errors are fail-fast: stream ends with `Stream.Err()`.
+
+### 9.5 Live SDK client (`/v1/live`)
+
+`Live.Connect` is the low-level websocket client for gateway live mode.
+
+```go
+session, err := client.Live.Connect(ctx, &vai.LiveConnectRequest{
+	Model: "anthropic/claude-sonnet-4",
+	Voice: vai.LiveVoice{
+		Provider: "cartesia",
+		VoiceID:  "your_voice_id",
+		Language: "en",
+	},
+	Features: vai.LiveFeatures{
+		AudioTransport:         "base64_json",
+		SendPlaybackMarks:      true,
+		WantPartialTranscripts: true,
+		WantAssistantText:      true,
+		WantRunEvents:          true,
+	},
+	Tools: vai.LiveTools{
+		ServerTools: []string{"vai_web_search", "vai_web_fetch"},
+		ServerToolConfig: map[string]any{
+			"vai_web_search": map[string]any{"provider": "tavily"},
+			"vai_web_fetch":  map[string]any{"provider": "tavily", "format": "markdown"},
+		},
+	},
+})
+if err != nil {
+	panic(err)
+}
+defer session.Close()
+
+for ev := range session.Events() {
+	switch e := ev.(type) {
+	case vai.LiveAssistantTextDeltaEvent:
+		fmt.Print(e.Delta)
+	case vai.LiveAssistantAudioChunkEvent:
+		play(e.Data, e.Format)
+	}
+}
+```
+
+`Live.RunStream` is the RunStream-like wrapper for live sessions:
+- maps `assistant_text_delta` to `TextDeltaFrom(...)`,
+- maps live audio to `AudioChunkEvent`,
+- forwards gateway `run_event` payloads to SDK `RunStreamEvent` types,
+- executes client function tools over `tool_call` / `tool_result` frames when handlers are provided via `WithTools(...)` / `WithToolHandler(...)`.
+
+Key requirements for live connect:
+- proxy mode (`WithBaseURL(...)`),
+- key for `req.Model` provider,
+- `CARTESIA_API_KEY` (or `WithProviderKey("cartesia", ...)`) for STT,
+- `ELEVENLABS_API_KEY` when `Voice.Provider=="elevenlabs"`.
 
 ---
 

@@ -14,6 +14,14 @@ func newHistoryManager() *historyManager {
 	}
 }
 
+func (h *historyManager) seed(messages []types.Message) {
+	if len(messages) == 0 {
+		return
+	}
+	h.canonical = append(h.canonical, cloneMessages(messages)...)
+	h.played = append(h.played, cloneMessages(messages)...)
+}
+
 func (h *historyManager) appendUser(text string) (canonicalIdx int, playedIdx int) {
 	msg := types.Message{Role: "user", Content: text}
 	h.canonical = append(h.canonical, msg)
@@ -66,5 +74,14 @@ func (h *historyManager) playedSnapshot() []types.Message {
 func (h *historyManager) canonicalSnapshot() []types.Message {
 	out := make([]types.Message, len(h.canonical))
 	copy(out, h.canonical)
+	return out
+}
+
+func cloneMessages(messages []types.Message) []types.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]types.Message, len(messages))
+	copy(out, messages)
 	return out
 }

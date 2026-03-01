@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"strings"
 	"testing"
@@ -400,5 +402,92 @@ func TestHandleSlashCommand_ModelSwitchPreservesHistory(t *testing.T) {
 	}
 	if len(state.history) != beforeLen {
 		t.Fatalf("history length changed: got %d want %d", len(state.history), beforeLen)
+	}
+}
+
+func TestParseChatConfig_LiveDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseChatConfig(nil, envMap(map[string]string{
+		"OPENAI_API_KEY": "sk-openai-test",
+		"TAVILY_API_KEY": "tvly-test",
+	}))
+	if err != nil {
+		t.Fatalf("parseChatConfig error: %v", err)
+	}
+	if cfg.LiveVoiceProvider != "cartesia" {
+		t.Fatalf("LiveVoiceProvider=%q, want %q", cfg.LiveVoiceProvider, "cartesia")
+	}
+	if cfg.LiveLanguage != "en" {
+		t.Fatalf("LiveLanguage=%q, want %q", cfg.LiveLanguage, "en")
+	}
+}
+
+func TestValidateLiveModeConfig_Requirements(t *testing.T) {
+	t.Parallel()
+
+	base := chatConfig{
+		Model:             "oai-resp/gpt-5-mini",
+		LiveVoiceProvider: "cartesia",
+		LiveVoiceID:       "voice_test",
+		CartesiaAPIKey:    "sk-cartesia",
+		ProviderKeys: map[string]string{
+			"openai": "sk-openai-test",
+		},
+	}
+	if err := validateLiveModeConfig(base, base.Model); err != nil {
+		t.Fatalf("validateLiveModeConfig error: %v", err)
+	}
+
+	missingVoice := base
+	missingVoice.LiveVoiceID = ""
+	if err := validateLiveModeConfig(missingVoice, missingVoice.Model); err == nil || !strings.Contains(err.Error(), "voice id") {
+		t.Fatalf("expected voice id validation error, got %v", err)
+	}
+
+	missingCartesia := base
+	missingCartesia.CartesiaAPIKey = ""
+	if err := validateLiveModeConfig(missingCartesia, missingCartesia.Model); err == nil || !strings.Contains(err.Error(), "CARTESIA_API_KEY") {
+		t.Fatalf("expected cartesia validation error, got %v", err)
+	}
+
+	eleven := base
+	eleven.LiveVoiceProvider = "elevenlabs"
+	if err := validateLiveModeConfig(eleven, eleven.Model); err == nil || !strings.Contains(err.Error(), "ELEVENLABS_API_KEY") {
+		t.Fatalf("expected elevenlabs validation error, got %v", err)
+	}
+}
+
+func TestRunChatbot_LiveCommandDispatches(t *testing.T) {
+	t.Parallel()
+
+	cfg := chatConfig{
+		BaseURL:      "http://127.0.0.1:8080",
+		Model:        "oai-resp/gpt-5-mini",
+		MaxTokens:    64,
+		Timeout:      5 * time.Second,
+		TavilyAPIKey: "tvly-test",
+		ProviderKeys: map[string]string{
+			"openai": "sk-openai-test",
+		},
+	}
+
+	var liveCalled bool
+	prev := runLiveModeFunc
+	runLiveModeFunc = func(ctx context.Context, scanner *bufio.Scanner, client *vai.Client, cfg chatConfig, state *chatRuntime, out io.Writer, errOut io.Writer) error {
+		liveCalled = true
+		return nil
+	}
+	t.Cleanup(func() { runLiveModeFunc = prev })
+
+	in := strings.NewReader("/live\n/quit\n")
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+
+	if err := runChatbot(context.Background(), cfg, in, &out, &errOut); err != nil {
+		t.Fatalf("runChatbot error: %v", err)
+	}
+	if !liveCalled {
+		t.Fatalf("expected /live to dispatch runLiveMode")
 	}
 }

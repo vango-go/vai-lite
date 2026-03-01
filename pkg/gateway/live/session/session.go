@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 
 const (
 	talkToUserToolName = "talk_to_user"
+	voiceSystemPrompt  = "You are a real-time voice assistant. Use tools when needed, and call talk_to_user({text}) for final speech output. Do not emit markdown. Expand numbers, symbols, and abbreviations for speech."
 
 	maxCanceledAssistantAudioIDs = 64
 	outboundPriorityQueueSize    = 8
@@ -218,6 +220,10 @@ type LiveSession struct {
 	clockHaveClient          atomic.Bool
 	clockMaxClientMS         atomic.Int64
 	clockMaxClientAtUnixNano atomic.Int64
+
+	clientTools     map[string]types.Tool
+	toolWaitersMu   sync.Mutex
+	toolResultQueue map[string]chan protocol.ClientToolResult
 }
 
 type outboundFrame struct {
@@ -355,6 +361,17 @@ func New(deps Dependencies) (*LiveSession, error) {
 		cancel:           cancel,
 		outboundPriority: make(chan outboundFrame, max(1, min(deps.Config.OutboundQueueSize, outboundPriorityQueueSize))),
 		outboundNormal:   make(chan outboundFrame, deps.Config.OutboundQueueSize),
+		clientTools:      make(map[string]types.Tool),
+		toolResultQueue:  make(map[string]chan protocol.ClientToolResult),
+	}
+	if deps.Hello.Tools != nil {
+		for _, tool := range deps.Hello.Tools.ClientTools {
+			name := strings.TrimSpace(tool.Name)
+			if name == "" {
+				continue
+			}
+			s.clientTools[strings.ToLower(name)] = tool
+		}
 	}
 	s.canceledAssistant.Store(canceledAssistantState{set: make(map[string]struct{}), order: nil})
 	return s, nil
@@ -484,6 +501,8 @@ func (s *LiveSession) Run() error {
 		playbackMarks         = make(map[string]protocol.ClientPlaybackMark)
 		backpressureResets    []time.Time
 	)
+
+	history.seed(s.hello.Messages)
 
 	onSendErr := func(err error, assistantID string) error {
 		if err == nil {
@@ -829,6 +848,10 @@ func (s *LiveSession) Run() error {
 						_ = s.sendWarning("session_end", "session ending by client request")
 						return nil
 					}
+				case protocol.ClientToolResult:
+					if !s.dispatchToolResult(m) {
+						_ = s.sendWarning("unexpected_tool_result", "received tool_result with no active matching tool call")
+					}
 				}
 			case websocket.BinaryMessage:
 				if !s.cfg.AudioTransportBinary {
@@ -1121,7 +1144,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 		req := &types.MessageRequest{
 			Model:    s.modelName,
 			Messages: turnHistory,
-			System:   "You are a real-time voice assistant. Use tools when needed, and call talk_to_user({text}) for final speech output. Do not emit markdown. Expand numbers, symbols, and abbreviations for speech.",
+			System:   s.turnSystemPrompt(),
 			Tools:    s.turnTools(),
 			Stream:   true,
 		}
@@ -1172,17 +1195,17 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 		}
 
 		talkCalls := make([]types.ToolUseBlock, 0, 1)
-		serverCalls := make([]types.ToolUseBlock, 0, len(toolUses))
+		toolCallsForExecution := make([]types.ToolUseBlock, 0, len(toolUses))
 		for _, call := range toolUses {
 			name := strings.TrimSpace(call.Name)
 			if strings.EqualFold(name, talkToUserToolName) {
 				talkCalls = append(talkCalls, call)
 				continue
 			}
-			serverCalls = append(serverCalls, call)
+			toolCallsForExecution = append(toolCallsForExecution, call)
 		}
 
-		if len(talkCalls) > 0 && len(serverCalls) > 0 {
+		if len(talkCalls) > 0 && len(toolCallsForExecution) > 0 {
 			return runTurnResult{}, fmt.Errorf("invalid tool plan: talk_to_user cannot be combined with other tool calls")
 		}
 		if len(talkCalls) > 0 {
@@ -1199,7 +1222,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 			})
 			return runTurnResult{text: normalizeSpace(text)}, nil
 		}
-		if len(serverCalls) == 0 {
+		if len(toolCallsForExecution) == 0 {
 			_ = s.emitRunEvent(turnID, types.RunCompleteEvent{
 				Type: "run_complete",
 				Result: &types.RunResult{
@@ -1210,7 +1233,7 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 			return runTurnResult{text: normalizeSpace(resp.TextContent())}, nil
 		}
 
-		if toolCalls+len(serverCalls) > maxToolCalls {
+		if toolCalls+len(toolCallsForExecution) > maxToolCalls {
 			_ = s.emitRunEvent(turnID, types.RunErrorEvent{Type: "error", Error: types.Error{
 				Type:    string(core.ErrInvalidRequest),
 				Message: "max tool calls per turn exceeded",
@@ -1219,83 +1242,86 @@ func (s *LiveSession) runTurn(ctx context.Context, history []types.Message, turn
 			return runTurnResult{}, fmt.Errorf("max tool calls exceeded")
 		}
 
-		toolResultBlocks := make([]types.ContentBlock, 0, len(serverCalls))
-		for _, call := range serverCalls {
-			if s.serverTools == nil || !s.serverTools.Has(call.Name) {
-				return runTurnResult{}, fmt.Errorf("unknown tool %q", call.Name)
+		toolResultBlocks := make([]types.ContentBlock, 0, len(toolCallsForExecution))
+		for _, call := range toolCallsForExecution {
+			callName := strings.TrimSpace(call.Name)
+			if callName == "" {
+				return runTurnResult{}, fmt.Errorf("tool name is required")
 			}
 			_ = s.emitRunEvent(turnID, types.RunToolCallStartEvent{
 				Type:  "tool_call_start",
 				ID:    call.ID,
-				Name:  call.Name,
+				Name:  callName,
 				Input: call.Input,
 			})
 
 			toolCtx := ctx
+			cancelTool := func() {}
 			toolTimeout := toolTimeoutDefault
 			if deadline, ok := ctx.Deadline(); ok {
 				remaining := time.Until(deadline)
 				if remaining <= 0 {
 					return runTurnResult{}, context.DeadlineExceeded
 				}
-				if remaining < toolTimeout {
+				if toolTimeout <= 0 || remaining < toolTimeout {
 					toolTimeout = remaining
 				}
 			}
 			if toolTimeout > 0 {
 				var cancel context.CancelFunc
 				toolCtx, cancel = context.WithTimeout(ctx, toolTimeout)
-				content, toolErr := s.serverTools.Execute(toolCtx, call.Name, call.Input)
-				cancel()
-				block := types.ToolResultBlock{Type: "tool_result", ToolUseID: call.ID, Content: content}
-				if toolErr != nil {
-					block.IsError = true
-					if len(content) == 0 {
-						msg := strings.TrimSpace(toolErr.Message)
-						if msg == "" {
-							msg = "tool execution failed"
-						}
-						block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: msg}}
-					}
-				} else if len(content) == 0 {
-					block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: ""}}
-				}
-				toolResultBlocks = append(toolResultBlocks, block)
-				_ = s.emitRunEvent(turnID, types.RunToolResultEvent{
-					Type:    "tool_result",
-					ID:      call.ID,
-					Name:    call.Name,
-					Content: block.Content,
-					IsError: block.IsError,
-				})
-				continue
+				cancelTool = cancel
 			}
 
-			content, toolErr := s.serverTools.Execute(toolCtx, call.Name, call.Input)
-			block := types.ToolResultBlock{Type: "tool_result", ToolUseID: call.ID, Content: content}
+			var (
+				content []types.ContentBlock
+				toolErr *types.Error
+				execErr error
+			)
+			switch {
+			case s.serverTools != nil && s.serverTools.Has(callName):
+				content, toolErr = s.serverTools.Execute(toolCtx, callName, call.Input)
+			case s.hasClientTool(callName):
+				content, toolErr, execErr = s.executeClientToolCall(toolCtx, ctx, turnID, call)
+			default:
+				cancelTool()
+				return runTurnResult{}, fmt.Errorf("unknown tool %q", callName)
+			}
+			cancelTool()
+			if execErr != nil {
+				return runTurnResult{}, execErr
+			}
+
+			block := types.ToolResultBlock{
+				Type:      "tool_result",
+				ToolUseID: call.ID,
+				Content:   content,
+			}
 			if toolErr != nil {
 				block.IsError = true
-				if len(content) == 0 {
+				if len(block.Content) == 0 {
 					msg := strings.TrimSpace(toolErr.Message)
 					if msg == "" {
 						msg = "tool execution failed"
 					}
 					block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: msg}}
 				}
-			} else if len(content) == 0 {
+			} else if len(block.Content) == 0 {
 				block.Content = []types.ContentBlock{types.TextBlock{Type: "text", Text: ""}}
 			}
+
 			toolResultBlocks = append(toolResultBlocks, block)
 			_ = s.emitRunEvent(turnID, types.RunToolResultEvent{
 				Type:    "tool_result",
 				ID:      call.ID,
-				Name:    call.Name,
+				Name:    callName,
 				Content: block.Content,
 				IsError: block.IsError,
+				Error:   toolErr,
 			})
 		}
 
-		toolCalls += len(serverCalls)
+		toolCalls += len(toolCallsForExecution)
 		assistantMsg := types.Message{Role: "assistant", Content: resp.Content}
 		toolMsg := types.Message{Role: "user", Content: toolResultBlocks}
 		turnHistory = append(turnHistory, assistantMsg, toolMsg)
@@ -1713,7 +1739,22 @@ func (s *LiveSession) turnTools() []types.Tool {
 			},
 		},
 	}
+	appendClientTools := func() {
+		if len(s.clientTools) == 0 {
+			return
+		}
+		names := make([]string, 0, len(s.clientTools))
+		for name := range s.clientTools {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			tools = append(tools, s.clientTools[name])
+		}
+	}
+
 	if s.serverTools == nil {
+		appendClientTools()
 		return tools
 	}
 	for _, name := range s.serverTools.Names() {
@@ -1721,7 +1762,24 @@ func (s *LiveSession) turnTools() []types.Tool {
 			tools = append(tools, def)
 		}
 	}
+	appendClientTools()
 	return tools
+}
+
+func (s *LiveSession) hasClientTool(name string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.clientTools[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func (s *LiveSession) turnSystemPrompt() string {
+	extra := strings.TrimSpace(s.hello.System)
+	if extra == "" {
+		return voiceSystemPrompt
+	}
+	return voiceSystemPrompt + "\n\n" + extra
 }
 
 func extractTalkToUserText(input map[string]any) (string, bool) {
@@ -2525,6 +2583,102 @@ func (s *LiveSession) readLoop(out chan<- inboundFrame) {
 		case <-s.ctx.Done():
 			return
 		}
+	}
+}
+
+func toolResultKey(turnID int, id string) string {
+	return fmt.Sprintf("%d:%s", turnID, strings.TrimSpace(id))
+}
+
+func (s *LiveSession) registerToolResultWaiter(turnID int, id string) chan protocol.ClientToolResult {
+	key := toolResultKey(turnID, id)
+	ch := make(chan protocol.ClientToolResult, 1)
+	s.toolWaitersMu.Lock()
+	s.toolResultQueue[key] = ch
+	s.toolWaitersMu.Unlock()
+	return ch
+}
+
+func (s *LiveSession) unregisterToolResultWaiter(turnID int, id string) {
+	key := toolResultKey(turnID, id)
+	s.toolWaitersMu.Lock()
+	delete(s.toolResultQueue, key)
+	s.toolWaitersMu.Unlock()
+}
+
+func (s *LiveSession) dispatchToolResult(result protocol.ClientToolResult) bool {
+	key := toolResultKey(result.TurnID, result.ID)
+	s.toolWaitersMu.Lock()
+	ch, ok := s.toolResultQueue[key]
+	s.toolWaitersMu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case ch <- result:
+	default:
+	}
+	return true
+}
+
+func (s *LiveSession) executeClientToolCall(toolCtx, parentCtx context.Context, turnID int, call types.ToolUseBlock) ([]types.ContentBlock, *types.Error, error) {
+	callID := strings.TrimSpace(call.ID)
+	if callID == "" {
+		return nil, &types.Error{
+			Type:    string(core.ErrInvalidRequest),
+			Message: "tool call id is required",
+			Code:    "run_validation_failed",
+			Param:   "tool_use.id",
+		}, nil
+	}
+	callName := strings.TrimSpace(call.Name)
+	waiter := s.registerToolResultWaiter(turnID, callID)
+	defer s.unregisterToolResultWaiter(turnID, callID)
+
+	if err := s.sendJSON(protocol.ServerToolCall{
+		Type:   "tool_call",
+		TurnID: turnID,
+		ID:     callID,
+		Name:   callName,
+		Input:  call.Input,
+	}); err != nil {
+		return nil, nil, err
+	}
+
+	select {
+	case result := <-waiter:
+		content := result.Content
+		if result.IsError {
+			toolErr := result.Error
+			if toolErr == nil {
+				toolErr = &types.Error{
+					Type:    string(core.ErrAPI),
+					Message: "client tool failed",
+					Code:    "tool_execution_failed",
+				}
+			}
+			return content, toolErr, nil
+		}
+		return content, nil, nil
+	case <-toolCtx.Done():
+		reason := "tool_timeout"
+		if parentCtx != nil && parentCtx.Err() != nil {
+			reason = "turn_cancelled"
+		}
+		_ = s.sendJSON(protocol.ServerToolCancel{
+			Type:   "tool_cancel",
+			TurnID: turnID,
+			ID:     callID,
+			Reason: reason,
+		})
+		if parentCtx != nil && parentCtx.Err() != nil {
+			return nil, nil, parentCtx.Err()
+		}
+		return nil, &types.Error{
+			Type:    string(core.ErrAPI),
+			Message: "client tool timed out",
+			Code:    "tool_timeout",
+		}, nil
 	}
 }
 

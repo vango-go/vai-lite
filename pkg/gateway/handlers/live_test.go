@@ -656,6 +656,57 @@ func TestLiveHandler_HelloAckIncludesRunTimeoutMS(t *testing.T) {
 	}
 }
 
+func TestLiveHandler_HelloMessagesSeedFirstTurnHistory(t *testing.T) {
+	provider := newSeedHistoryProvider("seeded reply")
+	h, serverURL := newLiveTestServer(t, liveTestOptions{
+		sttDeltasPerAudioFrame: [][]stt.TranscriptDelta{{{Text: "live input", IsFinal: true}}},
+		provider:               provider,
+	})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	hello["messages"] = []any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "seed user"},
+			},
+		},
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "seed assistant"},
+			},
+		},
+	}
+	mustWriteJSON(t, conn, hello)
+
+	ack := mustReadJSON(t, conn, 2*time.Second)
+	if ack["type"] != "hello_ack" {
+		t.Fatalf("ack type=%v payload=%+v", ack["type"], ack)
+	}
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":     "audio_frame",
+		"seq":      1,
+		"data_b64": base64.StdEncoding.EncodeToString([]byte("pcm")),
+	})
+
+	req := provider.awaitFirstReq(t, 3*time.Second)
+	if len(req.Messages) < 3 {
+		t.Fatalf("expected seeded history + utterance, got %d messages", len(req.Messages))
+	}
+	if req.Messages[0].Role != "user" || req.Messages[0].TextContent() != "seed user" {
+		t.Fatalf("message[0]=role:%q text:%q", req.Messages[0].Role, req.Messages[0].TextContent())
+	}
+	if req.Messages[1].Role != "assistant" || req.Messages[1].TextContent() != "seed assistant" {
+		t.Fatalf("message[1]=role:%q text:%q", req.Messages[1].Role, req.Messages[1].TextContent())
+	}
+}
+
 func TestLiveHandler_HandshakeGroqRequiresGroqBYOK(t *testing.T) {
 	h, serverURL := newLiveTestServer(t, liveTestOptions{})
 	defer h.close()
@@ -823,6 +874,168 @@ func TestLiveHandler_ServerTools_AmbiguousInferenceBadRequest(t *testing.T) {
 	}
 	if msg["code"] != "bad_request" {
 		t.Fatalf("code=%v payload=%+v", msg["code"], msg)
+	}
+}
+
+func TestLiveHandler_ServerTools_InferFetchProviderFromBYOK(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	hello["tools"] = map[string]any{
+		"server_tools": []any{"vai_web_fetch"},
+	}
+	hello["byok"] = map[string]any{
+		"anthropic": "sk-ant-test",
+		"cartesia":  "sk-car-test",
+		"keys": map[string]any{
+			"tavily": "tvly-test",
+		},
+	}
+	mustWriteJSON(t, conn, hello)
+
+	ack := mustReadJSON(t, conn, 2*time.Second)
+	if ack["type"] != "hello_ack" {
+		t.Fatalf("ack type=%v payload=%+v", ack["type"], ack)
+	}
+}
+
+func TestLiveHandler_ServerTools_ExplicitFetchTavilyWithoutKeyUnauthorized(t *testing.T) {
+	h, serverURL := newLiveTestServer(t, liveTestOptions{})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	hello["tools"] = map[string]any{
+		"server_tools": []any{"vai_web_fetch"},
+		"server_tool_config": map[string]any{
+			"vai_web_fetch": map[string]any{"provider": "tavily"},
+		},
+	}
+	mustWriteJSON(t, conn, hello)
+
+	msg := mustReadJSON(t, conn, 2*time.Second)
+	if msg["type"] != "error" {
+		t.Fatalf("type=%v payload=%+v", msg["type"], msg)
+	}
+	if msg["code"] != "unauthorized" {
+		t.Fatalf("code=%v payload=%+v", msg["code"], msg)
+	}
+	details, ok := msg["details"].(map[string]any)
+	if !ok {
+		t.Fatalf("details missing in payload=%+v", msg)
+	}
+	if details["requires_byok_header"] != "X-Provider-Key-Tavily" {
+		t.Fatalf("requires_byok_header=%v payload=%+v", details["requires_byok_header"], msg)
+	}
+}
+
+func TestLiveHandler_ClientToolRPCRoundTrip(t *testing.T) {
+	provider := &clientToolRPCProvider{}
+	h, serverURL := newLiveTestServer(t, liveTestOptions{
+		sttDeltasPerAudioFrame: [][]stt.TranscriptDelta{{{Text: "do tool", IsFinal: true}}},
+		ttsSlow:                false,
+		provider:               provider,
+	})
+	defer h.close()
+
+	conn := mustDialWS(t, serverURL)
+	defer conn.Close()
+
+	hello := baseHello("1")
+	features := hello["features"].(map[string]any)
+	features["want_run_events"] = true
+	hello["tools"] = map[string]any{
+		"client_tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "client_echo",
+				"description": "Echo text",
+				"input_schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"value": map[string]any{"type": "string"},
+					},
+					"required":             []any{"value"},
+					"additionalProperties": false,
+				},
+			},
+		},
+	}
+	mustWriteJSON(t, conn, hello)
+
+	ack := mustReadJSON(t, conn, 2*time.Second)
+	if ack["type"] != "hello_ack" {
+		t.Fatalf("ack type=%v payload=%+v", ack["type"], ack)
+	}
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":     "audio_frame",
+		"seq":      1,
+		"data_b64": base64.StdEncoding.EncodeToString([]byte("pcm")),
+	})
+
+	var (
+		gotToolCall         bool
+		toolCallID          string
+		toolCallTurnID      float64
+		seenRunToolResult   bool
+		seenAssistantSpeech bool
+	)
+	deadline := time.NewTimer(4 * time.Second)
+	defer deadline.Stop()
+
+	for !(seenRunToolResult && seenAssistantSpeech) {
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for client tool flow events: gotToolCall=%v seenRunToolResult=%v seenAssistantSpeech=%v", gotToolCall, seenRunToolResult, seenAssistantSpeech)
+		default:
+		}
+		msg, err := readJSON(conn, 500*time.Millisecond)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			t.Fatalf("read websocket frame: %v", err)
+		}
+		switch msg["type"] {
+		case "tool_call":
+			gotToolCall = true
+			toolCallID, _ = msg["id"].(string)
+			toolCallTurnID, _ = msg["turn_id"].(float64)
+			mustWriteJSON(t, conn, map[string]any{
+				"type":    "tool_result",
+				"turn_id": int(toolCallTurnID),
+				"id":      toolCallID,
+				"content": []any{
+					map[string]any{"type": "text", "text": "tool ok"},
+				},
+			})
+		case "run_event":
+			evRaw, _ := msg["event"].(map[string]any)
+			if evRaw != nil && evRaw["type"] == "tool_result" {
+				seenRunToolResult = true
+			}
+		case "assistant_audio_start":
+			seenAssistantSpeech = true
+		case "error":
+			t.Fatalf("received error frame: %+v", msg)
+		}
+	}
+
+	if !gotToolCall {
+		t.Fatalf("expected tool_call frame")
+	}
+	if toolCallID == "" || toolCallTurnID <= 0 {
+		t.Fatalf("invalid tool_call payload id=%q turn_id=%v", toolCallID, toolCallTurnID)
+	}
+	if !provider.sawToolResult() {
+		t.Fatalf("expected provider to observe tool_result in follow-up model turn")
 	}
 }
 
@@ -1229,6 +1442,92 @@ func (p *fakeTalkToUserProvider) Capabilities() core.ProviderCapabilities {
 	return core.ProviderCapabilities{Tools: true, ToolStreaming: true}
 }
 
+type seedHistoryProvider struct {
+	text       string
+	firstReqCh chan types.MessageRequest
+}
+
+func newSeedHistoryProvider(text string) *seedHistoryProvider {
+	return &seedHistoryProvider{
+		text:       text,
+		firstReqCh: make(chan types.MessageRequest, 1),
+	}
+}
+
+func (p *seedHistoryProvider) Name() string { return "seed_history_provider" }
+
+func (p *seedHistoryProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	return nil, io.EOF
+}
+
+func (p *seedHistoryProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	reqCopy := types.MessageRequest{
+		Model:     req.Model,
+		MaxTokens: req.MaxTokens,
+		System:    req.System,
+		Stream:    req.Stream,
+	}
+	reqCopy.Messages = append(reqCopy.Messages, req.Messages...)
+	reqCopy.Tools = append(reqCopy.Tools, req.Tools...)
+	select {
+	case p.firstReqCh <- reqCopy:
+	default:
+	}
+	return &sliceEventStream{events: talkToUserEvents(p.text)}, nil
+}
+
+func (p *seedHistoryProvider) Capabilities() core.ProviderCapabilities {
+	return core.ProviderCapabilities{Tools: true, ToolStreaming: true}
+}
+
+func (p *seedHistoryProvider) awaitFirstReq(t *testing.T, timeout time.Duration) types.MessageRequest {
+	t.Helper()
+	select {
+	case req := <-p.firstReqCh:
+		return req
+	case <-time.After(timeout):
+		t.Fatalf("timed out waiting for first provider request")
+		return types.MessageRequest{}
+	}
+}
+
+type clientToolRPCProvider struct {
+	mu            sync.Mutex
+	streamCalls   int
+	sawResultCall bool
+}
+
+func (p *clientToolRPCProvider) Name() string { return "client_tool_rpc_provider" }
+
+func (p *clientToolRPCProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	return nil, io.EOF
+}
+
+func (p *clientToolRPCProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	p.mu.Lock()
+	p.streamCalls++
+	call := p.streamCalls
+	if call > 1 && containsToolResultFor(req.Messages, "tool_client_1") {
+		p.sawResultCall = true
+	}
+	p.mu.Unlock()
+
+	if call == 1 {
+		return &sliceEventStream{events: functionToolUseEvents("tool_client_1", "client_echo", `{"value":"ping"}`)}, nil
+	}
+	return &sliceEventStream{events: talkToUserEvents("done")}, nil
+}
+
+func (p *clientToolRPCProvider) Capabilities() core.ProviderCapabilities {
+	return core.ProviderCapabilities{Tools: true, ToolStreaming: true}
+}
+
+func (p *clientToolRPCProvider) sawToolResult() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sawResultCall
+}
+
 type sliceEventStream struct {
 	events []types.StreamEvent
 	idx    int
@@ -1259,6 +1558,53 @@ func talkToUserEvents(text string) []types.StreamEvent {
 		msgDelta,
 		types.MessageStopEvent{Type: "message_stop"},
 	}
+}
+
+func functionToolUseEvents(toolID, toolName, inputJSON string) []types.StreamEvent {
+	msg := types.MessageResponse{ID: "msg_tool_1", Type: "message", Role: "assistant", Model: "test", Content: []types.ContentBlock{}}
+	toolStart := types.ContentBlockStartEvent{
+		Type:  "content_block_start",
+		Index: 0,
+		ContentBlock: types.ToolUseBlock{
+			Type:  "tool_use",
+			ID:    toolID,
+			Name:  toolName,
+			Input: map[string]any{},
+		},
+	}
+	toolDelta := types.ContentBlockDeltaEvent{
+		Type:  "content_block_delta",
+		Index: 0,
+		Delta: types.InputJSONDelta{Type: "input_json_delta", PartialJSON: inputJSON},
+	}
+	msgDelta := types.MessageDeltaEvent{Type: "message_delta", Usage: types.Usage{}}
+	msgDelta.Delta.StopReason = types.StopReasonToolUse
+	return []types.StreamEvent{
+		types.MessageStartEvent{Type: "message_start", Message: msg},
+		toolStart,
+		toolDelta,
+		types.ContentBlockStopEvent{Type: "content_block_stop", Index: 0},
+		msgDelta,
+		types.MessageStopEvent{Type: "message_stop"},
+	}
+}
+
+func containsToolResultFor(messages []types.Message, toolUseID string) bool {
+	for i := range messages {
+		for _, block := range messages[i].ContentBlocks() {
+			switch b := block.(type) {
+			case types.ToolResultBlock:
+				if strings.TrimSpace(b.ToolUseID) == strings.TrimSpace(toolUseID) {
+					return true
+				}
+			case *types.ToolResultBlock:
+				if b != nil && strings.TrimSpace(b.ToolUseID) == strings.TrimSpace(toolUseID) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 type gatedTalkToUserProvider struct {

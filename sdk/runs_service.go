@@ -157,6 +157,7 @@ func (c *Client) attachServerToolProviderHeaders(headers http.Header, req *types
 		if provider, hasProvider := extractServerToolProvider(req.ServerToolConfig, "vai_web_fetch"); hasProvider {
 			c.setProviderHeader(headers, provider)
 		} else {
+			c.setProviderHeader(headers, "tavily")
 			c.setProviderHeader(headers, "firecrawl")
 		}
 	}

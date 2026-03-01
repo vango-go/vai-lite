@@ -216,6 +216,39 @@ func TestRunsHandler_ServerToolExaMissingKey_Fails401(t *testing.T) {
 	}
 }
 
+func TestRunsHandler_ServerFetchInferProviderFromHeader_Succeeds(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_fetch"]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	req.Header.Set("X-Provider-Key-Tavily", "tvly-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRunsHandler_ServerFetchTavilyMissingKey_Fails401(t *testing.T) {
+	h := RunsHandler{Config: baseRunsConfig(), Upstreams: fakeFactory{p: &fakeRunProvider{}}, Stream: false}
+	req := httptest.NewRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(`{
+		"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]},
+		"server_tools":["vai_web_fetch"],
+		"server_tool_config":{"vai_web_fetch":{"provider":"tavily"}}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"param":"X-Provider-Key-Tavily"`) {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
 func TestRunsHandler_ModelAllowlistDenied(t *testing.T) {
 	cfg := baseRunsConfig()
 	cfg.ModelAllowlist = map[string]struct{}{"anthropic/allowed": {}}

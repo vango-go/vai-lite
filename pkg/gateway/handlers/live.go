@@ -561,18 +561,59 @@ func (h LiveHandler) newLiveServerToolsRegistry(hello protocol.ClientHello) (*se
 			}
 		}
 		if fetchCfg.Provider == "" {
-			fetchCfg.Provider = servertools.ProviderFirecrawl
-		}
-		firecrawlKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderFirecrawl))
-		if firecrawlKey == "" {
-			return nil, &liveServerToolError{
-				Code:    "unauthorized",
-				Message: "missing firecrawl key",
-				Details: map[string]any{"error_code": "provider_key_missing", "requires_byok_header": servertools.HeaderProviderKeyFirecrawl},
+			tavilyKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderTavily))
+			firecrawlKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderFirecrawl))
+			hasTavily := tavilyKey != ""
+			hasFirecrawl := firecrawlKey != ""
+			if hasTavily == hasFirecrawl {
+				msg := "server_tool_config.vai_web_fetch.provider is required"
+				if hasTavily && hasFirecrawl {
+					msg = "ambiguous web fetch provider; set server_tool_config.vai_web_fetch.provider"
+				}
+				return nil, &liveServerToolError{
+					Code:    "bad_request",
+					Message: msg,
+					Details: map[string]any{"error_code": "tool_provider_missing"},
+				}
+			}
+			if hasTavily {
+				fetchCfg.Provider = servertools.ProviderTavily
+			} else {
+				fetchCfg.Provider = servertools.ProviderFirecrawl
 			}
 		}
-		firecrawlClient := firecrawl.NewClient(firecrawlKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
-		executors = append(executors, servertools.NewWebFetchExecutor(fetchCfg, firecrawlClient))
+
+		var tavilyClient *tavily.Client
+		var firecrawlClient *firecrawl.Client
+		switch fetchCfg.Provider {
+		case servertools.ProviderTavily:
+			tavilyKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderTavily))
+			if tavilyKey == "" {
+				return nil, &liveServerToolError{
+					Code:    "unauthorized",
+					Message: "missing tavily key",
+					Details: map[string]any{"error_code": "provider_key_missing", "requires_byok_header": servertools.HeaderProviderKeyTavily},
+				}
+			}
+			tavilyClient = tavily.NewClient(tavilyKey, h.Config.TavilyBaseURL, toolHTTPClient)
+		case servertools.ProviderFirecrawl:
+			firecrawlKey := strings.TrimSpace(byokForProvider(hello.BYOK, servertools.ProviderFirecrawl))
+			if firecrawlKey == "" {
+				return nil, &liveServerToolError{
+					Code:    "unauthorized",
+					Message: "missing firecrawl key",
+					Details: map[string]any{"error_code": "provider_key_missing", "requires_byok_header": servertools.HeaderProviderKeyFirecrawl},
+				}
+			}
+			firecrawlClient = firecrawl.NewClient(firecrawlKey, h.Config.FirecrawlBaseURL, toolHTTPClient)
+		default:
+			return nil, &liveServerToolError{
+				Code:    "bad_request",
+				Message: fmt.Sprintf("unsupported web fetch provider %q", fetchCfg.Provider),
+				Details: map[string]any{"error_code": "unsupported_tool_provider"},
+			}
+		}
+		executors = append(executors, servertools.NewWebFetchExecutor(fetchCfg, firecrawlClient, tavilyClient))
 	}
 
 	return servertools.NewRegistry(executors...), nil

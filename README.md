@@ -106,7 +106,8 @@ go run ./cmd/vai-proxy
 ```bash
 go run ./cmd/proxy-chatbot \
   --base-url http://127.0.0.1:8080 \
-  --model oai-resp/gpt-5-mini
+  --model oai-resp/gpt-5-mini \
+  --live-voice-id "<your_voice_id>"
 ```
 
 Notes:
@@ -119,12 +120,25 @@ Notes:
   - `OPENROUTER_API_KEY`
   - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
 - `TAVILY_API_KEY` is required; the chatbot enables VAI-native `vai_web_search` and `vai_web_fetch` tools via Tavily.
-- The chatbot uses `Messages.RunStream()` (client-side loop), not `Runs.Stream()`.
-- Web tools are client-side function tools executed by the SDK loop, so they work across model providers and after `/model` switches.
+- Text mode uses `Messages.RunStream()` (client-side loop), not `Runs.Stream()`.
+- Text mode web tools are client-side function tools executed by the SDK loop, so they work across model providers and after `/model` switches.
 - The default model is `oai-resp/gpt-5-mini` so `gpt-5-mini` routes through the OpenAI Responses provider.
+- Live mode (`/live`) requirements:
+  - `CARTESIA_API_KEY` (required for Live STT)
+  - `VAI_LIVE_VOICE_ID` or `--live-voice-id` (required)
+  - `VAI_LIVE_VOICE_PROVIDER` or `--live-voice-provider` (`cartesia` default, `elevenlabs` optional)
+  - `ELEVENLABS_API_KEY` (required only when provider is `elevenlabs`)
+  - `ffmpeg` and `ffplay` available on `PATH` (used by the demo mic/playback handler)
+- In live mode, the chatbot uses gateway `/v1/live` with server tools enabled:
+  - `vai_web_search` (provider: Tavily)
+  - `vai_web_fetch` (provider: Tavily extract)
 - Runtime commands:
   - `/model` shows the active model
   - `/model:{provider}/{model}` switches models without resetting chat history
+  - `/live` enters live audio mode
+  - `/text` exits live audio mode back to text chat
+  - `/interrupt` requests live turn interruption (live mode)
+  - `/end` ends the active live session (live mode)
   - `/exit` or `/quit` exits
 
 ## Single-turn calls
