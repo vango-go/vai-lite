@@ -89,6 +89,44 @@ func main() {
 }
 ```
 
+## Proxy Chatbot Demo
+
+Run the gateway in one terminal and an interactive `RunStream` chatbot in another.
+
+### Terminal 1: start local gateway (proxy mode)
+
+```bash
+VAI_PROXY_AUTH_MODE=disabled \
+VAI_PROXY_ADDR=127.0.0.1:8080 \
+go run ./cmd/vai-proxy
+```
+
+### Terminal 2: start chatbot demo
+
+```bash
+go run ./cmd/proxy-chatbot \
+  --base-url http://127.0.0.1:8080 \
+  --model oai-resp/gpt-5-mini
+```
+
+Notes:
+- Both commands auto-load `./.env` if present (existing exported env vars still win).
+- The chatbot requires a provider key for the active model:
+  - `OPENAI_API_KEY` (`openai/*` and `oai-resp/*`)
+  - `ANTHROPIC_API_KEY`
+  - `GROQ_API_KEY`
+  - `CEREBRAS_API_KEY`
+  - `OPENROUTER_API_KEY`
+  - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
+- `TAVILY_API_KEY` is required; the chatbot enables VAI-native `vai_web_search` and `vai_web_fetch` tools via Tavily.
+- The chatbot uses `Messages.RunStream()` (client-side loop), not `Runs.Stream()`.
+- Web tools are client-side function tools executed by the SDK loop, so they work across model providers and after `/model` switches.
+- The default model is `oai-resp/gpt-5-mini` so `gpt-5-mini` routes through the OpenAI Responses provider.
+- Runtime commands:
+  - `/model` shows the active model
+  - `/model:{provider}/{model}` switches models without resetting chat history
+  - `/exit` or `/quit` exits
+
 ## Single-turn calls
 
 ```go

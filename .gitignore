@@ -33,7 +33,7 @@
 # Build artifacts
 /build/
 *.log
-vai-proxy
+/vai-proxy
 
 # Test coverage
 *.coverprofile
