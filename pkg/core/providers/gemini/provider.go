@@ -70,8 +70,8 @@ func (p *Provider) Capabilities() ProviderCapabilities {
 		AudioOutput:      false, // Only via Live API
 		Video:            true,  // Gemini supports video!
 		Tools:            true,
-		ToolStreaming:    true,
-		Thinking:         true, // Gemini 2.5+ supports thinking
+		ToolStreaming:    false, // Default Gemini streams tool inputs as one-shot args unless Vertex partial streaming is enabled.
+		Thinking:         true,  // Gemini 2.5+ supports thinking
 		StructuredOutput: true,
 		NativeTools:      []string{"web_search", "code_execution"},
 	}
@@ -100,8 +100,12 @@ func (p *Provider) StreamMessage(ctx context.Context, req *types.MessageRequest)
 	// Get the model name (strip provider prefix if present)
 	model := stripProviderPrefix(req.Model)
 
+	// Ensure stream-only request features are applied in request translation.
+	reqCopy := *req
+	reqCopy.Stream = true
+
 	// Build the Gemini request
-	geminiReq := p.buildRequest(req)
+	geminiReq := p.buildRequest(&reqCopy)
 
 	// Make HTTP call (returns SSE stream)
 	body, err := p.doStreamRequest(ctx, model, geminiReq)

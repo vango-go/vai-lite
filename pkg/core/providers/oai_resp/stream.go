@@ -1,17 +1,17 @@
 package oai_resp
 
 import (
-	"bufio"
 	"encoding/json"
 	"io"
 	"strings"
 
+	"github.com/vango-go/vai-lite/pkg/core/sseframe"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // eventStream implements EventStream for OpenAI Responses API SSE responses.
 type eventStream struct {
-	reader      *bufio.Reader
+	parser      *sseframe.Parser
 	closer      io.Closer
 	err         error
 	responseID  string
@@ -24,13 +24,14 @@ type eventStream struct {
 
 // streamAccumulator accumulates streamed data.
 type streamAccumulator struct {
-	textBlockIndex   int
-	textContent      strings.Builder
-	toolCalls        map[int]*toolCallAccumulator
-	currentItemIndex int
-	finishReason     string
-	inputTokens      int
-	outputTokens     int
+	textBlockIndex     int
+	textContent        strings.Builder
+	toolCalls          map[int]*toolCallAccumulator
+	blockIndexByOutput map[int]int
+	currentItemIndex   int
+	finishReason       string
+	inputTokens        int
+	outputTokens       int
 }
 
 // toolCallAccumulator accumulates a single tool call.
@@ -48,10 +49,11 @@ type toolCallAccumulator struct {
 // newEventStream creates a new event stream from an HTTP response body.
 func newEventStream(body io.ReadCloser) *eventStream {
 	return &eventStream{
-		reader: bufio.NewReader(body),
+		parser: sseframe.New(body),
 		closer: body,
 		accumulator: streamAccumulator{
-			toolCalls: make(map[int]*toolCallAccumulator),
+			toolCalls:          make(map[int]*toolCallAccumulator),
+			blockIndexByOutput: make(map[int]int),
 		},
 	}
 }
@@ -76,7 +78,7 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 	}
 
 	for {
-		line, err := s.reader.ReadString('\n')
+		frame, err := s.parser.Next()
 		if err != nil {
 			if err == io.EOF {
 				return s.buildFinalEvent()
@@ -85,24 +87,10 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 			return nil, err
 		}
 
-		line = strings.TrimSpace(line)
-
-		// Skip empty lines
-		if line == "" {
+		data := strings.TrimSpace(string(frame.Data))
+		if data == "" {
 			continue
 		}
-
-		// Parse SSE format: "event: <type>" followed by "data: <json>"
-		if strings.HasPrefix(line, "event:") {
-			// Read the event type but we primarily use the data
-			continue
-		}
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
 
 		// Check for stream end
 		if data == "[DONE]" {
@@ -154,6 +142,7 @@ func (s *eventStream) handleStreamEvent(event *streamEvent) (types.StreamEvent, 
 	case eventOutputTextDelta:
 		// Text delta
 		if event.Delta != "" {
+			s.accumulator.textBlockIndex = s.blockIndexForOutput(event.OutputIndex)
 			// If this is the first text content, emit content_block_start AND delta
 			if s.accumulator.textContent.Len() == 0 {
 				s.accumulator.textContent.WriteString(event.Delta)
@@ -192,7 +181,7 @@ func (s *eventStream) handleStreamEvent(event *streamEvent) (types.StreamEvent, 
 			acc, exists := s.accumulator.toolCalls[idx]
 			if !exists {
 				acc = &toolCallAccumulator{
-					blockIndex: s.getNextBlockIndex(),
+					blockIndex: s.blockIndexForOutput(idx),
 				}
 				s.accumulator.toolCalls[idx] = acc
 			}
@@ -224,7 +213,7 @@ func (s *eventStream) handleStreamEvent(event *streamEvent) (types.StreamEvent, 
 			acc, exists := s.accumulator.toolCalls[idx]
 			if !exists {
 				acc = &toolCallAccumulator{
-					blockIndex: s.getNextBlockIndex(),
+					blockIndex: s.blockIndexForOutput(idx),
 				}
 				s.accumulator.toolCalls[idx] = acc
 			}
@@ -359,18 +348,24 @@ func (s *eventStream) handleOutputItemAdded(item *outputItem, index int) (types.
 	switch item.Type {
 	case "message":
 		// Text message - will get deltas via output_text.delta
-		s.accumulator.textBlockIndex = index
+		s.accumulator.textBlockIndex = s.blockIndexForOutput(index)
 		return nil, false
 
 	case "function_call":
 		// Function call started
-		blockIndex := s.getNextBlockIndex()
-		s.accumulator.toolCalls[index] = &toolCallAccumulator{
-			ID:         item.CallID,
-			Name:       item.Name,
-			announced:  true,
-			blockIndex: blockIndex,
+		blockIndex := s.blockIndexForOutput(index)
+		acc, exists := s.accumulator.toolCalls[index]
+		if !exists || acc == nil {
+			acc = &toolCallAccumulator{}
+			s.accumulator.toolCalls[index] = acc
 		}
+		acc.ID = item.CallID
+		acc.Name = item.Name
+		acc.blockIndex = blockIndex
+		if acc.announced {
+			return nil, false
+		}
+		acc.announced = true
 		return types.ContentBlockStartEvent{
 			Type:  "content_block_start",
 			Index: blockIndex,
@@ -406,18 +401,13 @@ func (s *eventStream) handleOutputItemDone(item *outputItem, index int) (types.S
 	return nil, false
 }
 
-// getNextBlockIndex returns the next available block index.
-func (s *eventStream) getNextBlockIndex() int {
-	maxIndex := -1
-	if s.accumulator.textContent.Len() > 0 {
-		maxIndex = s.accumulator.textBlockIndex
+// blockIndexForOutput returns a stable content block index for a given output item.
+func (s *eventStream) blockIndexForOutput(outputIndex int) int {
+	if idx, ok := s.accumulator.blockIndexByOutput[outputIndex]; ok {
+		return idx
 	}
-	for _, tc := range s.accumulator.toolCalls {
-		if tc.blockIndex > maxIndex {
-			maxIndex = tc.blockIndex
-		}
-	}
-	return maxIndex + 1
+	s.accumulator.blockIndexByOutput[outputIndex] = outputIndex
+	return outputIndex
 }
 
 // buildFinalEvent builds the final events when stream ends.

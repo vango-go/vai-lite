@@ -81,7 +81,7 @@ func (p *Provider) Capabilities() core.ProviderCapabilities {
 		AudioOutput:      false,
 		Video:            true,
 		Tools:            true,
-		ToolStreaming:    true,
+		ToolStreaming:    false, // Default Gemini streams tool inputs as one-shot args unless Vertex partial streaming is enabled.
 		Thinking:         true,
 		StructuredOutput: true,
 		NativeTools:      []string{"web_search", "code_execution"},
@@ -119,8 +119,12 @@ func (p *Provider) StreamMessage(ctx context.Context, req *types.MessageRequest)
 		model = fallback
 	}
 
+	// Ensure stream-only request features are applied in request translation.
+	reqCopy := *req
+	reqCopy.Stream = true
+
 	// Build Gemini request
-	geminiReq := p.buildRequest(req)
+	geminiReq := p.buildRequest(&reqCopy)
 
 	// Send streaming request
 	body, err := p.doStreamRequest(ctx, model, geminiReq)
@@ -183,8 +187,28 @@ type geminiFileData struct {
 
 // geminiFunctionCall represents a function call from the model.
 type geminiFunctionCall struct {
-	Name string         `json:"name"`
-	Args map[string]any `json:"args,omitempty"`
+	Name         string             `json:"name"`
+	Args         map[string]any     `json:"args,omitempty"`
+	PartialArgs  []geminiPartialArg `json:"partialArgs,omitempty"`
+	WillContinue *bool              `json:"willContinue,omitempty"`
+}
+
+// geminiPartialArg represents an incremental function argument update.
+// Some backends may vary field casing, so we tolerate both camelCase/snake_case.
+type geminiPartialArg struct {
+	JSONPath      string   `json:"jsonPath,omitempty"`
+	JSONPathSnake string   `json:"json_path,omitempty"`
+	Value         any      `json:"value,omitempty"`
+	StringValue   *string  `json:"stringValue,omitempty"`
+	StringValueSn *string  `json:"string_value,omitempty"`
+	NumberValue   *float64 `json:"numberValue,omitempty"`
+	NumberValueSn *float64 `json:"number_value,omitempty"`
+	BoolValue     *bool    `json:"boolValue,omitempty"`
+	BoolValueSn   *bool    `json:"bool_value,omitempty"`
+	NullValue     bool     `json:"nullValue,omitempty"`
+	NullValueSn   bool     `json:"null_value,omitempty"`
+	WillContinue  *bool    `json:"willContinue,omitempty"`
+	WillContinueS *bool    `json:"will_continue,omitempty"`
 }
 
 // geminiFunctionResponse represents a function response.
@@ -222,8 +246,9 @@ type geminiToolConfig struct {
 
 // geminiFunctionCallingConfig controls function calling behavior.
 type geminiFunctionCallingConfig struct {
-	Mode                 string   `json:"mode,omitempty"`
-	AllowedFunctionNames []string `json:"allowed_function_names,omitempty"`
+	Mode                        string   `json:"mode,omitempty"`
+	AllowedFunctionNames        []string `json:"allowed_function_names,omitempty"`
+	StreamFunctionCallArguments bool     `json:"stream_function_call_arguments,omitempty"`
 }
 
 // geminiGenConfig contains generation configuration.
@@ -307,10 +332,41 @@ func (p *Provider) buildRequest(req *types.MessageRequest) *geminiRequest {
 		geminiReq.ToolConfig = p.translateToolChoice(req.ToolChoice)
 	}
 
+	// Vertex-only: opt-in incremental function argument streaming.
+	if req.Stream && len(req.Tools) > 0 && streamFunctionCallArgumentsEnabled(req) {
+		if geminiReq.ToolConfig == nil {
+			geminiReq.ToolConfig = &geminiToolConfig{}
+		}
+		if geminiReq.ToolConfig.FunctionCallingConfig == nil {
+			geminiReq.ToolConfig.FunctionCallingConfig = &geminiFunctionCallingConfig{}
+		}
+		if geminiReq.ToolConfig.FunctionCallingConfig.Mode == "" {
+			geminiReq.ToolConfig.FunctionCallingConfig.Mode = "AUTO"
+		}
+		geminiReq.ToolConfig.FunctionCallingConfig.StreamFunctionCallArguments = true
+	}
+
 	// Build generation config
 	geminiReq.GenerationConfig = p.buildGenerationConfig(req)
 
 	return geminiReq
+}
+
+func streamFunctionCallArgumentsEnabled(req *types.MessageRequest) bool {
+	if req == nil || req.Extensions == nil {
+		return false
+	}
+	ext, ok := req.Extensions["gemini"].(map[string]any)
+	if !ok || ext == nil {
+		return false
+	}
+	if v, ok := ext["stream_function_call_arguments"].(bool); ok {
+		return v
+	}
+	if v, ok := ext["streamFunctionCallArguments"].(bool); ok {
+		return v
+	}
+	return false
 }
 
 func (p *Provider) translateSystemInstruction(system any) *geminiContent {

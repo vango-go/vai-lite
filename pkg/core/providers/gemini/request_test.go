@@ -81,3 +81,74 @@ func TestBuildRequest_PreservesThoughtSignaturesAcrossRepeatedCalls(t *testing.T
 		t.Fatalf("history thought signature = %v, want %q", toolUse.Input["__thought_signature"], "sig-1")
 	}
 }
+
+func TestBuildRequest_StreamFunctionCallArgumentsExtension(t *testing.T) {
+	provider := New("test-key")
+
+	baseReq := &types.MessageRequest{
+		Model:    "gemini/gemini-2.5-pro",
+		Stream:   true,
+		Messages: []types.Message{{Role: "user", Content: "hi"}},
+		Tools: []types.Tool{
+			{
+				Type:        types.ToolTypeFunction,
+				Name:        "talk_to_user",
+				Description: "Speak to user",
+				InputSchema: &types.JSONSchema{Type: "object"},
+			},
+		},
+	}
+
+	t.Run("snake_case_extension_enables_streaming_flag", func(t *testing.T) {
+		req := *baseReq
+		req.Extensions = map[string]any{
+			"gemini": map[string]any{
+				"stream_function_call_arguments": true,
+			},
+		}
+
+		got := provider.buildRequest(&req)
+		if got.ToolConfig == nil || got.ToolConfig.FunctionCallingConfig == nil {
+			t.Fatalf("tool config missing: %#v", got.ToolConfig)
+		}
+		if got.ToolConfig.FunctionCallingConfig.Mode != "AUTO" {
+			t.Fatalf("mode = %q, want AUTO", got.ToolConfig.FunctionCallingConfig.Mode)
+		}
+		if !got.ToolConfig.FunctionCallingConfig.StreamFunctionCallArguments {
+			t.Fatal("streamFunctionCallArguments should be enabled")
+		}
+	})
+
+	t.Run("camel_case_alias_enables_streaming_flag", func(t *testing.T) {
+		req := *baseReq
+		req.Extensions = map[string]any{
+			"gemini": map[string]any{
+				"streamFunctionCallArguments": true,
+			},
+		}
+
+		got := provider.buildRequest(&req)
+		if got.ToolConfig == nil || got.ToolConfig.FunctionCallingConfig == nil {
+			t.Fatalf("tool config missing: %#v", got.ToolConfig)
+		}
+		if !got.ToolConfig.FunctionCallingConfig.StreamFunctionCallArguments {
+			t.Fatal("streamFunctionCallArguments should be enabled")
+		}
+	})
+
+	t.Run("non_stream_request_does_not_enable_flag", func(t *testing.T) {
+		req := *baseReq
+		req.Stream = false
+		req.Extensions = map[string]any{
+			"gemini": map[string]any{
+				"stream_function_call_arguments": true,
+			},
+		}
+
+		got := provider.buildRequest(&req)
+		if got.ToolConfig != nil && got.ToolConfig.FunctionCallingConfig != nil &&
+			got.ToolConfig.FunctionCallingConfig.StreamFunctionCallArguments {
+			t.Fatalf("streamFunctionCallArguments unexpectedly enabled: %#v", got.ToolConfig.FunctionCallingConfig)
+		}
+	})
+}

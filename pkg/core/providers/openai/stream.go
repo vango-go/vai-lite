@@ -1,17 +1,17 @@
 package openai
 
 import (
-	"bufio"
 	"encoding/json"
 	"io"
 	"strings"
 
+	"github.com/vango-go/vai-lite/pkg/core/sseframe"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // eventStream implements EventStream for OpenAI SSE responses.
 type eventStream struct {
-	reader      *bufio.Reader
+	parser      *sseframe.Parser
 	closer      io.Closer
 	err         error
 	modelPrefix string
@@ -79,8 +79,8 @@ func newEventStream(body io.ReadCloser, modelPrefix string) *eventStream {
 		modelPrefix = "openai"
 	}
 	return &eventStream{
-		reader: bufio.NewReader(body),
-		closer: body,
+		parser:      sseframe.New(body),
+		closer:      body,
 		modelPrefix: modelPrefix,
 		accumulator: streamAccumulator{
 			toolCalls: make(map[int]*toolCallAccumulator),
@@ -107,7 +107,7 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 	}
 
 	for {
-		line, err := s.reader.ReadString('\n')
+		frame, err := s.parser.Next()
 		if err != nil {
 			if err == io.EOF {
 				return s.buildFinalEvent()
@@ -116,19 +116,10 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 			return nil, err
 		}
 
-		line = strings.TrimSpace(line)
-
-		// Skip empty lines
-		if line == "" {
+		data := strings.TrimSpace(string(frame.Data))
+		if data == "" {
 			continue
 		}
-
-		// Parse SSE format: "data: <json>"
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
 
 		// Check for stream end
 		if data == "[DONE]" {
@@ -166,10 +157,14 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 			s.accumulator.finishReason = choice.FinishReason
 		}
 
-		// Emit message_start if not yet started
+		// Collect all events from this chunk, then emit one and queue the rest.
+		// This ensures same-chunk tool start + arguments are both delivered.
+		var events []types.StreamEvent
+
+		// Emit message_start if not yet started.
 		if !s.started {
 			s.started = true
-			return types.MessageStartEvent{
+			events = append(events, types.MessageStartEvent{
 				Type: "message_start",
 				Message: types.MessageResponse{
 					ID:      s.responseID,
@@ -179,16 +174,19 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 					Content: []types.ContentBlock{},
 					Usage:   types.Usage{},
 				},
-			}, nil
+			})
 		}
 
-		// Handle text delta
+		// Handle text delta.
 		if choice.Delta.Content != "" {
-			// If this is the first text content, emit content_block_start AND delta
 			if s.accumulator.textContent.Len() == 0 {
 				s.accumulator.textContent.WriteString(choice.Delta.Content)
-				// Queue the delta event for the next call
-				s.pending = append(s.pending, types.ContentBlockDeltaEvent{
+				events = append(events, types.ContentBlockStartEvent{
+					Type:         "content_block_start",
+					Index:        0,
+					ContentBlock: types.TextBlock{Type: "text", Text: ""},
+				})
+				events = append(events, types.ContentBlockDeltaEvent{
 					Type:  "content_block_delta",
 					Index: 0,
 					Delta: types.TextDelta{
@@ -196,26 +194,20 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 						Text: choice.Delta.Content,
 					},
 				})
-				// Return the start event now
-				return types.ContentBlockStartEvent{
-					Type:         "content_block_start",
-					Index:        0,
-					ContentBlock: types.TextBlock{Type: "text", Text: ""},
-				}, nil
+			} else {
+				s.accumulator.textContent.WriteString(choice.Delta.Content)
+				events = append(events, types.ContentBlockDeltaEvent{
+					Type:  "content_block_delta",
+					Index: 0,
+					Delta: types.TextDelta{
+						Type: "text_delta",
+						Text: choice.Delta.Content,
+					},
+				})
 			}
-
-			s.accumulator.textContent.WriteString(choice.Delta.Content)
-			return types.ContentBlockDeltaEvent{
-				Type:  "content_block_delta",
-				Index: 0,
-				Delta: types.TextDelta{
-					Type: "text_delta",
-					Text: choice.Delta.Content,
-				},
-			}, nil
 		}
 
-		// Handle tool call deltas
+		// Handle tool call deltas.
 		for _, tc := range choice.Delta.ToolCalls {
 			idx := tc.Index
 			acc, exists := s.accumulator.toolCalls[idx]
@@ -227,24 +219,21 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 				s.accumulator.toolCalls[idx] = acc
 			}
 
-			// Update ID if provided
 			if tc.ID != "" {
 				acc.ID = tc.ID
 			}
-			// Update name if provided
 			if tc.Function.Name != "" {
 				acc.Name = tc.Function.Name
 			}
 
-			// Emit tool call start if not announced
+			toolIndex := idx + 1
+			if s.accumulator.textContent.Len() == 0 {
+				toolIndex = idx
+			}
+
 			if !acc.announced && acc.ID != "" && acc.Name != "" {
 				acc.announced = true
-				// Tool use index starts after text (if text exists, it's at 0)
-				toolIndex := idx + 1
-				if s.accumulator.textContent.Len() == 0 {
-					toolIndex = idx
-				}
-				return types.ContentBlockStartEvent{
+				events = append(events, types.ContentBlockStartEvent{
 					Type:  "content_block_start",
 					Index: toolIndex,
 					ContentBlock: types.ToolUseBlock{
@@ -253,25 +242,27 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 						Name:  acc.Name,
 						Input: make(map[string]any),
 					},
-				}, nil
+				})
 			}
 
-			// Handle arguments delta
 			if tc.Function.Arguments != "" {
 				acc.ArgumentsJSON.WriteString(tc.Function.Arguments)
-				toolIndex := idx + 1
-				if s.accumulator.textContent.Len() == 0 {
-					toolIndex = idx
-				}
-				return types.ContentBlockDeltaEvent{
+				events = append(events, types.ContentBlockDeltaEvent{
 					Type:  "content_block_delta",
 					Index: toolIndex,
 					Delta: types.InputJSONDelta{
 						Type:        "input_json_delta",
 						PartialJSON: tc.Function.Arguments,
 					},
-				}, nil
+				})
 			}
+		}
+
+		if len(events) > 0 {
+			if len(events) > 1 {
+				s.pending = append(s.pending, events[1:]...)
+			}
+			return events[0], nil
 		}
 	}
 }

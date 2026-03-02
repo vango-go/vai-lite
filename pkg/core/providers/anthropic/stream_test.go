@@ -84,3 +84,58 @@ func TestEventStream_UnknownEventTypeDoesNotBreakStream(t *testing.T) {
 		t.Fatalf("third Next() event = %T, want nil", last)
 	}
 }
+
+func TestEventStream_DeliversFinalEventWithoutTrailingNewline(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":4,"output_tokens":5,"total_tokens":9}}`,
+	}, "\n")
+
+	stream := newEventStream(io.NopCloser(strings.NewReader(sse)))
+
+	event, err := stream.Next()
+	if err != nil {
+		t.Fatalf("first Next() error = %v, want nil", err)
+	}
+	delta, ok := event.(types.MessageDeltaEvent)
+	if !ok {
+		t.Fatalf("first event type = %T, want MessageDeltaEvent", event)
+	}
+	if delta.Usage.InputTokens != 4 || delta.Usage.OutputTokens != 5 || delta.Usage.TotalTokens != 9 {
+		t.Fatalf("usage = %+v, want input=4 output=5 total=9", delta.Usage)
+	}
+
+	event, err = stream.Next()
+	if err != io.EOF {
+		t.Fatalf("second Next() error = %v, want io.EOF", err)
+	}
+	if event != nil {
+		t.Fatalf("second Next() event = %T, want nil", event)
+	}
+}
+
+func TestEventStream_ParsesMultilineDataFrame(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},`,
+		`data: "usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`,
+		"",
+	}, "\n")
+
+	stream := newEventStream(io.NopCloser(strings.NewReader(sse)))
+
+	event, err := stream.Next()
+	if err != nil {
+		t.Fatalf("Next() error = %v, want nil", err)
+	}
+	delta, ok := event.(types.MessageDeltaEvent)
+	if !ok {
+		t.Fatalf("event type = %T, want MessageDeltaEvent", event)
+	}
+	if delta.Delta.StopReason != types.StopReasonEndTurn {
+		t.Fatalf("stop reason = %q, want %q", delta.Delta.StopReason, types.StopReasonEndTurn)
+	}
+	if delta.Usage.InputTokens != 1 || delta.Usage.OutputTokens != 2 || delta.Usage.TotalTokens != 3 {
+		t.Fatalf("usage = %+v, want input=1 output=2 total=3", delta.Usage)
+	}
+}

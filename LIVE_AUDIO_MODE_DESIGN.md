@@ -9,6 +9,10 @@ The design assumes:
 - **Grace period**: if speech resumes within **5s**, cancel current assistant output/run and append the resumed text
 - **Barge-in interrupt** while assistant audio is playing, with best-effort “truncate to what the user actually heard”
 - A terminal tool `talk_to_user(text)` that governs when the assistant speaks
+- Explicit session config split into `stt` and `tts` (instead of a single overloaded `voice` object)
+- Provider-prefixed resource IDs:
+  - `stt.model` uses `{provider}/{model}`
+  - `tts.voice` uses `{provider}/{voice_id}`
 
 ---
 
@@ -41,7 +45,8 @@ The design assumes:
 
 ## 1. Repository Reality Check (What Exists Today)
 
-This repo (`vai-lite`) is intentionally “direct-mode only” and currently excludes proxy/server mode. However, it already includes:
+This repo (`vai-lite`) includes both an SDK and a gateway proxy (HTTP/SSE today; Live WS is being re-implemented).
+It already includes:
 
 - `RunStream` with cancellation/interrupt and lifecycle events: `sdk/run.go`
 - A `talk_to_user`-like mechanism can be implemented as a function tool via `MakeTool`/`ToolSet`: `sdk/tools.go`, `sdk/run.go`
@@ -52,7 +57,7 @@ This repo (`vai-lite`) is intentionally “direct-mode only” and currently exc
 
 Notably:
 - The Cartesia TTS code in-tree currently behaves like a **single streaming context**; it does not yet expose multi-context multiplexing or “cancel context by ID”.
-- ElevenLabs is not integrated today.
+- ElevenLabs live TTS is planned behind the provider-agnostic `tts.voice` contract described below.
 
 This doc describes the **gateway service** and its Live endpoint, but it also identifies the minimal `vai-lite` library primitives that are useful to share (e.g., tool semantics, event types, provider interfaces).
 
@@ -124,6 +129,11 @@ The Live WS endpoint must support explicit versioning to keep SDKs stable:
 - First client message must be `hello` including:
   - `protocol_version`: `"1"`
   - `client`: `{name, version, platform}`
+  - `model`: `{provider}/{model}` LLM model for the agent loop
+  - optional seed conversation: `system` + `messages`
+  - optional tool config (gateway-managed server tools)
+  - `stt`: STT config (`model`, `language`, optional provider-specific options)
+  - `tts`: TTS config (`voice`, `language`, optional prosody controls)
   - audio input spec (format + sample rate)
   - requested output audio format (codec, sample rate)
   - optional feature flags (binary audio frames, alignment, captions)
@@ -195,6 +205,19 @@ Normative v1 guidance:
   "type": "hello",
   "protocol_version": "1",
   "client": {"name": "vai-js", "version": "0.1.0", "platform": "web"},
+  "model": "oai-resp/gpt-5-mini",
+  "system": "You are a real-time voice assistant. Use tools when needed, and call talk_to_user({text}) for final speech output.",
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "Hello!"}]}
+  ],
+  "tools": {
+    "server_tools": ["vai_web_search", "vai_web_fetch"],
+    "server_tool_config": {
+      "vai_web_search": {"provider": "tavily"},
+      "vai_web_fetch": {"provider": "tavily", "format": "markdown"}
+    }
+  },
   "auth": {"mode": "api_key", "gateway_api_key": "vai_sk_..."},
   "byok": {
     "cartesia": "sk-car-...",
@@ -210,6 +233,16 @@ Normative v1 guidance:
   },
   "audio_in": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
   "audio_out": {"encoding": "pcm_s16le", "sample_rate_hz": 24000, "channels": 1},
+  "stt": {
+    "model": "cartesia/ink-whisper",
+    "language": "en"
+  },
+  "tts": {
+    "voice": "elevenlabs/JBFqnCBsd6RMkjVDRZzb",
+    "language": "en",
+    "speed": 1.0,
+    "volume": 1.0
+  },
   "features": {
     "audio_transport": "binary",
     "send_playback_marks": true,
@@ -224,6 +257,21 @@ Notes:
 - `byok.keys` is the recommended future-proof shape: a map from provider id (the model prefix before the first `/`) to that provider’s API key.
 - Alias behavior: `oai-resp/*` uses the `openai` key by default (override with `byok.keys["oai-resp"]`). `gemini-oauth/*` uses the `gemini` key by default (override with `byok.keys["gemini-oauth"]`).
 - Legacy typed `byok.<provider>` fields may still be accepted for compatibility.
+- `stt` and `tts` are required in v1. At minimum:
+  - `stt.model` is required (v1: `cartesia/ink-whisper`)
+  - `tts.voice` is required (`cartesia/*` or `elevenlabs/*`)
+- `stt.model` MUST use `{provider}/{model}`. v1 currently supports `cartesia/ink-whisper` only; future providers
+  (for example `deepgram/*`, `google/*`) can be added without wire-shape changes.
+- `tts.voice` MUST use `{provider}/{voice_id}`. The gateway routes TTS by provider prefix.
+- v1 TTS provider support: `cartesia/*` and `elevenlabs/*`.
+- Pre-launch breaking change: legacy `voice.provider` / `voice.voice_id` handshake fields are removed from the canonical contract.
+- Required BYOK keys for v1 live sessions:
+  - model provider key (derived from `model` prefix; note alias behavior above)
+  - `cartesia` key (required for STT in all sessions)
+  - `elevenlabs` key only when `tts.voice` uses the `elevenlabs/` prefix
+- Tools:
+  - `tools.server_tools` is the allowlist of gateway-managed tools enabled for this session.
+  - `tools.server_tool_config` contains per-tool configuration and must only include keys for enabled tools.
 
 #### `audio_frame` (JSON variant)
 ```json
@@ -236,7 +284,7 @@ Notes:
 ```
 
 Binary variant:
-- Client sends `type=audio_frame_header` JSON occasionally or once at start:
+- Client sends `audio_stream_start` once at start (or when the input format changes):
 ```json
 {"type":"audio_stream_start","stream_id":"mic","encoding":"pcm_s16le","sample_rate_hz":16000,"channels":1}
 ```
@@ -281,6 +329,11 @@ Examples:
 ```json
 {"type":"control","op":"end_session"}
 ```
+
+Recommended v1 `op` values:
+- `interrupt`: user-initiated barge-in (stop assistant audio immediately; do not wait for grace)
+- `cancel_turn`: cancel the in-progress model/tool loop turn (best-effort)
+- `end_session`: graceful shutdown
 
 ### 4.4 Server -> Client message types (minimum)
 
@@ -432,7 +485,7 @@ Optional: forward selected `RunStream` lifecycle/tool events for debugging / UI.
 This must be curated; do not leak provider-internal details by default.
 
 #### `session_config` (reserved)
-Reserved for mid-session changes (v1.1+), such as changing voice, adjusting silence thresholds, or toggling features,
+Reserved for mid-session changes (v1.1+), such as changing `stt`/`tts` settings, adjusting silence thresholds, or toggling features,
 without reconnecting.
 
 ### 4.5 Backpressure contract (required for production)
@@ -733,6 +786,9 @@ The gateway should apply the following rules while **Grace is active**:
 Notes:
 - “speech detected” may come from VAD energy or interim STT deltas; “confirmed” should be based on semantic gating.
 - The assistant should never be cancelled due to noise-only activity.
+- Grace cancellation should only apply while the current assistant turn is still in progress (generating and/or speaking).
+  If the assistant has already finished playback for the current `assistant_audio_id` (e.g. client has reported `playback_mark.state:"finished"`),
+  then new speech should start a new turn (do not append to the prior utterance).
 
 ---
 
@@ -899,9 +955,15 @@ This gives you a principled way to handle interruptions without hacking the prov
 
 ## 12. Provider Selection Policy
 
-### 12.1 Recommended baseline
-- STT: **Cartesia** (already present, streaming WS)
-- TTS: **ElevenLabs** for realism + alignment (multi-context WS + `sync_alignment`)
+### 12.1 v1 rollout baseline
+- STT contract is `stt.model`, but v1 implementation supports **Cartesia only**:
+  - required: `stt.model = "cartesia/ink-whisper"`
+- TTS contract is `tts.voice = "{provider}/{voice_id}"`:
+  - supported providers in v1: `elevenlabs/*`, `cartesia/*`
+  - provider routing comes from the `tts.voice` prefix (no separate `tts.provider` field required)
+- Operational default recommendation:
+  - STT: Cartesia
+  - TTS: ElevenLabs primary, Cartesia fallback
 
 ### 12.2 Optional / fallback
 - TTS: **Cartesia** when:
@@ -920,7 +982,7 @@ The session should not branch on provider name; it should branch on capabilities
 These are recommended initial settings for a production live gateway. Treat them as defaults that
 must be tuned with real traffic (latency, noise environments, voice choice, and tier constraints).
 
-#### ElevenLabs live TTS (primary)
+#### ElevenLabs live TTS (primary; `tts.voice` prefix `elevenlabs/`)
 
 - **Model:** `eleven_flash_v2_5` (multi-context is not available for `eleven_v3`)
 - **Output format:** `pcm_24000` (good quality/bandwidth baseline for conversational audio)
@@ -932,7 +994,7 @@ must be tuned with real traffic (latency, noise environments, voice choice, and 
 - **Keepalive:** if a context must stay open while no text is being sent, send `{"text":"", "context_id":"..."}` every ~15s.
 - **Chunking:** stream sentence-ish chunks; set `flush:true` at sentence boundaries and at the end of the segment.
 
-#### Cartesia live STT (default)
+#### Cartesia live STT (required in v1; `stt.model=cartesia/ink-whisper`)
 
 - **Model:** `ink-whisper`
 - **Encoding:** `pcm_s16le`
@@ -943,7 +1005,7 @@ must be tuned with real traffic (latency, noise environments, voice choice, and 
   1. **Gateway-owned endpointing (recommended):** keep STT streaming without provider silence-based endpointing and commit turns based on the gateway’s 600ms silence detector + semantic “real speech” checks.
   2. **Provider endpointing:** set provider silence threshold to `0.6s` so STT emits finals on silence; still keep semantic checks and grace/interrupt logic in the gateway.
 
-#### Cartesia live TTS (secondary / fallback)
+#### Cartesia live TTS (secondary / fallback; `tts.voice` prefix `cartesia/`)
 
 - **Model:** `sonic-3`
 - **Output format:** `container=raw`, `encoding=pcm_s16le`, `sample_rate=24000`
@@ -970,6 +1032,10 @@ Fail-fast policy:
 - If required credentials are missing (gateway auth and/or required BYOK provider keys), the gateway should fail fast
   during the handshake (e.g. send a terminal `error` and close).
 - Provider fallback should be explicit (tenant policy/config), not an implicit runtime surprise.
+- Required BYOK keys for v1 live sessions:
+  - model provider key (derived from `model` prefix)
+  - `cartesia` key (required for STT in all sessions)
+  - `elevenlabs` key only when `tts.voice` uses the `elevenlabs/` prefix
 
 ### 13.2 Tooling policy (live mode)
 
@@ -1047,9 +1113,9 @@ To implement adapters correctly and pick default settings, we may need:
 1. ElevenLabs recommended settings for low-latency conversational use:
    - model id choices that support multi-context
    - output formats allowed per plan tier
-3. Cartesia STT:
+2. Cartesia STT:
    - recommended sample rate and encoding constraints for lowest TTCT
-4. Cartesia TTS (if we want it to support cancel/multi-context/alignment):
+3. Cartesia TTS (if we want it to support cancel/multi-context/alignment):
    - confirm precise semantics of `use_normalized_timestamps` (docs are vague; validate with real traffic)
    - confirm ordering guarantees between `timestamps`, `chunk`, and `flush_done` for robust correlation logic
 

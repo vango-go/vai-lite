@@ -1,16 +1,16 @@
 package anthropic
 
 import (
-	"bufio"
 	"io"
 	"strings"
 
+	"github.com/vango-go/vai-lite/pkg/core/sseframe"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
 // eventStream implements core.EventStream for Anthropic SSE responses.
 type eventStream struct {
-	reader *bufio.Reader
+	parser *sseframe.Parser
 	closer io.Closer
 	err    error
 }
@@ -18,7 +18,7 @@ type eventStream struct {
 // newEventStream creates a new event stream from an HTTP response body.
 func newEventStream(body io.ReadCloser) *eventStream {
 	return &eventStream{
-		reader: bufio.NewReader(body),
+		parser: sseframe.New(body),
 		closer: body,
 	}
 }
@@ -31,7 +31,7 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 	}
 
 	for {
-		line, err := s.reader.ReadString('\n')
+		frame, err := s.parser.Next()
 		if err != nil {
 			if err == io.EOF {
 				return nil, io.EOF
@@ -40,36 +40,17 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 			return nil, err
 		}
 
-		line = strings.TrimSpace(line)
-
-		// Skip empty lines
-		if line == "" {
+		eventType := strings.TrimSpace(frame.Event)
+		if eventType == "ping" {
 			continue
 		}
 
-		// Parse SSE format: "event: <type>" followed by "data: <json>"
-		if strings.HasPrefix(line, "event: ") {
-			eventType := strings.TrimPrefix(line, "event: ")
+		data := strings.TrimSpace(string(frame.Data))
+		if data == "" {
+			continue
+		}
 
-			// Read the data line
-			dataLine, err := s.reader.ReadString('\n')
-			if err != nil {
-				s.err = err
-				return nil, err
-			}
-			dataLine = strings.TrimSpace(dataLine)
-
-			if !strings.HasPrefix(dataLine, "data: ") {
-				continue
-			}
-
-			data := strings.TrimPrefix(dataLine, "data: ")
-
-			// Skip ping events
-			if eventType == "ping" {
-				continue
-			}
-
+		if eventType != "" {
 			event, err := parseStreamEvent(eventType, []byte(data))
 			if err != nil {
 				// Log the error but continue processing
@@ -82,18 +63,13 @@ func (s *eventStream) Next() (types.StreamEvent, error) {
 			continue
 		}
 
-		// Handle "data:" only format (some SSE implementations)
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-
-			// Try to determine event type from the data itself
-			event, err := parseStreamEventFromData([]byte(data))
-			if err != nil {
-				continue // Skip unparseable events
-			}
-			if event != nil {
-				return event, nil
-			}
+		// Handle "data:" only format (some SSE implementations).
+		event, err := parseStreamEventFromData([]byte(data))
+		if err != nil {
+			continue // Skip unparseable events
+		}
+		if event != nil {
+			return event, nil
 		}
 	}
 }

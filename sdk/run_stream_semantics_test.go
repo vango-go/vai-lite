@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,6 +131,94 @@ func TestRunStream_ToolCallStartEvent_EmittedOnceWithFullInput(t *testing.T) {
 	}
 	if got, ok := input["b"].(float64); !ok || got != 7 {
 		t.Fatalf("input[b] = %v (%T), want 7", input["b"], input["b"])
+	}
+}
+
+func TestRunStreamProcess_EmitsToolInputDeltaCallbacksAndExecutionLifecycle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	provider := newScriptedProvider(
+		"test",
+		toolTurnEventsForRunStream(),
+		finalTextTurnEventsForRunStream("done"),
+	)
+	svc := newMessagesServiceForRunStreamTest(provider)
+
+	multiply := MakeTool("multiply", "Multiply two numbers", func(ctx context.Context, in struct {
+		A int `json:"a"`
+		B int `json:"b"`
+	}) (int, error) {
+		return in.A * in.B, nil
+	})
+
+	stream, err := svc.RunStream(ctx, &MessageRequest{
+		Model: "test/fake-model",
+		Messages: []Message{
+			{Role: "user", Content: Text("Multiply 6 by 7")},
+		},
+		MaxTokens: 1024,
+	}, WithTools(multiply))
+	if err != nil {
+		t.Fatalf("RunStream() returned error: %v", err)
+	}
+	defer stream.Close()
+
+	var streamStartCount int
+	var streamStopCount int
+	var execStartCount int
+	var deltas strings.Builder
+
+	text, err := stream.Process(StreamCallbacks{
+		OnToolUseStart: func(index int, id, name string) {
+			streamStartCount++
+			if index != 0 || id != "call_1" || name != "multiply" {
+				t.Fatalf("OnToolUseStart got (%d,%q,%q), want (0,%q,%q)", index, id, name, "call_1", "multiply")
+			}
+		},
+		OnToolInputDelta: func(index int, id, name, partialJSON string) {
+			if index != 0 || id != "call_1" || name != "multiply" {
+				t.Fatalf("OnToolInputDelta index/meta=(%d,%q,%q), want (0,%q,%q)", index, id, name, "call_1", "multiply")
+			}
+			deltas.WriteString(partialJSON)
+		},
+		OnToolUseStop: func(index int, id, name string) {
+			streamStopCount++
+			if index != 0 || id != "call_1" || name != "multiply" {
+				t.Fatalf("OnToolUseStop got (%d,%q,%q), want (0,%q,%q)", index, id, name, "call_1", "multiply")
+			}
+		},
+		OnToolCallStart: func(id, name string, input map[string]any) {
+			execStartCount++
+			if id != "call_1" || name != "multiply" {
+				t.Fatalf("OnToolCallStart got (%q,%q), want (%q,%q)", id, name, "call_1", "multiply")
+			}
+			if got, ok := input["a"].(float64); !ok || got != 6 {
+				t.Fatalf("input[a] = %v (%T), want 6", input["a"], input["a"])
+			}
+			if got, ok := input["b"].(float64); !ok || got != 7 {
+				t.Fatalf("input[b] = %v (%T), want 7", input["b"], input["b"])
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+
+	if text != "done" {
+		t.Fatalf("Process() text = %q, want %q", text, "done")
+	}
+	if got := deltas.String(); got != `{"a":6,"b":7}` {
+		t.Fatalf("joined input_json_delta = %q, want %q", got, `{"a":6,"b":7}`)
+	}
+	if streamStartCount != 1 {
+		t.Fatalf("OnToolUseStart calls = %d, want 1", streamStartCount)
+	}
+	if streamStopCount != 1 {
+		t.Fatalf("OnToolUseStop calls = %d, want 1", streamStopCount)
+	}
+	if execStartCount != 1 {
+		t.Fatalf("OnToolCallStart calls = %d, want 1", execStartCount)
 	}
 }
 
