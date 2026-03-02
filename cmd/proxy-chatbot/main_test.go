@@ -805,7 +805,7 @@ func TestSyncHistoryFromRunResult_FallbackUsesAssistantText(t *testing.T) {
 	}
 }
 
-func TestFormatDetailedError_IncludesCoreFields(t *testing.T) {
+func TestFormatError_IncludesCoreFields(t *testing.T) {
 	t.Parallel()
 
 	retryAfter := 7
@@ -819,7 +819,7 @@ func TestFormatDetailedError_IncludesCoreFields(t *testing.T) {
 		ProviderError: map[string]any{"status": "RESOURCE_EXHAUSTED", "message": "quota exceeded"},
 	}
 
-	got := formatDetailedError(err)
+	got := vai.FormatError(err)
 	if !strings.Contains(got, "api_error: internal error") {
 		t.Fatalf("missing base error text, got=%q", got)
 	}
@@ -840,14 +840,14 @@ func TestFormatDetailedError_IncludesCoreFields(t *testing.T) {
 	}
 }
 
-func TestFormatDetailedError_UnwrapsCauseChain(t *testing.T) {
+func TestFormatError_UnwrapsCauseChain(t *testing.T) {
 	t.Parallel()
 
 	root := errors.New("root cause")
 	wrapped := fmt.Errorf("layer 1: %w", root)
 	err := fmt.Errorf("top level: %w", wrapped)
 
-	got := formatDetailedError(err)
+	got := vai.FormatError(err)
 	if !strings.Contains(got, "top level: layer 1: root cause") {
 		t.Fatalf("missing top-level text, got=%q", got)
 	}

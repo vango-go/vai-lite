@@ -5,6 +5,7 @@ import (
 	"net/url"
 
 	"github.com/vango-go/vai-lite/pkg/core"
+	"github.com/vango-go/vai-lite/pkg/core/errorfmt"
 )
 
 // SDK-level error type that wraps core errors
@@ -59,6 +60,27 @@ func (e *TransportError) Unwrap() error {
 		return nil
 	}
 	return e.Err
+}
+
+// TransportOp returns the transport operation (for rich error formatters).
+func (e *TransportError) TransportOp() string {
+	if e == nil {
+		return ""
+	}
+	return e.Op
+}
+
+// TransportURL returns the transport URL (for rich error formatters).
+func (e *TransportError) TransportURL() string {
+	if e == nil {
+		return ""
+	}
+	return e.URL
+}
+
+// FormatError returns a rich human-readable rendering of an error.
+func FormatError(err error) string {
+	return errorfmt.Format(err)
 }
 
 func redactURLUserInfo(raw string) string {

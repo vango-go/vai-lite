@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/vango-go/vai-lite/pkg/core"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	gatewayserver "github.com/vango-go/vai-lite/pkg/gateway/server"
 )
@@ -37,6 +39,50 @@ func TestRunMain_ReturnsNonZeroWhenConfigLoadFails(t *testing.T) {
 	}
 	if got := stderr.String(); got == "" {
 		t.Fatalf("expected stderr output for startup error")
+	}
+}
+
+func TestRunMain_FormatsStructuredErrors(t *testing.T) {
+	t.Parallel()
+
+	retryAfter := 9
+	var stderr bytes.Buffer
+	exitCode := runMain(context.Background(), &stderr, proxyDeps{
+		loadConfig: func() (config.Config, error) {
+			return config.Config{}, &core.Error{
+				Type:          core.ErrAPI,
+				Message:       "internal error",
+				Param:         "auth_mode",
+				Code:          "INVALID_AUTH_MODE",
+				RequestID:     "req_abc",
+				RetryAfter:    &retryAfter,
+				ProviderError: map[string]any{"reason": "misconfigured"},
+			}
+		},
+		newGateway: func(cfg config.Config, logger *slog.Logger) *gatewayserver.Server {
+			t.Fatalf("newGateway should not be called when config load fails")
+			return nil
+		},
+		signalNotify: func(c chan<- os.Signal, sig ...os.Signal) {},
+		signalStop:   func(c chan<- os.Signal) {},
+	})
+
+	if exitCode != 1 {
+		t.Fatalf("exitCode=%d, want 1", exitCode)
+	}
+	got := stderr.String()
+	wantParts := []string{
+		"vai-proxy: load config: api_error: internal error",
+		"param=auth_mode",
+		"code=INVALID_AUTH_MODE",
+		"request_id=req_abc",
+		"retry_after=9s",
+		`provider_error={"reason":"misconfigured"}`,
+	}
+	for _, want := range wantParts {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in %q", want, got)
+		}
 	}
 }
 
@@ -78,13 +124,13 @@ func TestGatewayHandlerStack_Smoke(t *testing.T) {
 		UpstreamResponseHeaderTimeout: time.Second,
 		ReadHeaderTimeout:             time.Second,
 		ReadTimeout:                   time.Second,
-		LimitRPS:                   10,
-		LimitBurst:                 20,
-		LimitMaxConcurrentRequests: 20,
-		LimitMaxConcurrentStreams:  10,
-		TavilyBaseURL:              "https://api.tavily.com",
-		ExaBaseURL:                 "https://api.exa.ai",
-		FirecrawlBaseURL:           "https://api.firecrawl.dev",
+		LimitRPS:                      10,
+		LimitBurst:                    20,
+		LimitMaxConcurrentRequests:    20,
+		LimitMaxConcurrentStreams:     10,
+		TavilyBaseURL:                 "https://api.tavily.com",
+		ExaBaseURL:                    "https://api.exa.ai",
+		FirecrawlBaseURL:              "https://api.firecrawl.dev",
 	}, logger)
 
 	ts := httptest.NewServer(gw.Handler())

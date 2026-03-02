@@ -45,6 +45,17 @@ Notes:
 - In proxy mode, `WithProviderKey(...)` becomes source for `X-Provider-Key-*` BYOK headers.
 - Non-streaming proxy calls apply a default timeout if your context has no deadline; pass per-request context deadlines in production.
 
+## Error formatting
+
+For CLI/log output, use `vai.FormatError(err)` to get consistent rich error details
+across transport and API errors.
+
+```go
+if err != nil {
+	fmt.Println(vai.FormatError(err))
+}
+```
+
 ## Cartesia setup
 
 Configure Cartesia using either:

@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/vango-go/vai-lite/internal/dotenv"
+	"github.com/vango-go/vai-lite/pkg/core/errorfmt"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	gatewayserver "github.com/vango-go/vai-lite/pkg/gateway/server"
 )
@@ -116,12 +117,12 @@ func runMain(ctx context.Context, stderr io.Writer, deps proxyDeps) int {
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 
 	if err := dotenv.LoadFile(".env"); err != nil {
-		fmt.Fprintf(stderr, "vai-proxy: %v\n", err)
+		fmt.Fprintf(stderr, "vai-proxy: %s\n", errorfmt.Format(err))
 		return 1
 	}
 
 	if err := runProxy(ctx, logger, deps); err != nil {
-		fmt.Fprintf(stderr, "vai-proxy: %v\n", err)
+		fmt.Fprintf(stderr, "vai-proxy: %s\n", errorfmt.Format(err))
 		return 1
 	}
 	return 0
