@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,11 @@ const (
 	defaultMaxTokens = 512
 	defaultTimeout   = 90 * time.Second
 )
+
+const talkToUserSystemInstruction = `You must use the talk_to_user tool for any user-facing speech.
+When talking to the user, call talk_to_user with JSON arguments shaped like {"content":"..."}.
+You may use other tools (e.g. web tools) first, then talk_to_user to present results.
+Do not duplicate the same spoken content as plain assistant text.`
 
 type chatConfig struct {
 	BaseURL       string
@@ -45,6 +51,11 @@ type streamPrintState struct {
 	openToolLineIndex       int
 	openToolLineAtLineStart bool
 	toolStateInitialized    bool
+
+	talkRawByIndex              map[int]string
+	talkDecodedByIndex          map[int]string
+	talkPrintedByIndex          map[int]bool
+	talkEndedWithNewlineByIndex map[int]bool
 }
 
 type toolMeta struct {
@@ -247,10 +258,16 @@ func buildClientOptions(cfg chatConfig) []vai.ClientOption {
 	return opts
 }
 
-func buildWebTools(cfg chatConfig) []vai.ToolWithHandler {
+func buildChatTools(cfg chatConfig) []vai.ToolWithHandler {
+	type talkToUserInput struct {
+		Content string `json:"content" desc:"Exact text to speak to the user"`
+	}
 	return []vai.ToolWithHandler{
 		vai.VAIWebSearch(tavily.NewSearch(cfg.TavilyAPIKey)),
 		vai.VAIWebFetch(tavily.NewExtract(cfg.TavilyAPIKey)),
+		vai.MakeTool("talk_to_user", "Speak text directly to the user via the voice/output channel.", func(ctx context.Context, input talkToUserInput) (string, error) {
+			return "delivered", nil
+		}),
 	}
 }
 
@@ -308,10 +325,10 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 	}
 
 	client := vai.NewClient(buildClientOptions(cfg)...)
-	webTools := buildWebTools(cfg)
+	chatTools := buildChatTools(cfg)
 
 	fmt.Fprintf(out, "Proxy chatbot connected to %s using %s\n", cfg.BaseURL, cfg.Model)
-	fmt.Fprintln(out, "Tavily web tools enabled: vai_web_search, vai_web_fetch")
+	fmt.Fprintln(out, "Tools enabled: talk_to_user, vai_web_search, vai_web_fetch")
 	fmt.Fprintln(out, "Type /exit or /quit to stop. Use /model to view and /model:{provider}/{model} to switch.")
 
 	scanner := bufio.NewScanner(in)
@@ -357,12 +374,10 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 			Messages:  state.history,
 			MaxTokens: cfg.MaxTokens,
 		}
-		if cfg.SystemPrompt != "" {
-			req.System = cfg.SystemPrompt
-		}
+		req.System = composeSystemPrompt(cfg.SystemPrompt)
 
 		turnCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-		stream, err := client.Messages.RunStream(turnCtx, req, vai.WithTools(webTools...))
+		stream, err := client.Messages.RunStream(turnCtx, req, vai.WithTools(chatTools...))
 		if err != nil {
 			cancel()
 			state.history = state.history[:beforeLen]
@@ -405,6 +420,7 @@ func buildStreamCallbacks(out io.Writer, printState *streamPrintState) vai.Strea
 	return vai.StreamCallbacks{
 		OnTextDelta: func(text string) {
 			closeOpenToolStreamLine(out, printState)
+			closeOpenTalkStreamLines(out, printState)
 			printState.sawText = true
 			printState.text.WriteString(text)
 			fmt.Fprint(out, text)
@@ -429,17 +445,47 @@ func buildStreamCallbacks(out io.Writer, printState *streamPrintState) vai.Strea
 			}
 			printState.toolMetaByIndex[index] = meta
 
+			if isTalkToUserTool(meta.name) {
+				closeOpenToolStreamLine(out, printState)
+				printState.talkRawByIndex[index] += partialJSON
+				decoded, found := extractSpokenPrefixFromToolArgs(printState.talkRawByIndex[index])
+				if !found {
+					return
+				}
+				prev := printState.talkDecodedByIndex[index]
+				suffix := decodedSuffix(prev, decoded)
+				printState.talkDecodedByIndex[index] = decoded
+				emitTalkSuffix(out, printState, index, suffix)
+				return
+			}
 			streamToolInputDelta(out, printState, index, displayToolName(meta.name), partialJSON)
 		},
 		OnToolUseStop: func(index int, id, name string) {
+			meta := printState.toolMetaByIndex[index]
+			toolName := strings.TrimSpace(meta.name)
+			if toolName == "" {
+				toolName = strings.TrimSpace(name)
+			}
+
 			if printState.openToolLineIndex == index {
 				closeOpenToolStreamLine(out, printState)
 			}
+			if isTalkToUserTool(toolName) && printState.talkPrintedByIndex[index] && !printState.talkEndedWithNewlineByIndex[index] {
+				fmt.Fprintln(out)
+			}
 			delete(printState.toolMetaByIndex, index)
 			delete(printState.toolLineStartedByIndex, index)
+			delete(printState.talkRawByIndex, index)
+			delete(printState.talkDecodedByIndex, index)
+			delete(printState.talkPrintedByIndex, index)
+			delete(printState.talkEndedWithNewlineByIndex, index)
 		},
 		OnToolCallStart: func(id, name string, _ map[string]any) {
 			closeOpenToolStreamLine(out, printState)
+			closeOpenTalkStreamLines(out, printState)
+			if isTalkToUserTool(name) {
+				return
+			}
 			fmt.Fprintf(out, "[tool] %s\n", name)
 		},
 	}
@@ -483,6 +529,15 @@ func syncHistoryFromRunResult(state *chatRuntime, result *vai.RunResult, assista
 	}
 }
 
+func composeSystemPrompt(userPrompt string) string {
+	base := strings.TrimSpace(userPrompt)
+	enforced := strings.TrimSpace(talkToUserSystemInstruction)
+	if base == "" {
+		return enforced
+	}
+	return base + "\n\n" + enforced
+}
+
 func initToolStreamState(state *streamPrintState) {
 	if state == nil {
 		return
@@ -497,6 +552,18 @@ func initToolStreamState(state *streamPrintState) {
 	if state.toolLineStartedByIndex == nil {
 		state.toolLineStartedByIndex = make(map[int]bool)
 	}
+	if state.talkRawByIndex == nil {
+		state.talkRawByIndex = make(map[int]string)
+	}
+	if state.talkDecodedByIndex == nil {
+		state.talkDecodedByIndex = make(map[int]string)
+	}
+	if state.talkPrintedByIndex == nil {
+		state.talkPrintedByIndex = make(map[int]bool)
+	}
+	if state.talkEndedWithNewlineByIndex == nil {
+		state.talkEndedWithNewlineByIndex = make(map[int]bool)
+	}
 }
 
 func displayToolName(name string) string {
@@ -505,6 +572,10 @@ func displayToolName(name string) string {
 		return "unknown"
 	}
 	return trimmed
+}
+
+func isTalkToUserTool(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "talk_to_user")
 }
 
 func streamToolInputDelta(out io.Writer, state *streamPrintState, index int, toolName, partialJSON string) {
@@ -524,6 +595,158 @@ func streamToolInputDelta(out io.Writer, state *streamPrintState, index int, too
 
 	fmt.Fprint(out, partialJSON)
 	state.openToolLineAtLineStart = partialJSON[len(partialJSON)-1] == '\n'
+}
+
+func closeOpenTalkStreamLines(out io.Writer, state *streamPrintState) {
+	if state == nil {
+		return
+	}
+	for index := range state.talkPrintedByIndex {
+		if state.talkPrintedByIndex[index] && !state.talkEndedWithNewlineByIndex[index] {
+			fmt.Fprintln(out)
+			state.talkEndedWithNewlineByIndex[index] = true
+		}
+	}
+}
+
+func emitTalkSuffix(out io.Writer, state *streamPrintState, index int, suffix string) {
+	if suffix == "" {
+		return
+	}
+	fmt.Fprint(out, suffix)
+	state.talkPrintedByIndex[index] = true
+	state.talkEndedWithNewlineByIndex[index] = suffix[len(suffix)-1] == '\n'
+}
+
+func decodedSuffix(previous string, current string) string {
+	if previous == "" {
+		return current
+	}
+	if strings.HasPrefix(current, previous) {
+		return current[len(previous):]
+	}
+	// Fallback for parser resync: emit only the changed tail from the common prefix.
+	common := commonPrefixLen(previous, current)
+	if common >= len(current) {
+		return ""
+	}
+	return current[common:]
+}
+
+func commonPrefixLen(a string, b string) int {
+	limit := len(a)
+	if len(b) < limit {
+		limit = len(b)
+	}
+	i := 0
+	for i < limit && a[i] == b[i] {
+		i++
+	}
+	return i
+}
+
+func extractSpokenPrefixFromToolArgs(raw string) (decoded string, found bool) {
+	for _, key := range []string{"content", "message", "text"} {
+		if decoded, found := extractJSONStringFieldPrefix(raw, key); found {
+			return decoded, true
+		}
+	}
+	return "", false
+}
+
+func extractJSONStringFieldPrefix(raw string, key string) (decoded string, found bool) {
+	if raw == "" || key == "" {
+		return "", false
+	}
+	field := `"` + key + `"`
+	searchPos := 0
+	for searchPos < len(raw) {
+		idx := strings.Index(raw[searchPos:], field)
+		if idx < 0 {
+			return "", false
+		}
+		idx += searchPos
+		pos := idx + len(field)
+
+		for pos < len(raw) && isJSONWhitespace(raw[pos]) {
+			pos++
+		}
+		if pos >= len(raw) || raw[pos] != ':' {
+			searchPos = idx + 1
+			continue
+		}
+		pos++
+		for pos < len(raw) && isJSONWhitespace(raw[pos]) {
+			pos++
+		}
+		if pos >= len(raw) {
+			return "", false
+		}
+		if raw[pos] != '"' {
+			searchPos = idx + 1
+			continue
+		}
+		return decodeJSONStringPrefix(raw[pos+1:]), true
+	}
+	return "", false
+}
+
+func isJSONWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+func decodeJSONStringPrefix(raw string) string {
+	var out strings.Builder
+	for i := 0; i < len(raw); {
+		ch := raw[i]
+		if ch == '"' {
+			return out.String()
+		}
+		if ch != '\\' {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if i+1 >= len(raw) {
+			return out.String()
+		}
+		esc := raw[i+1]
+		switch esc {
+		case '"', '\\', '/':
+			out.WriteByte(esc)
+			i += 2
+		case 'b':
+			out.WriteByte('\b')
+			i += 2
+		case 'f':
+			out.WriteByte('\f')
+			i += 2
+		case 'n':
+			out.WriteByte('\n')
+			i += 2
+		case 'r':
+			out.WriteByte('\r')
+			i += 2
+		case 't':
+			out.WriteByte('\t')
+			i += 2
+		case 'u':
+			if i+5 >= len(raw) {
+				return out.String()
+			}
+			hex := raw[i+2 : i+6]
+			v, err := strconv.ParseUint(hex, 16, 16)
+			if err != nil {
+				return out.String()
+			}
+			out.WriteRune(rune(v))
+			i += 6
+		default:
+			// Tolerate unknown/incomplete escapes as partial prefix.
+			return out.String()
+		}
+	}
+	return out.String()
 }
 
 func closeOpenToolStreamLine(out io.Writer, state *streamPrintState) {

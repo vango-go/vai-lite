@@ -222,14 +222,14 @@ func TestBuildClientOptions_RegistersProviderKeys(t *testing.T) {
 	}
 }
 
-func TestBuildWebTools_DefaultNamesAndHandlers(t *testing.T) {
+func TestBuildChatTools_DefaultNamesAndHandlers(t *testing.T) {
 	t.Parallel()
 
-	tools := buildWebTools(chatConfig{
+	tools := buildChatTools(chatConfig{
 		TavilyAPIKey: "tvly-test",
 	})
-	if len(tools) != 2 {
-		t.Fatalf("len(tools)=%d, want 2", len(tools))
+	if len(tools) != 3 {
+		t.Fatalf("len(tools)=%d, want 3", len(tools))
 	}
 	if tools[0].Name != "vai_web_search" {
 		t.Fatalf("tools[0].Name=%q, want %q", tools[0].Name, "vai_web_search")
@@ -237,11 +237,37 @@ func TestBuildWebTools_DefaultNamesAndHandlers(t *testing.T) {
 	if tools[1].Name != "vai_web_fetch" {
 		t.Fatalf("tools[1].Name=%q, want %q", tools[1].Name, "vai_web_fetch")
 	}
+	if tools[2].Name != "talk_to_user" {
+		t.Fatalf("tools[2].Name=%q, want %q", tools[2].Name, "talk_to_user")
+	}
 	if tools[0].Handler == nil {
 		t.Fatalf("tools[0].Handler is nil")
 	}
 	if tools[1].Handler == nil {
 		t.Fatalf("tools[1].Handler is nil")
+	}
+	if tools[2].Handler == nil {
+		t.Fatalf("tools[2].Handler is nil")
+	}
+}
+
+func TestComposeSystemPrompt_AppendsTalkInstruction(t *testing.T) {
+	t.Parallel()
+
+	withoutBase := composeSystemPrompt("")
+	if !strings.Contains(withoutBase, `talk_to_user`) {
+		t.Fatalf("missing talk_to_user instruction in prompt: %q", withoutBase)
+	}
+	if !strings.Contains(withoutBase, `{"content":"..."}`) {
+		t.Fatalf("missing canonical content shape in prompt: %q", withoutBase)
+	}
+
+	withBase := composeSystemPrompt("Be concise.")
+	if !strings.Contains(withBase, "Be concise.") {
+		t.Fatalf("missing user prompt prefix: %q", withBase)
+	}
+	if !strings.Contains(withBase, talkToUserSystemInstruction) {
+		t.Fatalf("missing enforced talk instruction suffix: %q", withBase)
 	}
 }
 
@@ -546,6 +572,91 @@ func TestBuildStreamCallbacks_TextDeltaStartsAfterToolLineTermination(t *testing
 	got := out.String()
 	if !strings.Contains(got, "\nTool-tool_x: abc\nhello") {
 		t.Fatalf("assistant text did not start on a new line after tool stream, got=%q", got)
+	}
+}
+
+func TestBuildStreamCallbacks_TalkToUser_StreamsExtractedSpeechOnly(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	state := &streamPrintState{}
+	callbacks := buildStreamCallbacks(&out, state)
+
+	callbacks.OnToolUseStart(0, "call_1", "talk_to_user")
+	callbacks.OnToolInputDelta(0, "call_1", "talk_to_user", `{"content":"hel`)
+	callbacks.OnToolInputDelta(0, "call_1", "talk_to_user", `lo"}`)
+	callbacks.OnToolUseStop(0, "call_1", "talk_to_user")
+
+	got := out.String()
+	if strings.Contains(got, "Tool-talk_to_user:") {
+		t.Fatalf("unexpected raw talk tool line prefix, got=%q", got)
+	}
+	if strings.Contains(got, `{"content":"`) {
+		t.Fatalf("unexpected raw json output for talk_to_user, got=%q", got)
+	}
+	if !strings.Contains(got, "hello\n") {
+		t.Fatalf("expected streamed spoken text, got=%q", got)
+	}
+}
+
+func TestBuildStreamCallbacks_TalkToUser_NewlineContinuationHasNoPrefix(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	state := &streamPrintState{}
+	callbacks := buildStreamCallbacks(&out, state)
+
+	callbacks.OnToolUseStart(0, "", "talk_to_user")
+	callbacks.OnToolInputDelta(0, "", "talk_to_user", `{"content":"line1\nline2"}`)
+	callbacks.OnToolUseStop(0, "", "talk_to_user")
+
+	got := out.String()
+	if !strings.Contains(got, "line1\nline2\n") {
+		t.Fatalf("expected newline continuation without prefix, got=%q", got)
+	}
+	if strings.Contains(got, "Tool-talk_to_user") {
+		t.Fatalf("unexpected talk tool prefix on continuation, got=%q", got)
+	}
+}
+
+func TestBuildStreamCallbacks_TalkToUser_HandlesEscapesAcrossChunks(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	state := &streamPrintState{}
+	callbacks := buildStreamCallbacks(&out, state)
+
+	callbacks.OnToolUseStart(5, "", "talk_to_user")
+	callbacks.OnToolInputDelta(5, "", "talk_to_user", `{"content":"he\`)
+	callbacks.OnToolInputDelta(5, "", "talk_to_user", `nllo \u00`)
+	callbacks.OnToolInputDelta(5, "", "talk_to_user", `41 \"ok\""}`)
+	callbacks.OnToolUseStop(5, "", "talk_to_user")
+
+	got := out.String()
+	if !strings.Contains(got, "he\nllo A \"ok\"\n") {
+		t.Fatalf("expected decoded escaped speech, got=%q", got)
+	}
+}
+
+func TestBuildStreamCallbacks_TalkToUser_HidesExecutionMarker(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	state := &streamPrintState{}
+	callbacks := buildStreamCallbacks(&out, state)
+
+	callbacks.OnToolUseStart(8, "call_talk", "talk_to_user")
+	callbacks.OnToolInputDelta(8, "call_talk", "talk_to_user", `{"content":"hi"}`)
+	callbacks.OnToolUseStop(8, "call_talk", "talk_to_user")
+	callbacks.OnToolCallStart("call_talk", "talk_to_user", map[string]any{"content": "hi"})
+	callbacks.OnToolCallStart("call_search", "vai_web_search", nil)
+
+	got := out.String()
+	if strings.Contains(got, "[tool] talk_to_user") {
+		t.Fatalf("unexpected talk_to_user execution marker, got=%q", got)
+	}
+	if !strings.Contains(got, "[tool] vai_web_search") {
+		t.Fatalf("expected non-talk execution marker, got=%q", got)
 	}
 }
 
