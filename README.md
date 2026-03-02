@@ -128,7 +128,14 @@ Notes:
   - `VAI_LIVE_VOICE_ID` or `--live-voice-id` (required)
   - `VAI_LIVE_VOICE_PROVIDER` or `--live-voice-provider` (`cartesia` default, `elevenlabs` optional)
   - `ELEVENLABS_API_KEY` (required only when provider is `elevenlabs`)
-  - `ffmpeg` and `ffplay` available on `PATH` (used by the demo mic/playback handler)
+  - `ffmpeg` and `ffplay` available on `PATH` (demo live mic + playback)
+  - Optional mic selection envs:
+    - `VAI_LIVE_MIC_NAME` (preferred on macOS; resolves AVFoundation input by device name, e.g. `ULT WEAR`)
+    - `VAI_LIVE_MIC_INDEX` (macOS AVFoundation audio index, defaults to `0`)
+    - `VAI_LIVE_FFMPEG_INPUT` (explicit ffmpeg input string, overrides `VAI_LIVE_MIC_INDEX`)
+  - Optional playback envs:
+    - `VAI_LIVE_FFPLAY_AUDIO_DEVICE` (sets ffplay output device via `SDL_AUDIO_DEVICE_NAME`)
+    - `VAI_LIVE_FFPLAY_VOLUME` (0-100, default `100`)
 - In live mode, the chatbot uses gateway `/v1/live` with server tools enabled:
   - `vai_web_search` (provider: Tavily)
   - `vai_web_fetch` (provider: Tavily extract)

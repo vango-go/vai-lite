@@ -330,40 +330,6 @@ paths:
         "529":
           $ref: "#/components/responses/Overloaded"
 
-  /v1/live:
-    get:
-      tags: [Live]
-      summary: Live Audio Mode WebSocket endpoint (upgrade)
-      description: |
-        WebSocket upgrade endpoint for Live Audio Mode.
-
-        OpenAPI cannot fully model WebSocket message flows; see `LIVE_AUDIO_MODE_DESIGN.md`
-        for the normative protocol (`hello`/`hello_ack`, audio framing, playback marks, etc.).
-
-        This endpoint is reserved in the v1 API surface even if not enabled in a given build/deployment.
-      operationId: getV1Live
-      parameters:
-        - $ref: "#/components/parameters/XVAIversion"
-        - $ref: "#/components/parameters/XRequestID"
-        - $ref: "#/components/parameters/Authorization"
-      responses:
-        "101":
-          description: Switching Protocols (WebSocket)
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
-        "500":
-          $ref: "#/components/responses/InternalError"
-        "529":
-          $ref: "#/components/responses/Overloaded"
-
   /healthz:
     get:
       tags: [Health]

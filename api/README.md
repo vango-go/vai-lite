@@ -8,7 +8,6 @@
 - `/v1/messages` (JSON + SSE)
 - `/v1/runs` (blocking) and `/v1/runs:stream` (SSE)
 - `/v1/models`
-- `/v1/live` (WebSocket upgrade; protocol is documented in `LIVE_AUDIO_MODE_DESIGN.md`)
 - `/healthz` and `/readyz`
 
 ## Notes

@@ -132,7 +132,7 @@ func TestAccessLog_PreservesHijacker(t *testing.T) {
 		}
 	}))
 
-	h.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/v1/live", nil).WithContext(WithRequestID(context.Background(), "req_test")))
+	h.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/v1/ws", nil).WithContext(WithRequestID(context.Background(), "req_test")))
 
 	if !writer.hijacked {
 		t.Fatalf("expected underlying hijacker to be invoked")
@@ -159,7 +159,7 @@ func TestAccessLog_PreservesFlusherAndHijacker(t *testing.T) {
 		}
 	}))
 
-	h.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/v1/live", nil).WithContext(WithRequestID(context.Background(), "req_test")))
+	h.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/v1/ws", nil).WithContext(WithRequestID(context.Background(), "req_test")))
 
 	if !writer.flushed {
 		t.Fatalf("expected flush to be delegated")

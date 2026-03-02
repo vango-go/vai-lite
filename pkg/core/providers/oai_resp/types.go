@@ -317,6 +317,7 @@ type streamEvent struct {
 	Response       *responsesResponse `json:"response,omitempty"`
 	Item           *outputItem        `json:"item,omitempty"`
 	Delta          string             `json:"delta,omitempty"`
+	Arguments      string             `json:"arguments,omitempty"`
 	OutputIndex    int                `json:"output_index,omitempty"`
 	ContentIndex   int                `json:"content_index,omitempty"`
 	SequenceNumber int                `json:"sequence_number,omitempty"`

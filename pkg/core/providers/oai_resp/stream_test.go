@@ -45,3 +45,76 @@ func TestEventStream_EmitsTerminalEventsBeforeEOF(t *testing.T) {
 		t.Fatalf("third Next() event = %T, want nil", event)
 	}
 }
+
+func TestEventStream_FunctionCallArgumentsDoneAppendsTailAndDefersStop(t *testing.T) {
+	// Simulates a Responses stream where output_item.done arrives before function_call_arguments.done,
+	// and the final full tool arguments are delivered via the `.done` event.
+	//
+	// This ordering must not truncate tool args for live talk_to_user streaming.
+	sse := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
+		``,
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"tool_1","name":"talk_to_user"}}`,
+		``,
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"text\":\"Hello"}`,
+		``,
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call"}}`,
+		``,
+		`data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"text\":\"Hello\\nWorld\"}"}`,
+		``,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-test","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	stream := newEventStream(io.NopCloser(strings.NewReader(sse)))
+
+	var got []types.StreamEvent
+	for {
+		ev, err := stream.Next()
+		if ev != nil {
+			got = append(got, ev)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next err=%v", err)
+		}
+	}
+
+	// Expect: message_start, content_block_start (tool_use), content_block_delta (args delta),
+	// content_block_delta (tail from args.done), content_block_stop, message_delta, message_stop.
+	typesSeq := make([]string, 0, len(got))
+	var seenArgs strings.Builder
+	for _, ev := range got {
+		switch e := ev.(type) {
+		case types.MessageStartEvent:
+			typesSeq = append(typesSeq, e.Type)
+		case types.ContentBlockStartEvent:
+			typesSeq = append(typesSeq, e.Type)
+		case types.ContentBlockDeltaEvent:
+			typesSeq = append(typesSeq, e.Type)
+			if d, ok := e.Delta.(types.InputJSONDelta); ok {
+				seenArgs.WriteString(d.PartialJSON)
+			}
+		case types.ContentBlockStopEvent:
+			typesSeq = append(typesSeq, e.Type)
+		case types.MessageDeltaEvent:
+			typesSeq = append(typesSeq, e.Type)
+		case types.MessageStopEvent:
+			typesSeq = append(typesSeq, e.Type)
+		default:
+			typesSeq = append(typesSeq, ev.EventType())
+		}
+	}
+
+	gotSeq := strings.Join(typesSeq, ",")
+	if !strings.Contains(gotSeq, "content_block_stop") {
+		t.Fatalf("missing content_block_stop in seq=%s", gotSeq)
+	}
+	if !strings.Contains(seenArgs.String(), "\\nWorld") {
+		t.Fatalf("args missing tail: %q", seenArgs.String())
+	}
+}

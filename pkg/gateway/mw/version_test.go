@@ -119,7 +119,7 @@ func TestAPIVersion_WebSocketUpgradeBypass(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/live", nil).WithContext(WithRequestID(context.Background(), "req_test"))
+	req := httptest.NewRequest(http.MethodGet, "/v1/ws", nil).WithContext(WithRequestID(context.Background(), "req_test"))
 	req.Header.Set(apiVersionHeader, "2")
 	req.Header.Set("Connection", "keep-alive, Upgrade")
 	req.Header.Set("Upgrade", "websocket")

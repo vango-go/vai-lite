@@ -43,12 +43,6 @@ func Auth(cfg config.Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID, _ := RequestIDFrom(r.Context())
 
-		// /v1/live authenticates in-band via the first websocket hello frame.
-		if isLiveWebSocketUpgrade(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		switch cfg.AuthMode {
 		case config.AuthModeDisabled:
 			next.ServeHTTP(w, r)
@@ -229,11 +223,4 @@ func writeJSONError(w http.ResponseWriter, status int, err *core.Error) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(errorEnvelope{Error: err})
-}
-
-func isLiveWebSocketUpgrade(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	return r.URL.Path == "/v1/live" && isWebSocketUpgrade(r)
 }

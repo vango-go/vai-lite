@@ -25,10 +25,6 @@ const (
 	defaultTimeout   = 90 * time.Second
 )
 
-var errChatExitRequested = errors.New("chat exit requested")
-
-var runLiveModeFunc = runLiveMode
-
 type chatConfig struct {
 	BaseURL           string
 	Model             string
@@ -38,11 +34,6 @@ type chatConfig struct {
 	GatewayAPIKey     string
 	TavilyAPIKey      string
 	ProviderKeys      map[string]string
-	LiveVoiceProvider string
-	LiveVoiceID       string
-	LiveLanguage      string
-	CartesiaAPIKey    string
-	ElevenLabsAPIKey  string
 }
 
 func parseChatConfig(args []string, getenv func(string) string) (chatConfig, error) {
@@ -60,25 +51,12 @@ func parseChatConfig(args []string, getenv func(string) string) (chatConfig, err
 	fs.DurationVar(&cfg.Timeout, "timeout", defaultTimeout, "per-turn timeout (e.g. 90s)")
 	fs.StringVar(&cfg.SystemPrompt, "system", "", "optional system prompt")
 	fs.StringVar(&cfg.GatewayAPIKey, "gateway-api-key", strings.TrimSpace(getenv("VAI_GATEWAY_API_KEY")), "optional gateway api key (or VAI_GATEWAY_API_KEY)")
-	fs.StringVar(&cfg.LiveVoiceProvider, "live-voice-provider", strings.TrimSpace(getenv("VAI_LIVE_VOICE_PROVIDER")), "live voice provider: cartesia or elevenlabs (or VAI_LIVE_VOICE_PROVIDER)")
-	fs.StringVar(&cfg.LiveVoiceID, "live-voice-id", strings.TrimSpace(getenv("VAI_LIVE_VOICE_ID")), "live voice id (or VAI_LIVE_VOICE_ID)")
-	fs.StringVar(&cfg.LiveLanguage, "live-language", strings.TrimSpace(getenv("VAI_LIVE_LANGUAGE")), "live language (or VAI_LIVE_LANGUAGE, default: en)")
 
 	if err := fs.Parse(args); err != nil {
 		return chatConfig{}, err
 	}
 
 	cfg.TavilyAPIKey = strings.TrimSpace(getenv("TAVILY_API_KEY"))
-	cfg.CartesiaAPIKey = strings.TrimSpace(getenv("CARTESIA_API_KEY"))
-	cfg.ElevenLabsAPIKey = strings.TrimSpace(getenv("ELEVENLABS_API_KEY"))
-	cfg.LiveVoiceProvider = strings.ToLower(strings.TrimSpace(cfg.LiveVoiceProvider))
-	if cfg.LiveVoiceProvider == "" {
-		cfg.LiveVoiceProvider = "cartesia"
-	}
-	cfg.LiveLanguage = strings.TrimSpace(cfg.LiveLanguage)
-	if cfg.LiveLanguage == "" {
-		cfg.LiveLanguage = "en"
-	}
 	cfg.ProviderKeys = collectProviderKeys(getenv)
 
 	if err := validateChatConfig(cfg); err != nil {
@@ -298,7 +276,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 
 	fmt.Fprintf(out, "Proxy chatbot connected to %s using %s\n", cfg.BaseURL, cfg.Model)
 	fmt.Fprintln(out, "Tavily web tools enabled: vai_web_search, vai_web_fetch")
-	fmt.Fprintln(out, "Type /exit or /quit to stop. Use /model to view and /model:{provider}/{model} to switch. Use /live for voice mode.")
+	fmt.Fprintln(out, "Type /exit or /quit to stop. Use /model to view and /model:{provider}/{model} to switch.")
 
 	scanner := bufio.NewScanner(in)
 	state := chatRuntime{
@@ -323,15 +301,6 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 		case "/exit", "/quit":
 			fmt.Fprintln(out, "bye")
 			return nil
-		case "/live":
-			if err := runLiveModeFunc(ctx, scanner, client, cfg, &state, out, errOut); err != nil {
-				if errors.Is(err, errChatExitRequested) {
-					fmt.Fprintln(out, "bye")
-					return nil
-				}
-				fmt.Fprintf(errOut, "live mode error: %v\n", err)
-			}
-			continue
 		}
 
 		if handled, err := handleSlashCommand(line, &state, cfg, out, errOut); err != nil {

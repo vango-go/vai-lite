@@ -380,6 +380,7 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 	// Create streaming context
 	sc := NewStreamingContext()
 	contextID := generateContextID()
+	var finalSent atomic.Bool
 
 	// Build output format from options (WebSocket streaming currently requires raw PCM).
 	outputFormat := buildStreamingOutputFormat(opts.SampleRate)
@@ -427,6 +428,10 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 	sc.SendFunc = func(text string, isFinal bool) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+
+		if isFinal {
+			finalSent.Store(true)
+		}
 
 		req := baseReq
 		req.Transcript = text
@@ -491,7 +496,13 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 				}
 
 			case "done":
-				return
+				// Some Cartesia accounts/protocol versions may emit "done" as a boundary while
+				// the context remains open (continue=true). Only treat "done" as terminal once
+				// we've sent the final chunk (continue=false).
+				if finalSent.Load() {
+					return
+				}
+				continue
 
 			case "flush_done":
 				// Flush acknowledged, continue reading until "done" with all audio

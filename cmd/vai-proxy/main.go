@@ -94,18 +94,11 @@ func runProxy(ctx context.Context, logger *slog.Logger, deps proxyDeps) error {
 	}
 
 	gw.SetDraining()
-	gw.WarnLiveSessionsDraining()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
 	defer shutdownCancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown http server: %w", err)
-	}
-
-	waitCtx, waitCancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
-	defer waitCancel()
-	if !gw.WaitLiveSessions(waitCtx) {
-		gw.CancelLiveSessions()
 	}
 
 	if err := <-listenErrCh; err != nil {

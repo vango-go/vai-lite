@@ -40,6 +40,9 @@ type toolCallAccumulator struct {
 	ArgumentsJSON strings.Builder
 	announced     bool
 	blockIndex    int
+	outputDone    bool
+	argsDone      bool
+	stopEmitted   bool
 }
 
 // newEventStream creates a new event stream from an HTTP response body.
@@ -205,6 +208,67 @@ func (s *eventStream) handleStreamEvent(event *streamEvent) (types.StreamEvent, 
 			}, true
 		}
 
+	case eventFunctionCallArgumentsDone:
+		// Function call arguments completion.
+		//
+		// Some Responses API streams deliver the final tool-arguments payload in this event (as
+		// a full `arguments` string), and may emit output_item.done before it. We must not emit
+		// content_block_stop until we've incorporated this tail, or live talk_to_user streaming
+		// will truncate captions/TTS.
+		payload := event.Arguments
+		if payload == "" {
+			payload = event.Delta
+		}
+		if payload != "" {
+			idx := event.OutputIndex
+			acc, exists := s.accumulator.toolCalls[idx]
+			if !exists {
+				acc = &toolCallAccumulator{
+					blockIndex: s.getNextBlockIndex(),
+				}
+				s.accumulator.toolCalls[idx] = acc
+			}
+			acc.argsDone = true
+
+			prev := acc.ArgumentsJSON.String()
+			suffix := payload
+			if prev != "" {
+				switch {
+				case strings.HasPrefix(payload, prev):
+					suffix = payload[len(prev):]
+				case strings.HasPrefix(prev, payload):
+					suffix = ""
+				default:
+					// Diverged; replace accumulator with the canonical payload and emit it as a delta
+					// so downstream tool parsers can recover.
+					acc.ArgumentsJSON.Reset()
+				}
+			} else {
+				acc.ArgumentsJSON.Reset()
+			}
+			if suffix != "" {
+				acc.ArgumentsJSON.WriteString(suffix)
+				// If we can, emit the final delta immediately and queue a stop after it.
+				if acc.outputDone && !acc.stopEmitted {
+					acc.stopEmitted = true
+					s.pending = append(s.pending, types.ContentBlockStopEvent{Type: "content_block_stop", Index: acc.blockIndex})
+				}
+				return types.ContentBlockDeltaEvent{
+					Type:  "content_block_delta",
+					Index: acc.blockIndex,
+					Delta: types.InputJSONDelta{
+						Type:        "input_json_delta",
+						PartialJSON: suffix,
+					},
+				}, true
+			}
+			// No new tail. If output is already done, emit stop now.
+			if acc.outputDone && !acc.stopEmitted {
+				acc.stopEmitted = true
+				return types.ContentBlockStopEvent{Type: "content_block_stop", Index: acc.blockIndex}, true
+			}
+		}
+
 	case eventOutputTextDone:
 		// Text content finished - emit content_block_stop
 		if s.accumulator.textContent.Len() > 0 {
@@ -231,11 +295,24 @@ func (s *eventStream) handleStreamEvent(event *streamEvent) (types.StreamEvent, 
 		if s.accumulator.finishReason == "tool_calls" {
 			stopReason = types.StopReasonToolUse
 		}
-		// Queue message_stop for next call
-		s.pending = append(s.pending, types.MessageStopEvent{
-			Type: "message_stop",
-		})
-		return types.MessageDeltaEvent{
+
+		// If any function_call output items completed but never emitted a stop (for example,
+		// if function_call_arguments.done is absent), emit stops now before message_delta.
+		var finalEvents []types.StreamEvent
+		for _, acc := range s.accumulator.toolCalls {
+			if acc == nil {
+				continue
+			}
+			if acc.outputDone && !acc.stopEmitted {
+				acc.stopEmitted = true
+				finalEvents = append(finalEvents, types.ContentBlockStopEvent{
+					Type:  "content_block_stop",
+					Index: acc.blockIndex,
+				})
+			}
+		}
+
+		finalEvents = append(finalEvents, types.MessageDeltaEvent{
 			Type: "message_delta",
 			Delta: struct {
 				StopReason types.StopReason `json:"stop_reason,omitempty"`
@@ -247,7 +324,16 @@ func (s *eventStream) handleStreamEvent(event *streamEvent) (types.StreamEvent, 
 				OutputTokens: s.accumulator.outputTokens,
 				TotalTokens:  s.accumulator.inputTokens + s.accumulator.outputTokens,
 			},
-		}, true
+		})
+		finalEvents = append(finalEvents, types.MessageStopEvent{Type: "message_stop"})
+		if len(finalEvents) == 0 {
+			return nil, false
+		}
+		// Return first, queue the rest.
+		if len(finalEvents) > 1 {
+			s.pending = append(s.pending, finalEvents[1:]...)
+		}
+		return finalEvents[0], true
 
 	case eventResponseFailed:
 		// Response failed
@@ -306,12 +392,14 @@ func (s *eventStream) handleOutputItemDone(item *outputItem, index int) (types.S
 	case "function_call":
 		// Mark that we need tool use
 		s.accumulator.finishReason = "tool_calls"
-		// Emit content_block_stop for the tool
-		if acc, exists := s.accumulator.toolCalls[index]; exists {
-			return types.ContentBlockStopEvent{
-				Type:  "content_block_stop",
-				Index: acc.blockIndex,
-			}, true
+		// Note: do not emit content_block_stop here. The final tool args may arrive in
+		// response.function_call_arguments.done. We emit stop once args are done (or on response.completed).
+		if acc, exists := s.accumulator.toolCalls[index]; exists && acc != nil {
+			acc.outputDone = true
+			if acc.argsDone && !acc.stopEmitted {
+				acc.stopEmitted = true
+				return types.ContentBlockStopEvent{Type: "content_block_stop", Index: acc.blockIndex}, true
+			}
 		}
 	}
 
