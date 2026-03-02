@@ -447,30 +447,28 @@ func TestRunChatbot_CanonicalizesConfigForRuntimeState(t *testing.T) {
 	}
 }
 
-func TestBuildStreamCallbacks_PrintsToolStreamLinesAndText(t *testing.T) {
+func TestBuildStreamCallbacks_PrintsSingleLineToolStreamAndText(t *testing.T) {
 	t.Parallel()
 
 	var out bytes.Buffer
 	state := &streamPrintState{}
 	callbacks := buildStreamCallbacks(&out, state)
 
-	callbacks.OnToolUseStart(2, "", "")
-	callbacks.OnToolInputDelta(2, "", "", "{\n\"a\":1}")
-	callbacks.OnToolUseStop(2, "", "")
+	callbacks.OnToolUseStart(2, "", "vai_web_search")
+	callbacks.OnToolInputDelta(2, "", "", `{"query":"recent`)
+	callbacks.OnToolInputDelta(2, "", "", ` news"}`)
+	callbacks.OnToolUseStop(2, "", "vai_web_search")
 	callbacks.OnToolCallStart("call_1", "vai_web_search", nil)
 	callbacks.OnTextDelta("hello")
 
 	got := out.String()
-	if !strings.Contains(got, "[tool-stream:start] idx=2 name=- id=-") {
-		t.Fatalf("missing tool-stream start line, got=%q", got)
+	if strings.Contains(got, "[tool-stream:") {
+		t.Fatalf("unexpected legacy tool-stream marker output, got=%q", got)
 	}
-	if !strings.Contains(got, "[tool-stream:delta] idx=2 name=- id=- {\\n\"a\":1}") {
-		t.Fatalf("missing/sanitized tool-stream delta line, got=%q", got)
+	if !strings.Contains(got, "\nTool-vai_web_search: {\"query\":\"recent news\"}\n") {
+		t.Fatalf("missing single-line tool stream output, got=%q", got)
 	}
-	if !strings.Contains(got, "[tool-stream:stop] idx=2 name=- id=-") {
-		t.Fatalf("missing tool-stream stop line, got=%q", got)
-	}
-	if !strings.Contains(got, "[tool] vai_web_search") {
+	if !strings.Contains(got, "[tool] vai_web_search\n") {
 		t.Fatalf("missing execution tool line, got=%q", got)
 	}
 	if !strings.Contains(got, "hello") {
@@ -481,6 +479,73 @@ func TestBuildStreamCallbacks_PrintsToolStreamLinesAndText(t *testing.T) {
 	}
 	if state.text.String() != "hello" {
 		t.Fatalf("state.text=%q, want %q", state.text.String(), "hello")
+	}
+}
+
+func TestBuildStreamCallbacks_ToolStreamNewlineContinuationHasNoPrefix(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	state := &streamPrintState{}
+	callbacks := buildStreamCallbacks(&out, state)
+
+	callbacks.OnToolUseStart(1, "", "vai_web_search")
+	callbacks.OnToolInputDelta(1, "", "", "{\"query\":\"line1\nline2\"}")
+	callbacks.OnToolUseStop(1, "", "vai_web_search")
+
+	got := out.String()
+	if !strings.Contains(got, "\nTool-vai_web_search: {\"query\":\"line1\nline2\"}\n") {
+		t.Fatalf("unexpected newline continuation rendering, got=%q", got)
+	}
+	if strings.Contains(got, "\nTool-vai_web_search: line2") {
+		t.Fatalf("continuation line was incorrectly prefixed, got=%q", got)
+	}
+}
+
+func TestBuildStreamCallbacks_ToolStreamInterleavedIndicesStaySeparated(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	state := &streamPrintState{}
+	callbacks := buildStreamCallbacks(&out, state)
+
+	callbacks.OnToolUseStart(1, "", "tool_a")
+	callbacks.OnToolUseStart(2, "", "tool_b")
+	callbacks.OnToolInputDelta(1, "", "", `{"a":`)
+	callbacks.OnToolInputDelta(2, "", "", `{"b":`)
+	callbacks.OnToolInputDelta(1, "", "", `1}`)
+	callbacks.OnToolUseStop(1, "", "tool_a")
+	callbacks.OnToolUseStop(2, "", "tool_b")
+
+	got := out.String()
+	if strings.Count(got, "Tool-tool_a:") != 2 {
+		t.Fatalf("expected tool_a to open two segments due to interleaving, got=%q", got)
+	}
+	if strings.Count(got, "Tool-tool_b:") != 1 {
+		t.Fatalf("expected one tool_b segment, got=%q", got)
+	}
+	firstA := strings.Index(got, "Tool-tool_a:")
+	firstB := strings.Index(got, "Tool-tool_b:")
+	lastA := strings.LastIndex(got, "Tool-tool_a:")
+	if !(firstA >= 0 && firstB > firstA && lastA > firstB) {
+		t.Fatalf("tool stream interleaving order invalid, got=%q", got)
+	}
+}
+
+func TestBuildStreamCallbacks_TextDeltaStartsAfterToolLineTermination(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	state := &streamPrintState{}
+	callbacks := buildStreamCallbacks(&out, state)
+
+	callbacks.OnToolUseStart(3, "", "tool_x")
+	callbacks.OnToolInputDelta(3, "", "", "abc")
+	callbacks.OnTextDelta("hello")
+
+	got := out.String()
+	if !strings.Contains(got, "\nTool-tool_x: abc\nhello") {
+		t.Fatalf("assistant text did not start on a new line after tool stream, got=%q", got)
 	}
 }
 

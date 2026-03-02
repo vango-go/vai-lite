@@ -39,6 +39,17 @@ type chatConfig struct {
 type streamPrintState struct {
 	sawText bool
 	text    strings.Builder
+
+	toolMetaByIndex         map[int]toolMeta
+	toolLineStartedByIndex  map[int]bool
+	openToolLineIndex       int
+	openToolLineAtLineStart bool
+	toolStateInitialized    bool
+}
+
+type toolMeta struct {
+	id   string
+	name string
 }
 
 func parseChatConfig(args []string, getenv func(string) string) (chatConfig, error) {
@@ -390,23 +401,46 @@ func buildStreamCallbacks(out io.Writer, printState *streamPrintState) vai.Strea
 	if printState == nil {
 		printState = &streamPrintState{}
 	}
+	initToolStreamState(printState)
 	return vai.StreamCallbacks{
 		OnTextDelta: func(text string) {
+			closeOpenToolStreamLine(out, printState)
 			printState.sawText = true
 			printState.text.WriteString(text)
 			fmt.Fprint(out, text)
 		},
 		OnToolUseStart: func(index int, id, name string) {
-			fmt.Fprintf(out, "\n[tool-stream:start] idx=%d name=%s id=%s\n", index, dashIfEmpty(name), dashIfEmpty(id))
+			meta := printState.toolMetaByIndex[index]
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				meta.id = trimmed
+			}
+			if trimmed := strings.TrimSpace(name); trimmed != "" {
+				meta.name = trimmed
+			}
+			printState.toolMetaByIndex[index] = meta
 		},
 		OnToolInputDelta: func(index int, id, name, partialJSON string) {
-			fmt.Fprintf(out, "\n[tool-stream:delta] idx=%d name=%s id=%s %s\n", index, dashIfEmpty(name), dashIfEmpty(id), sanitizeToolDeltaForLine(partialJSON))
+			meta := printState.toolMetaByIndex[index]
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				meta.id = trimmed
+			}
+			if trimmed := strings.TrimSpace(name); trimmed != "" {
+				meta.name = trimmed
+			}
+			printState.toolMetaByIndex[index] = meta
+
+			streamToolInputDelta(out, printState, index, displayToolName(meta.name), partialJSON)
 		},
 		OnToolUseStop: func(index int, id, name string) {
-			fmt.Fprintf(out, "\n[tool-stream:stop] idx=%d name=%s id=%s\n", index, dashIfEmpty(name), dashIfEmpty(id))
+			if printState.openToolLineIndex == index {
+				closeOpenToolStreamLine(out, printState)
+			}
+			delete(printState.toolMetaByIndex, index)
+			delete(printState.toolLineStartedByIndex, index)
 		},
 		OnToolCallStart: func(id, name string, _ map[string]any) {
-			fmt.Fprintf(out, "\n[tool] %s\n", name)
+			closeOpenToolStreamLine(out, printState)
+			fmt.Fprintf(out, "[tool] %s\n", name)
 		},
 	}
 }
@@ -449,16 +483,62 @@ func syncHistoryFromRunResult(state *chatRuntime, result *vai.RunResult, assista
 	}
 }
 
-func dashIfEmpty(v string) string {
-	if strings.TrimSpace(v) == "" {
-		return "-"
+func initToolStreamState(state *streamPrintState) {
+	if state == nil {
+		return
 	}
-	return strings.TrimSpace(v)
+	if !state.toolStateInitialized {
+		state.openToolLineIndex = -1
+		state.toolStateInitialized = true
+	}
+	if state.toolMetaByIndex == nil {
+		state.toolMetaByIndex = make(map[int]toolMeta)
+	}
+	if state.toolLineStartedByIndex == nil {
+		state.toolLineStartedByIndex = make(map[int]bool)
+	}
 }
 
-func sanitizeToolDeltaForLine(partialJSON string) string {
-	out := strings.ReplaceAll(partialJSON, "\r", `\r`)
-	return strings.ReplaceAll(out, "\n", `\n`)
+func displayToolName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "unknown"
+	}
+	return trimmed
+}
+
+func streamToolInputDelta(out io.Writer, state *streamPrintState, index int, toolName, partialJSON string) {
+	if state.openToolLineIndex != index {
+		closeOpenToolStreamLine(out, state)
+		state.openToolLineIndex = index
+		state.openToolLineAtLineStart = false
+		state.toolLineStartedByIndex[index] = false
+	}
+	if !state.toolLineStartedByIndex[index] {
+		fmt.Fprintf(out, "\nTool-%s: ", toolName)
+		state.toolLineStartedByIndex[index] = true
+	}
+	if partialJSON == "" {
+		return
+	}
+
+	fmt.Fprint(out, partialJSON)
+	state.openToolLineAtLineStart = partialJSON[len(partialJSON)-1] == '\n'
+}
+
+func closeOpenToolStreamLine(out io.Writer, state *streamPrintState) {
+	if state == nil || state.openToolLineIndex < 0 {
+		return
+	}
+	index := state.openToolLineIndex
+	if state.toolLineStartedByIndex[index] {
+		if !state.openToolLineAtLineStart {
+			fmt.Fprintln(out)
+		}
+		state.toolLineStartedByIndex[index] = false
+	}
+	state.openToolLineIndex = -1
+	state.openToolLineAtLineStart = false
 }
 
 func main() {
