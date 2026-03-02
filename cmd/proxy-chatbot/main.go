@@ -14,7 +14,6 @@ import (
 
 	"github.com/vango-go/vai-lite/internal/dotenv"
 	"github.com/vango-go/vai-lite/pkg/core"
-	"github.com/vango-go/vai-lite/pkg/core/types"
 	vai "github.com/vango-go/vai-lite/sdk"
 	"github.com/vango-go/vai-lite/sdk/adapters/tavily"
 )
@@ -344,7 +343,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 
 		req := &vai.MessageRequest{
 			Model:     state.currentModel,
-			Messages:  sanitizeMessagesForRequest(state.history),
+			Messages:  state.history,
 			MaxTokens: cfg.MaxTokens,
 		}
 		if cfg.SystemPrompt != "" {
@@ -431,11 +430,11 @@ func syncHistoryFromRunResult(state *chatRuntime, result *vai.RunResult, assista
 		return
 	}
 	if result != nil && len(result.Messages) > 0 {
-		state.history = sanitizeMessagesForRequest(result.Messages)
+		state.history = append([]vai.Message(nil), result.Messages...)
 		return
 	}
 	if result != nil && result.Response != nil && len(result.Response.Content) > 0 {
-		contentCopy := sanitizeContentBlocksForInput(result.Response.Content)
+		contentCopy := append([]vai.ContentBlock(nil), result.Response.Content...)
 		state.history = append(state.history, vai.Message{
 			Role:    "assistant",
 			Content: contentCopy,
@@ -460,96 +459,6 @@ func dashIfEmpty(v string) string {
 func sanitizeToolDeltaForLine(partialJSON string) string {
 	out := strings.ReplaceAll(partialJSON, "\r", `\r`)
 	return strings.ReplaceAll(out, "\n", `\n`)
-}
-
-func sanitizeMessagesForRequest(messages []vai.Message) []vai.Message {
-	if len(messages) == 0 {
-		return nil
-	}
-	out := make([]vai.Message, 0, len(messages))
-	for _, msg := range messages {
-		switch content := msg.Content.(type) {
-		case string:
-			out = append(out, vai.Message{Role: msg.Role, Content: content})
-		default:
-			blocks := sanitizeContentBlocksForInput(msg.ContentBlocks())
-			out = append(out, vai.Message{Role: msg.Role, Content: blocks})
-		}
-	}
-	return out
-}
-
-func sanitizeContentBlocksForInput(blocks []vai.ContentBlock) []vai.ContentBlock {
-	if len(blocks) == 0 {
-		return nil
-	}
-	out := make([]vai.ContentBlock, 0, len(blocks))
-	for _, block := range blocks {
-		if block == nil {
-			continue
-		}
-		switch b := block.(type) {
-		case types.TextBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "text"
-			}
-			out = append(out, b)
-		case types.ImageBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "image"
-			}
-			out = append(out, b)
-		case types.AudioBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "audio"
-			}
-			out = append(out, b)
-		case types.VideoBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "video"
-			}
-			out = append(out, b)
-		case types.DocumentBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "document"
-			}
-			out = append(out, b)
-		case types.ToolUseBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "tool_use"
-			}
-			out = append(out, b)
-		case types.ThinkingBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "thinking"
-			}
-			out = append(out, b)
-		case types.ServerToolUseBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "server_tool_use"
-			}
-			out = append(out, b)
-		case types.WebSearchToolResultBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "web_search_tool_result"
-			}
-			out = append(out, b)
-		case types.ToolResultBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				b.Type = "tool_result"
-			}
-			b.Content = sanitizeContentBlocksForInput(b.Content)
-			out = append(out, b)
-		case types.UnknownContentBlock:
-			if strings.TrimSpace(b.Type) == "" {
-				continue
-			}
-			out = append(out, b)
-		default:
-			out = append(out, block)
-		}
-	}
-	return out
 }
 
 func main() {

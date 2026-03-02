@@ -540,8 +540,7 @@ func TestSyncHistoryFromRunResult_UsesResultMessages(t *testing.T) {
 	result := &vai.RunResult{
 		Messages: []types.Message{
 			{Role: "user", Content: []types.ContentBlock{
-				nil,
-				types.TextBlock{Text: "new-user"},
+				types.TextBlock{Type: "text", Text: "new-user"},
 			}},
 			{Role: "assistant", Content: vai.Text("new-assistant")},
 		},
@@ -555,13 +554,6 @@ func TestSyncHistoryFromRunResult_UsesResultMessages(t *testing.T) {
 	if state.history[0].TextContent() != "new-user" || state.history[1].TextContent() != "new-assistant" {
 		t.Fatalf("history content unexpected: %#v", state.history)
 	}
-	firstBlocks := state.history[0].ContentBlocks()
-	if len(firstBlocks) != 1 {
-		t.Fatalf("sanitized first message blocks len=%d, want 1", len(firstBlocks))
-	}
-	if tb, ok := firstBlocks[0].(types.TextBlock); !ok || tb.Type != "text" || tb.Text != "new-user" {
-		t.Fatalf("sanitized first block=%#v, want TextBlock{Type:text,Text:new-user}", firstBlocks[0])
-	}
 
 	result.Messages[0] = types.Message{Role: "assistant", Content: vai.Text("mutated")}
 	if state.history[0].TextContent() != "new-user" {
@@ -569,27 +561,7 @@ func TestSyncHistoryFromRunResult_UsesResultMessages(t *testing.T) {
 	}
 }
 
-func TestSanitizeContentBlocksForInput_DropsUnknownEmptyTypeAndNil(t *testing.T) {
-	t.Parallel()
-
-	blocks := sanitizeContentBlocksForInput([]vai.ContentBlock{
-		nil,
-		types.UnknownContentBlock{Type: ""},
-		types.TextBlock{Type: "", Text: "ok"},
-	})
-	if len(blocks) != 1 {
-		t.Fatalf("len(blocks)=%d, want 1", len(blocks))
-	}
-	tb, ok := blocks[0].(types.TextBlock)
-	if !ok {
-		t.Fatalf("blocks[0]=%T, want TextBlock", blocks[0])
-	}
-	if tb.Type != "text" || tb.Text != "ok" {
-		t.Fatalf("TextBlock=%#v, want Type=text Text=ok", tb)
-	}
-}
-
-func TestSyncHistoryFromRunResult_FallbackUsesFullResponseContent(t *testing.T) {
+func TestSyncHistoryFromRunResult_FallbackCopiesResponseContentSlice(t *testing.T) {
 	t.Parallel()
 
 	state := &chatRuntime{
@@ -597,37 +569,33 @@ func TestSyncHistoryFromRunResult_FallbackUsesFullResponseContent(t *testing.T) 
 			{Role: "user", Content: vai.Text("u1")},
 		},
 	}
+	orig := []types.ContentBlock{
+		types.TextBlock{Type: "text", Text: "x"},
+	}
 	result := &vai.RunResult{
 		Response: &vai.Response{
 			MessageResponse: &types.MessageResponse{
-				Type: "message",
-				Role: "assistant",
-				Content: []types.ContentBlock{
-					types.ToolUseBlock{
-						Type:  "tool_use",
-						ID:    "call_1",
-						Name:  "talk_to_user",
-						Input: map[string]any{"message": "hi"},
-					},
-				},
+				Type:    "message",
+				Role:    "assistant",
+				Content: orig,
 			},
 		},
 	}
-
-	syncHistoryFromRunResult(state, result, "fallback text")
-
+	syncHistoryFromRunResult(state, result, "")
 	if len(state.history) != 2 {
 		t.Fatalf("history len=%d, want 2", len(state.history))
 	}
-	if state.history[1].Role != "assistant" {
-		t.Fatalf("history[1].Role=%q, want assistant", state.history[1].Role)
+	cloned, ok := state.history[1].Content.([]types.ContentBlock)
+	if !ok {
+		t.Fatalf("history[1].Content type=%T, want []types.ContentBlock", state.history[1].Content)
 	}
-	blocks := state.history[1].ContentBlocks()
-	if len(blocks) != 1 {
-		t.Fatalf("history[1].ContentBlocks len=%d, want 1", len(blocks))
+	if len(cloned) != 1 {
+		t.Fatalf("len(content)=%d, want 1", len(cloned))
 	}
-	if _, ok := blocks[0].(types.ToolUseBlock); !ok {
-		t.Fatalf("history[1].ContentBlocks[0]=%T, want ToolUseBlock", blocks[0])
+	orig[0] = types.TextBlock{Type: "text", Text: "mutated"}
+	tb, ok := cloned[0].(types.TextBlock)
+	if !ok || tb.Text != "x" {
+		t.Fatalf("content aliasing detected, got %#v", cloned[0])
 	}
 }
 
