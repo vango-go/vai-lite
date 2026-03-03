@@ -163,9 +163,9 @@ Notes:
   - `CEREBRAS_API_KEY`
   - `OPENROUTER_API_KEY`
   - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
-- `TAVILY_API_KEY` is required; the chatbot enables VAI-native `vai_web_search` and `vai_web_fetch` tools via Tavily.
+- `TAVILY_API_KEY` is required; the chatbot enables gateway-native `vai_web_search` and `vai_web_fetch` tools via Tavily.
 - Text mode uses `Messages.RunStream()` (client-side loop), not `Runs.Stream()`.
-- Text mode web tools are client-side function tools executed by the SDK loop, so they work across model providers and after `/model` switches.
+- Text mode web tools are gateway-native function tools invoked by the SDK loop and executed by the gateway (`/v1/server-tools:execute`), so they work across model providers and after `/model` switches.
 - The default model is `oai-resp/gpt-5-mini` so `gpt-5-mini` routes through the OpenAI Responses provider.
 - Live mode (`/live`) requirements:
   - `CARTESIA_API_KEY` (required for Live STT)

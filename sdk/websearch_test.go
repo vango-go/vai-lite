@@ -40,7 +40,7 @@ func (m *mockFetchProvider) Fetch(ctx context.Context, url string, opts WebFetch
 	return m.result, m.err
 }
 
-func TestVAIWebSearch_BasicUsage(t *testing.T) {
+func TestLocalVAIWebSearch_BasicUsage(t *testing.T) {
 	provider := &mockSearchProvider{
 		results: []WebSearchHit{
 			{Title: "Go Programming", URL: "https://golang.org", Snippet: "The Go programming language"},
@@ -48,7 +48,7 @@ func TestVAIWebSearch_BasicUsage(t *testing.T) {
 		},
 	}
 
-	tool := VAIWebSearch(provider)
+	tool := LocalVAIWebSearch(provider)
 
 	// Verify tool type and name
 	if tool.Tool.Type != types.ToolTypeFunction {
@@ -86,9 +86,9 @@ func TestVAIWebSearch_BasicUsage(t *testing.T) {
 	}
 }
 
-func TestVAIWebSearch_EmptyQuery(t *testing.T) {
+func TestLocalVAIWebSearch_EmptyQuery(t *testing.T) {
 	provider := &mockSearchProvider{}
-	tool := VAIWebSearch(provider)
+	tool := LocalVAIWebSearch(provider)
 
 	input := `{"query": ""}`
 	result, err := tool.Handler(context.Background(), json.RawMessage(input))
@@ -105,11 +105,11 @@ func TestVAIWebSearch_EmptyQuery(t *testing.T) {
 	}
 }
 
-func TestVAIWebSearch_NoResults(t *testing.T) {
+func TestLocalVAIWebSearch_NoResults(t *testing.T) {
 	provider := &mockSearchProvider{
 		results: []WebSearchHit{},
 	}
-	tool := VAIWebSearch(provider)
+	tool := LocalVAIWebSearch(provider)
 
 	input := `{"query": "very obscure query"}`
 	result, err := tool.Handler(context.Background(), json.RawMessage(input))
@@ -126,12 +126,12 @@ func TestVAIWebSearch_NoResults(t *testing.T) {
 	}
 }
 
-func TestVAIWebSearch_CustomConfig(t *testing.T) {
+func TestLocalVAIWebSearch_CustomConfig(t *testing.T) {
 	provider := &mockSearchProvider{
 		results: []WebSearchHit{{Title: "Test", URL: "https://test.com", Snippet: "Test result"}},
 	}
 
-	tool := VAIWebSearch(provider, VAIWebSearchConfig{
+	tool := LocalVAIWebSearch(provider, LocalVAIWebSearchConfig{
 		ToolName:        "custom_search",
 		ToolDescription: "Custom search description",
 		MaxResults:      10,
@@ -165,11 +165,11 @@ func TestVAIWebSearch_CustomConfig(t *testing.T) {
 	}
 }
 
-func TestVAIWebSearch_ProviderError(t *testing.T) {
+func TestLocalVAIWebSearch_ProviderError(t *testing.T) {
 	provider := &mockSearchProvider{
 		err: context.DeadlineExceeded,
 	}
-	tool := VAIWebSearch(provider)
+	tool := LocalVAIWebSearch(provider)
 
 	input := `{"query": "test"}`
 	result, err := tool.Handler(context.Background(), json.RawMessage(input))
@@ -186,9 +186,9 @@ func TestVAIWebSearch_ProviderError(t *testing.T) {
 	}
 }
 
-func TestVAIWebSearch_InvalidJSON(t *testing.T) {
+func TestLocalVAIWebSearch_InvalidJSON(t *testing.T) {
 	provider := &mockSearchProvider{}
-	tool := VAIWebSearch(provider)
+	tool := LocalVAIWebSearch(provider)
 
 	input := `{invalid json}`
 	_, err := tool.Handler(context.Background(), json.RawMessage(input))
@@ -197,7 +197,7 @@ func TestVAIWebSearch_InvalidJSON(t *testing.T) {
 	}
 }
 
-func TestVAIWebFetch_BasicUsage(t *testing.T) {
+func TestLocalVAIWebFetch_BasicUsage(t *testing.T) {
 	provider := &mockFetchProvider{
 		result: &WebFetchResult{
 			URL:     "https://example.com/article",
@@ -206,7 +206,7 @@ func TestVAIWebFetch_BasicUsage(t *testing.T) {
 		},
 	}
 
-	tool := VAIWebFetch(provider)
+	tool := LocalVAIWebFetch(provider)
 
 	// Verify tool type and name
 	if tool.Tool.Type != types.ToolTypeFunction {
@@ -247,9 +247,9 @@ func TestVAIWebFetch_BasicUsage(t *testing.T) {
 	}
 }
 
-func TestVAIWebFetch_EmptyURL(t *testing.T) {
+func TestLocalVAIWebFetch_EmptyURL(t *testing.T) {
 	provider := &mockFetchProvider{}
-	tool := VAIWebFetch(provider)
+	tool := LocalVAIWebFetch(provider)
 
 	input := `{"url": ""}`
 	result, err := tool.Handler(context.Background(), json.RawMessage(input))
@@ -266,7 +266,7 @@ func TestVAIWebFetch_EmptyURL(t *testing.T) {
 	}
 }
 
-func TestVAIWebFetch_CustomConfig(t *testing.T) {
+func TestLocalVAIWebFetch_CustomConfig(t *testing.T) {
 	provider := &mockFetchProvider{
 		result: &WebFetchResult{
 			URL:     "https://example.com",
@@ -274,7 +274,7 @@ func TestVAIWebFetch_CustomConfig(t *testing.T) {
 		},
 	}
 
-	tool := VAIWebFetch(provider, VAIWebFetchConfig{
+	tool := LocalVAIWebFetch(provider, LocalVAIWebFetchConfig{
 		ToolName:        "custom_fetch",
 		ToolDescription: "Custom fetch description",
 		Format:          "text",
@@ -297,11 +297,11 @@ func TestVAIWebFetch_CustomConfig(t *testing.T) {
 	}
 }
 
-func TestVAIWebFetch_ProviderError(t *testing.T) {
+func TestLocalVAIWebFetch_ProviderError(t *testing.T) {
 	provider := &mockFetchProvider{
 		err: context.DeadlineExceeded,
 	}
-	tool := VAIWebFetch(provider)
+	tool := LocalVAIWebFetch(provider)
 
 	input := `{"url": "https://example.com"}`
 	result, err := tool.Handler(context.Background(), json.RawMessage(input))
@@ -346,9 +346,9 @@ func TestWebFetch_NativeTool(t *testing.T) {
 	}
 }
 
-func TestVAIWebSearch_SchemaGeneration(t *testing.T) {
+func TestLocalVAIWebSearch_SchemaGeneration(t *testing.T) {
 	provider := &mockSearchProvider{}
-	tool := VAIWebSearch(provider)
+	tool := LocalVAIWebSearch(provider)
 
 	if tool.Tool.InputSchema == nil {
 		t.Fatal("expected InputSchema to be non-nil")
@@ -362,9 +362,9 @@ func TestVAIWebSearch_SchemaGeneration(t *testing.T) {
 	}
 }
 
-func TestVAIWebFetch_SchemaGeneration(t *testing.T) {
+func TestLocalVAIWebFetch_SchemaGeneration(t *testing.T) {
 	provider := &mockFetchProvider{}
-	tool := VAIWebFetch(provider)
+	tool := LocalVAIWebFetch(provider)
 
 	if tool.Tool.InputSchema == nil {
 		t.Fatal("expected InputSchema to be non-nil")

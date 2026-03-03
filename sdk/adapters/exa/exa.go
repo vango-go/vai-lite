@@ -7,11 +7,11 @@
 //
 //	import "github.com/vango-go/vai-lite/sdk/adapters/exa"
 //
-//	// Web search
-//	search := vai.VAIWebSearch(exa.NewSearch(os.Getenv("EXA_API_KEY")))
+//	// Local web search
+//	search := vai.LocalVAIWebSearch(exa.NewSearch(os.Getenv("EXA_API_KEY")))
 //
-//	// Web fetch (content retrieval)
-//	fetch := vai.VAIWebFetch(exa.NewContents(os.Getenv("EXA_API_KEY")))
+//	// Local web fetch (content retrieval)
+//	fetch := vai.LocalVAIWebFetch(exa.NewContents(os.Getenv("EXA_API_KEY")))
 package exa
 
 import (

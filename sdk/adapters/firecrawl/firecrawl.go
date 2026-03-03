@@ -8,7 +8,7 @@
 //
 //	import "github.com/vango-go/vai-lite/sdk/adapters/firecrawl"
 //
-//	fetch := vai.VAIWebFetch(firecrawl.NewScrape(os.Getenv("FIRECRAWL_API_KEY")))
+//	fetch := vai.LocalVAIWebFetch(firecrawl.NewScrape(os.Getenv("FIRECRAWL_API_KEY")))
 package firecrawl
 
 import (

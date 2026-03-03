@@ -7,13 +7,160 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/vango-go/vai-lite/pkg/core"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
-// --- VAI-Native Web Search ---
+// VAIProvider selects the backend provider for gateway-native VAI tools.
+type VAIProvider string
+
+const (
+	Tavily    VAIProvider = "tavily"
+	Exa       VAIProvider = "exa"
+	Firecrawl VAIProvider = "firecrawl"
+)
+
+const (
+	vaiWebSearchToolName = "vai_web_search"
+	vaiWebFetchToolName  = "vai_web_fetch"
+)
+
+// --- Gateway-Native VAI Web Search / Fetch ---
+
+type gatewaySearchInput struct {
+	Query      string `json:"query" desc:"The search query to execute"`
+	MaxResults int    `json:"max_results,omitempty" desc:"Optional maximum number of results"`
+}
+
+type gatewayFetchInput struct {
+	URL string `json:"url" desc:"The URL of the web page to fetch"`
+}
+
+// VAIWebSearch creates a gateway-native web search function tool.
+//
+// This tool executes via the VAI gateway (/v1/server-tools:execute), not locally.
+// Requires proxy mode (`WithBaseURL(...)`) and a provider key configured via
+// `WithProviderKey("tavily", ...)` or `WithProviderKey("exa", ...)`.
+func VAIWebSearch(provider VAIProvider) ToolWithHandler {
+	providerName := normalizeVAIProvider(provider)
+
+	return ToolWithHandler{
+		Tool: types.Tool{
+			Type:        types.ToolTypeFunction,
+			Name:        vaiWebSearchToolName,
+			Description: "Search the web for current information. Returns normalized search results from the configured provider.",
+			InputSchema: GenerateJSONSchema(reflect.TypeOf(gatewaySearchInput{})),
+		},
+		Handler: func(ctx context.Context, rawInput json.RawMessage) (any, error) {
+			if err := validateGatewaySearchProvider(providerName); err != nil {
+				return nil, err
+			}
+			input, err := decodeToolInputObject(rawInput)
+			if err != nil {
+				return nil, err
+			}
+			client := toolExecutionClientFromContext(ctx)
+			if client == nil {
+				return nil, core.NewInvalidRequestError("gateway-native VAI tools require Messages.Run or Messages.RunStream")
+			}
+			return client.executeGatewayServerTool(ctx, vaiWebSearchToolName, providerName, input)
+		},
+	}
+}
+
+// VAIWebFetch creates a gateway-native web fetch function tool.
+//
+// This tool executes via the VAI gateway (/v1/server-tools:execute), not locally.
+// Requires proxy mode (`WithBaseURL(...)`) and a provider key configured via
+// `WithProviderKey("tavily", ...)` or `WithProviderKey("firecrawl", ...)`.
+func VAIWebFetch(provider VAIProvider) ToolWithHandler {
+	providerName := normalizeVAIProvider(provider)
+
+	return ToolWithHandler{
+		Tool: types.Tool{
+			Type:        types.ToolTypeFunction,
+			Name:        vaiWebFetchToolName,
+			Description: "Fetch and extract the content of a web page given its URL. Returns normalized content from the configured provider.",
+			InputSchema: GenerateJSONSchema(reflect.TypeOf(gatewayFetchInput{})),
+		},
+		Handler: func(ctx context.Context, rawInput json.RawMessage) (any, error) {
+			if err := validateGatewayFetchProvider(providerName); err != nil {
+				return nil, err
+			}
+			input, err := decodeToolInputObject(rawInput)
+			if err != nil {
+				return nil, err
+			}
+			client := toolExecutionClientFromContext(ctx)
+			if client == nil {
+				return nil, core.NewInvalidRequestError("gateway-native VAI tools require Messages.Run or Messages.RunStream")
+			}
+			return client.executeGatewayServerTool(ctx, vaiWebFetchToolName, providerName, input)
+		},
+	}
+}
+
+func normalizeVAIProvider(provider VAIProvider) string {
+	return strings.ToLower(strings.TrimSpace(string(provider)))
+}
+
+func validateGatewaySearchProvider(provider string) error {
+	switch provider {
+	case string(Tavily), string(Exa):
+		return nil
+	case "":
+		return &core.Error{
+			Type:    core.ErrInvalidRequest,
+			Message: "provider is required",
+			Param:   "provider",
+			Code:    "tool_provider_missing",
+		}
+	default:
+		return &core.Error{
+			Type:    core.ErrInvalidRequest,
+			Message: fmt.Sprintf("unsupported web search provider %q", provider),
+			Param:   "provider",
+			Code:    "unsupported_tool_provider",
+		}
+	}
+}
+
+func validateGatewayFetchProvider(provider string) error {
+	switch provider {
+	case string(Tavily), string(Firecrawl):
+		return nil
+	case "":
+		return &core.Error{
+			Type:    core.ErrInvalidRequest,
+			Message: "provider is required",
+			Param:   "provider",
+			Code:    "tool_provider_missing",
+		}
+	default:
+		return &core.Error{
+			Type:    core.ErrInvalidRequest,
+			Message: fmt.Sprintf("unsupported web fetch provider %q", provider),
+			Param:   "provider",
+			Code:    "unsupported_tool_provider",
+		}
+	}
+}
+
+func decodeToolInputObject(rawInput json.RawMessage) (map[string]any, error) {
+	var input map[string]any
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return nil, core.NewInvalidRequestErrorWithParam("tool input must be a valid JSON object", "input")
+	}
+	if input == nil {
+		return nil, core.NewInvalidRequestErrorWithParam("tool input must be a JSON object", "input")
+	}
+	return input, nil
+}
+
+// --- Local VAI-Native Web Search / Fetch ---
 
 // WebSearchProvider performs web searches via a third-party API.
-// Implement this interface to create a custom search backend for VAIWebSearch.
+// Implement this interface to create a custom backend for LocalVAIWebSearch.
 type WebSearchProvider interface {
 	// Search performs a web search and returns results.
 	Search(ctx context.Context, query string, opts WebSearchOpts) ([]WebSearchHit, error)
@@ -35,8 +182,8 @@ type WebSearchHit struct {
 	Content string `json:"content,omitempty"` // Optional full content
 }
 
-// VAIWebSearchConfig configures the VAI-native web search tool.
-type VAIWebSearchConfig struct {
+// LocalVAIWebSearchConfig configures the local VAI web search tool.
+type LocalVAIWebSearchConfig struct {
 	// ToolName overrides the default function tool name ("vai_web_search").
 	ToolName string
 
@@ -53,30 +200,19 @@ type VAIWebSearchConfig struct {
 	BlockedDomains []string
 }
 
-// vaiSearchInput is the input schema for the VAI web search tool.
-type vaiSearchInput struct {
+// localSearchInput is the input schema for the local VAI web search tool.
+type localSearchInput struct {
 	Query string `json:"query" desc:"The search query to execute"`
 }
 
-// VAIWebSearch creates a VAI-native web search function tool backed by the given provider.
-//
-// Unlike vai.WebSearch() which relies on the LLM provider's native search capability,
-// VAIWebSearch creates a function tool that VAI executes locally using the specified
-// third-party search provider (e.g., Tavily, Exa, Brave).
-//
-// This works with ANY LLM provider, including those without native web search support.
-//
-// Example:
-//
-//	search := vai.VAIWebSearch(tavily.NewSearch(apiKey))
-//	result, err := client.Messages.Run(ctx, req, vai.WithTools(search))
-func VAIWebSearch(provider WebSearchProvider, configs ...VAIWebSearchConfig) ToolWithHandler {
-	var cfg VAIWebSearchConfig
+// LocalVAIWebSearch creates a local VAI web search function tool backed by the given provider.
+func LocalVAIWebSearch(provider WebSearchProvider, configs ...LocalVAIWebSearchConfig) ToolWithHandler {
+	var cfg LocalVAIWebSearchConfig
 	if len(configs) > 0 {
 		cfg = configs[0]
 	}
 
-	name := "vai_web_search"
+	name := vaiWebSearchToolName
 	if cfg.ToolName != "" {
 		name = cfg.ToolName
 	}
@@ -90,10 +226,10 @@ func VAIWebSearch(provider WebSearchProvider, configs ...VAIWebSearchConfig) Too
 		maxResults = cfg.MaxResults
 	}
 
-	schema := GenerateJSONSchema(reflect.TypeOf(vaiSearchInput{}))
+	schema := GenerateJSONSchema(reflect.TypeOf(localSearchInput{}))
 
 	handler := func(ctx context.Context, rawInput json.RawMessage) (any, error) {
-		var input vaiSearchInput
+		var input localSearchInput
 		if err := json.Unmarshal(rawInput, &input); err != nil {
 			return nil, fmt.Errorf("invalid input: %w", err)
 		}
@@ -117,7 +253,7 @@ func VAIWebSearch(provider WebSearchProvider, configs ...VAIWebSearchConfig) Too
 			return "No results found.", nil
 		}
 
-		// Format results for the model
+		// Format results for the model.
 		var sb strings.Builder
 		for i, r := range results {
 			fmt.Fprintf(&sb, "[%d] %s\n", i+1, r.Title)
@@ -145,10 +281,8 @@ func VAIWebSearch(provider WebSearchProvider, configs ...VAIWebSearchConfig) Too
 	}
 }
 
-// --- VAI-Native Web Fetch ---
-
 // WebFetchProvider fetches and extracts content from URLs via a third-party API.
-// Implement this interface to create a custom fetch backend for VAIWebFetch.
+// Implement this interface to create a custom backend for LocalVAIWebFetch.
 type WebFetchProvider interface {
 	// Fetch retrieves and extracts content from the given URL.
 	Fetch(ctx context.Context, url string, opts WebFetchOpts) (*WebFetchResult, error)
@@ -166,8 +300,8 @@ type WebFetchResult struct {
 	Content string `json:"content"` // Extracted content (markdown or text)
 }
 
-// VAIWebFetchConfig configures the VAI-native web fetch tool.
-type VAIWebFetchConfig struct {
+// LocalVAIWebFetchConfig configures the local VAI web fetch tool.
+type LocalVAIWebFetchConfig struct {
 	// ToolName overrides the default function tool name ("vai_web_fetch").
 	ToolName string
 
@@ -178,30 +312,19 @@ type VAIWebFetchConfig struct {
 	Format string
 }
 
-// vaiFetchInput is the input schema for the VAI web fetch tool.
-type vaiFetchInput struct {
+// localFetchInput is the input schema for the local VAI web fetch tool.
+type localFetchInput struct {
 	URL string `json:"url" desc:"The URL of the web page to fetch"`
 }
 
-// VAIWebFetch creates a VAI-native web fetch function tool backed by the given provider.
-//
-// Unlike vai.WebFetch() which relies on the LLM provider's native fetch capability
-// (currently only Anthropic), VAIWebFetch creates a function tool that VAI executes
-// locally using the specified third-party provider (e.g., Firecrawl, Tavily Extract).
-//
-// This works with ANY LLM provider.
-//
-// Example:
-//
-//	fetch := vai.VAIWebFetch(firecrawl.NewFetch(apiKey))
-//	result, err := client.Messages.Run(ctx, req, vai.WithTools(fetch))
-func VAIWebFetch(provider WebFetchProvider, configs ...VAIWebFetchConfig) ToolWithHandler {
-	var cfg VAIWebFetchConfig
+// LocalVAIWebFetch creates a local VAI web fetch function tool backed by the given provider.
+func LocalVAIWebFetch(provider WebFetchProvider, configs ...LocalVAIWebFetchConfig) ToolWithHandler {
+	var cfg LocalVAIWebFetchConfig
 	if len(configs) > 0 {
 		cfg = configs[0]
 	}
 
-	name := "vai_web_fetch"
+	name := vaiWebFetchToolName
 	if cfg.ToolName != "" {
 		name = cfg.ToolName
 	}
@@ -215,10 +338,10 @@ func VAIWebFetch(provider WebFetchProvider, configs ...VAIWebFetchConfig) ToolWi
 		format = cfg.Format
 	}
 
-	schema := GenerateJSONSchema(reflect.TypeOf(vaiFetchInput{}))
+	schema := GenerateJSONSchema(reflect.TypeOf(localFetchInput{}))
 
 	handler := func(ctx context.Context, rawInput json.RawMessage) (any, error) {
-		var input vaiFetchInput
+		var input localFetchInput
 		if err := json.Unmarshal(rawInput, &input); err != nil {
 			return nil, fmt.Errorf("invalid input: %w", err)
 		}
@@ -227,16 +350,13 @@ func VAIWebFetch(provider WebFetchProvider, configs ...VAIWebFetchConfig) ToolWi
 			return "Error: url is required", nil
 		}
 
-		opts := WebFetchOpts{
-			Format: format,
-		}
-
+		opts := WebFetchOpts{Format: format}
 		result, err := provider.Fetch(ctx, input.URL, opts)
 		if err != nil {
 			return fmt.Sprintf("Fetch error: %v", err), nil
 		}
 
-		// Format result for the model
+		// Format result for the model.
 		var sb strings.Builder
 		if result.Title != "" {
 			fmt.Fprintf(&sb, "# %s\n\n", result.Title)

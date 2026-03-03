@@ -426,7 +426,7 @@ func (p *Provider) translateTools(tools []types.Tool) []geminiTool {
 
 		case types.ToolTypeWebFetch:
 			// Gemini doesn't support web fetch - skip
-			// Users should use VAIWebFetch() instead
+			// Users should use VAIWebFetch(...) or LocalVAIWebFetch(...) instead
 			continue
 
 		case types.ToolTypeComputerUse:

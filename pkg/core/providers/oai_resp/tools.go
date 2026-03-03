@@ -98,7 +98,7 @@ func (p *Provider) translateTools(tools []types.Tool) []responsesTool {
 
 		case types.ToolTypeWebFetch:
 			// Web fetch is not supported in OpenAI Responses API — skip
-			// Users should use VAIWebFetch() instead
+			// Users should use VAIWebFetch(...) or LocalVAIWebFetch(...) instead
 			continue
 
 		case types.ToolTypeTextEditor:

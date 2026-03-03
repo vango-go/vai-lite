@@ -97,12 +97,16 @@ Key directories you’ll touch:
   - `sdk/tools.go` — tool builders (`MakeTool`, `ToolSet`, native tool constructors)
   - `sdk/stream.go` — stream wrapper that accumulates final responses
   - `sdk/stream_helpers.go` — helper callbacks + extractor utilities for RunStream events
+  - `sdk/tool_arg_decoder.go` — incremental decoder for streamed `input_json_delta` string fields (`content` / `message` / `text`)
+  - `sdk/errors.go` — SDK error aliases, `TransportError`, and `FormatError(err)` rich rendering
   - `sdk/content.go` — content-block constructors (text/image/video/document/tool_result)
   - `sdk/schema.go` — schema generation helpers for function tools / structured output
 - `pkg/core/` — shared core types + providers (SDK uses these directly)
   - `pkg/core/engine.go` — provider registry + `provider/model` routing
   - `pkg/core/types/*` — canonical API types (requests, responses, blocks, tools, streaming events)
   - `pkg/core/providers/*` — provider implementations (anthropic/openai/gemini/groq/etc.)
+  - `pkg/core/sseframe/parser.go` — shared SSE frame parser used by streaming providers
+  - `pkg/core/errorfmt/format.go` — shared rich error formatter used by SDK + CLIs
 
 ---
 
@@ -509,10 +513,16 @@ When the model requests tools (via `tool_use` blocks), the SDK:
    - other types → JSON-marshaled into a `text` block
 6. Injects a `tool_result` block back into the conversation.
 
-For `RunStream` specifically, `ToolCallStartEvent` is emitted when local SDK tool execution begins (once per tool call) and includes the complete parsed input.
+For `RunStream` specifically:
 
-If you need earliest provider-side tool detection, inspect wrapped provider events (`StreamEventWrapper`) such as
-`content_block_start` + `input_json_delta`.
+- `ToolCallStartEvent` is emitted when local SDK tool execution begins (once per tool call) and includes the complete parsed input.
+- Tool-use streaming lifecycle is available through `RunStream.Process` callbacks:
+  - `OnToolUseStart(index, id, name)`
+  - `OnToolInputDelta(index, id, name, partialJSON)`
+  - `OnToolUseStop(index, id, name)`
+- Equivalent extractor helpers exist if you consume raw events: `ToolUseStartFrom`, `ToolInputDeltaFrom`, `ToolUseStopFrom`.
+
+You can still inspect wrapped provider events (`StreamEventWrapper`) directly when you need full raw stream payloads.
 
 If no handler exists for a tool name, the SDK returns a tool result like:
 
@@ -739,7 +749,7 @@ Important:
 - Native tool support is **provider/model dependent**.
 - The providers in `pkg/core/providers/*` map these normalized tool types to provider-specific tool names and request formats.
 - Since providers execute these tools, you generally do **not** register handlers for them.
-- `WebFetch` currently maps to Anthropic's `web_fetch_20250910` only. For other providers, use `VAIWebFetch()` instead.
+- `WebFetch` currently maps to Anthropic's `web_fetch_20250910` only. For other providers, use `VAIWebFetch(...)` (gateway-native) or `LocalVAIWebFetch(...)` (local adapter-backed).
 
 Native web search mapping:
 
@@ -750,38 +760,44 @@ Native web search mapping:
 | Gemini | `googleSearch` grounding | _(skipped)_ |
 | OpenAI Chat | _(skipped)_ | _(skipped)_ |
 
-### 8.1 VAI-Native Web Tools (Configurable)
+### 8.1 VAI Web Tools: Gateway vs Local
 
-For providers that don't support native web search/fetch, or when you want to use a specific third-party search provider regardless of LLM provider, use the **VAI-native** variants:
+`VAIWebSearch` / `VAIWebFetch` are now **gateway-native** tool builders:
+
+```go
+search := vai.VAIWebSearch(vai.Tavily)      // or vai.Exa
+fetch := vai.VAIWebFetch(vai.Tavily)        // or vai.Firecrawl
+```
+
+These are function tools with built-in handlers that call gateway endpoint `POST /v1/server-tools:execute`.
+
+Requirements:
+- Proxy mode (`WithBaseURL(...)`)
+- BYOK provider key via `WithProviderKey(...)` for the selected tool provider
+- Use with `Messages.Run` / `Messages.RunStream` (the SDK loop executes the tool handler)
+
+If you want adapter-backed execution inside your process (no gateway execution), use:
+- `vai.LocalVAIWebSearch(...)`
+- `vai.LocalVAIWebFetch(...)`
+
+Example local usage:
 
 ```go
 import (
     vai "github.com/vango-go/vai-lite/sdk"
     "github.com/vango-go/vai-lite/sdk/adapters/tavily"
-    "github.com/vango-go/vai-lite/sdk/adapters/firecrawl"
 )
 
-// VAI-native web search via Tavily (BYOK: you provide the Tavily API key)
-search := vai.VAIWebSearch(tavily.NewSearch(os.Getenv("TAVILY_API_KEY")))
-
-// VAI-native web fetch via Firecrawl (BYOK: you provide the Firecrawl API key)
-fetch := vai.VAIWebFetch(firecrawl.NewScrape(os.Getenv("FIRECRAWL_API_KEY")))
-
-// Use with any provider — even those without native search support
-result, err := client.Messages.Run(ctx, &vai.MessageRequest{
-    Model:    "groq/llama-3.3-70b",
-    Messages: msgs,
-}, vai.WithTools(search, fetch))
+search := vai.LocalVAIWebSearch(tavily.NewSearch(os.Getenv("TAVILY_API_KEY")))
+fetch := vai.LocalVAIWebFetch(tavily.NewExtract(os.Getenv("TAVILY_API_KEY")))
 ```
 
-**Key difference from native tools:**
+Key difference:
+- `vai.WebSearch()` / `vai.WebFetch()` → provider-native tools
+- `vai.VAIWebSearch(vai.Provider)` / `vai.VAIWebFetch(vai.Provider)` → gateway-executed VAI tools
+- `vai.LocalVAIWebSearch(...)` / `vai.LocalVAIWebFetch(...)` → local adapter-executed VAI tools
 
-- `vai.WebSearch()` / `vai.WebFetch()` → provider-executed native tools (no handler needed)
-- `vai.VAIWebSearch(provider)` / `vai.VAIWebFetch(provider)` → VAI-executed function tools (handler is built in)
-
-`VAIWebSearch` and `VAIWebFetch` return `ToolWithHandler`, so they work with `WithTools()` for automatic handler registration.
-
-**Available adapters:**
+Local adapters:
 
 | Package | Search | Fetch | Import |
 |---------|--------|-------|--------|
@@ -789,7 +805,7 @@ result, err := client.Messages.Run(ctx, &vai.MessageRequest{
 | Firecrawl | — | `firecrawl.NewScrape(apiKey)` | `sdk/adapters/firecrawl` |
 | Exa | `exa.NewSearch(apiKey)` | `exa.NewContents(apiKey)` | `sdk/adapters/exa` |
 
-**Custom providers:** Implement `vai.WebSearchProvider` or `vai.WebFetchProvider`:
+Local custom providers implement:
 
 ```go
 type WebSearchProvider interface {
@@ -801,25 +817,23 @@ type WebFetchProvider interface {
 }
 ```
 
-**Configuration options:**
+Local configuration options:
 
 ```go
-// Custom tool name and max results
-search := vai.VAIWebSearch(tavily.NewSearch(apiKey), vai.VAIWebSearchConfig{
+search := vai.LocalVAIWebSearch(tavily.NewSearch(apiKey), vai.LocalVAIWebSearchConfig{
     ToolName:       "my_search",
     MaxResults:     10,
     AllowedDomains: []string{"docs.example.com"},
     BlockedDomains: []string{"spam.site"},
 })
 
-// Custom format for fetch
-fetch := vai.VAIWebFetch(firecrawl.NewScrape(apiKey), vai.VAIWebFetchConfig{
+fetch := vai.LocalVAIWebFetch(firecrawl.NewScrape(apiKey), vai.LocalVAIWebFetchConfig{
     ToolName: "my_fetch",
     Format:   "text",
 })
 ```
 
-DX sugar helpers are available for adapter setup: `tavily.FromEnv()`, `firecrawl.FromEnv()`, and `exa.FromEnv()` (plus `tavily.ExtractFromEnv()` / `exa.ContentsFromEnv()` for fetch-style adapters).
+DX sugar helpers for local adapters remain available: `tavily.FromEnv()`, `firecrawl.FromEnv()`, and `exa.FromEnv()` (plus `tavily.ExtractFromEnv()` / `exa.ContentsFromEnv()` for fetch-style adapters).
 
 ### 8.2 Gateway-Executed VAI-Native Web Tools (`/v1/runs`)
 
@@ -873,6 +887,9 @@ Helpers in `sdk/stream_helpers.go`:
 - `TextDeltaFrom(event)` — extracts text chunks from wrapped stream deltas
 - `ThinkingDeltaFrom(event)` — extracts thinking chunks if present
 - `AudioChunkFrom(event)` — extracts run-level audio chunks
+- `ToolUseStartFrom(event)` — extracts tool-use start metadata from wrapped `content_block_start`
+- `ToolInputDeltaFrom(event)` — extracts streamed `input_json_delta` partial JSON
+- `ToolUseStopFrom(event)` — extracts tool-use stop indices from wrapped `content_block_stop`
 
 Example:
 
@@ -891,6 +908,15 @@ for ev := range stream.Events() {
 ```go
 text, err := stream.Process(vai.StreamCallbacks{
 	OnTextDelta: func(t string) { fmt.Print(t) },
+	OnToolUseStart: func(index int, id, name string) {
+		log.Printf("tool stream start idx=%d id=%s name=%s", index, id, name)
+	},
+	OnToolInputDelta: func(index int, id, name, partialJSON string) {
+		log.Printf("tool stream delta idx=%d id=%s name=%s json=%q", index, id, name, partialJSON)
+	},
+	OnToolUseStop: func(index int, id, name string) {
+		log.Printf("tool stream stop idx=%d id=%s name=%s", index, id, name)
+	},
 	OnAudioChunk: func(data []byte, format string) { play(data, format) },
 	OnToolCallStart: func(id, name string, input map[string]any) {
 		log.Printf("tool %s(%v)", name, input)
@@ -902,6 +928,45 @@ text, err := stream.Process(vai.StreamCallbacks{
 ```
 
 It returns the accumulated output text and any final error.
+
+Tool-stream vs execution semantics:
+
+- `OnToolUseStart` / `OnToolInputDelta` / `OnToolUseStop` correspond to model stream `content_block_*` tool-use blocks.
+- `OnToolCallStart` / `OnToolResult` correspond to SDK local tool execution lifecycle.
+- In out-of-order streams, `OnToolInputDelta` may fire before start metadata; in that case `id`/`name` are empty and index is still stable.
+
+For TTS/captions from streamed tool args, use per-tool-index `ToolArgStringDecoder`:
+
+```go
+decoders := map[int]*vai.ToolArgStringDecoder{}
+
+_, err = stream.Process(vai.StreamCallbacks{
+	OnToolUseStart: func(index int, id, name string) {
+		if name == "talk_to_user" {
+			decoders[index] = vai.NewToolArgStringDecoder(vai.ToolArgStringDecoderOptions{})
+		}
+	},
+	OnToolInputDelta: func(index int, id, name, partialJSON string) {
+		decoder := decoders[index]
+		if decoder == nil {
+			return
+		}
+		update := decoder.Push(partialJSON)
+		if update.Found && update.Delta != "" {
+			fmt.Print(update.Delta) // live speech/captions
+		}
+	},
+	OnToolUseStop: func(index int, id, name string) {
+		delete(decoders, index)
+	},
+})
+```
+
+Decoder notes:
+
+- Default key candidates are `content`, `message`, `text` (in that order).
+- The decoder locks the first detected key for stable low-latency output.
+- V1 scope is root-level key extraction (nested JSON paths are intentionally out of scope).
 
 ### 9.4 `Messages.Stream` audio side channel
 
@@ -980,6 +1045,14 @@ Common cases:
 - auth errors (missing/invalid API key)
 - provider overloads / rate limits
 - invalid request shapes (bad model string, invalid tool schema, etc.)
+
+For human-readable CLI/log output, prefer:
+
+```go
+fmt.Println(vai.FormatError(err))
+```
+
+`vai.FormatError` includes rich details when available (for example `op`, `url`, `param`, `code`, `request_id`, `retry_after`, and compact `provider_error`).
 
 ### Handling errors (recommended)
 

@@ -97,6 +97,10 @@ func (s *Server) routes() {
 		Lifecycle:  s.lifecycle,
 		Stream:     true,
 	})
+	s.mux.Handle("/v1/server-tools:execute", handlers.ServerToolsHandler{
+		Config:     s.cfg,
+		HTTPClient: s.httpClient,
+	})
 	s.mux.Handle("/v1/models", handlers.ModelsHandler{Config: s.cfg})
 
 	// Catch-all JSON 404s for unknown paths.

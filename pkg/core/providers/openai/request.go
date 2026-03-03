@@ -312,7 +312,7 @@ func (p *Provider) translateTools(tools []types.Tool) []chatTool {
 
 		case types.ToolTypeWebFetch:
 			// OpenAI doesn't have native web fetch in Chat Completions
-			// Users should use VAIWebFetch() instead
+			// Users should use VAIWebFetch(...) or LocalVAIWebFetch(...) instead
 			continue
 
 		case types.ToolTypeCodeExecution:

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +148,111 @@ func TestWithTools_MakeTool(t *testing.T) {
 	}
 	if result != "result for test" {
 		t.Errorf("Result = %v, want %q", result, "result for test")
+	}
+}
+
+func TestExecuteToolCall_InjectsClientIntoContext(t *testing.T) {
+	svc := &MessagesService{
+		client: &Client{baseURL: "http://gateway.test"},
+	}
+
+	cfg := defaultRunConfig()
+	cfg.toolHandlers["ctx_tool"] = func(ctx context.Context, input json.RawMessage) (any, error) {
+		if got := toolExecutionClientFromContext(ctx); got != svc.client {
+			t.Fatalf("toolExecutionClientFromContext(ctx) = %p, want %p", got, svc.client)
+		}
+		return "ok", nil
+	}
+
+	result := svc.executeToolCall(context.Background(), types.ToolUseBlock{
+		Type:  "tool_use",
+		ID:    "call_1",
+		Name:  "ctx_tool",
+		Input: map[string]any{"x": 1},
+	}, &cfg)
+
+	if result.Error != nil {
+		t.Fatalf("executeToolCall() error = %v", result.Error)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("len(result.Content) = %d, want 1", len(result.Content))
+	}
+	tb, ok := result.Content[0].(types.TextBlock)
+	if !ok {
+		t.Fatalf("result.Content[0] type = %T, want types.TextBlock", result.Content[0])
+	}
+	if tb.Text != "ok" {
+		t.Fatalf("result text = %q, want %q", tb.Text, "ok")
+	}
+}
+
+func TestExecuteToolCall_MixesGatewayAndLocalTools(t *testing.T) {
+	var gatewayCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gatewayCalls++
+		if r.URL.Path != "/v1/server-tools:execute" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Provider-Key-Tavily"); got != "tvly-test" {
+			t.Fatalf("X-Provider-Key-Tavily=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{
+				{"type": "text", "text": "gateway-result"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("tavily", "tvly-test"),
+		WithHTTPClient(server.Client()),
+	)
+	svc := &MessagesService{client: client}
+
+	localTool := MakeTool("local_echo", "Echo", func(ctx context.Context, input struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		return "local:" + input.Text, nil
+	})
+
+	cfg := defaultRunConfig()
+	WithTools(
+		VAIWebSearch(Tavily),
+		localTool,
+	)(&cfg)
+
+	gwResult := svc.executeToolCall(context.Background(), types.ToolUseBlock{
+		Type:  "tool_use",
+		ID:    "call_gw",
+		Name:  "vai_web_search",
+		Input: map[string]any{"query": "latest"},
+	}, &cfg)
+	if gwResult.Error != nil {
+		t.Fatalf("gateway tool error: %v", gwResult.Error)
+	}
+	if gatewayCalls != 1 {
+		t.Fatalf("gateway calls=%d, want 1", gatewayCalls)
+	}
+	gwText, ok := gwResult.Content[0].(types.TextBlock)
+	if !ok || gwText.Text != "gateway-result" {
+		t.Fatalf("gateway content=%#v", gwResult.Content)
+	}
+
+	localResult := svc.executeToolCall(context.Background(), types.ToolUseBlock{
+		Type:  "tool_use",
+		ID:    "call_local",
+		Name:  "local_echo",
+		Input: map[string]any{"text": "hi"},
+	}, &cfg)
+	if localResult.Error != nil {
+		t.Fatalf("local tool error: %v", localResult.Error)
+	}
+	localText, ok := localResult.Content[0].(types.TextBlock)
+	if !ok || localText.Text != "local:hi" {
+		t.Fatalf("local content=%#v", localResult.Content)
 	}
 }
 

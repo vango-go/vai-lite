@@ -51,8 +51,8 @@ func TestParseChatConfig_DefaultsAndEnv(t *testing.T) {
 	if cfg.ProviderKeys["openai"] != "sk-openai-test" {
 		t.Fatalf("ProviderKeys[openai]=%q, want %q", cfg.ProviderKeys["openai"], "sk-openai-test")
 	}
-	if cfg.TavilyAPIKey != "tvly-test" {
-		t.Fatalf("TavilyAPIKey=%q, want %q", cfg.TavilyAPIKey, "tvly-test")
+	if cfg.ProviderKeys["tavily"] != "tvly-test" {
+		t.Fatalf("ProviderKeys[tavily]=%q, want %q", cfg.ProviderKeys["tavily"], "tvly-test")
 	}
 }
 
@@ -120,11 +120,11 @@ func TestValidateChatConfig_TimeoutAndMaxTokens(t *testing.T) {
 	t.Parallel()
 
 	base := chatConfig{
-		BaseURL:      "http://127.0.0.1:8080",
-		Model:        "oai-resp/gpt-5-mini",
-		TavilyAPIKey: "tvly-test",
+		BaseURL: "http://127.0.0.1:8080",
+		Model:   "oai-resp/gpt-5-mini",
 		ProviderKeys: map[string]string{
 			"openai": "sk-openai-test",
+			"tavily": "tvly-test",
 		},
 	}
 
@@ -228,9 +228,7 @@ func TestBuildClientOptions_RegistersProviderKeys(t *testing.T) {
 func TestBuildChatTools_DefaultNamesAndHandlers(t *testing.T) {
 	t.Parallel()
 
-	tools := buildChatTools(chatConfig{
-		TavilyAPIKey: "tvly-test",
-	})
+	tools := buildChatTools(chatConfig{})
 	if len(tools) != 3 {
 		t.Fatalf("len(tools)=%d, want 3", len(tools))
 	}
@@ -456,13 +454,13 @@ func TestRunChatbot_CanonicalizesConfigForRuntimeState(t *testing.T) {
 	t.Parallel()
 
 	cfg := chatConfig{
-		BaseURL:      "http://127.0.0.1:8080",
-		Model:        " OpenAI/gpt-5-mini ",
-		MaxTokens:    128,
-		Timeout:      2 * time.Second,
-		TavilyAPIKey: "tvly-test",
+		BaseURL:   "http://127.0.0.1:8080",
+		Model:     " OpenAI/gpt-5-mini ",
+		MaxTokens: 128,
+		Timeout:   2 * time.Second,
 		ProviderKeys: map[string]string{
 			"openai": "sk-openai-test",
+			"tavily": "tvly-test",
 		},
 	}
 

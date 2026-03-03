@@ -7,11 +7,11 @@
 //
 //	import "github.com/vango-go/vai-lite/sdk/adapters/tavily"
 //
-//	// Web search
-//	search := vai.VAIWebSearch(tavily.NewSearch(os.Getenv("TAVILY_API_KEY")))
+//	// Local web search
+//	search := vai.LocalVAIWebSearch(tavily.NewSearch(os.Getenv("TAVILY_API_KEY")))
 //
-//	// Web fetch (content extraction)
-//	fetch := vai.VAIWebFetch(tavily.NewExtract(os.Getenv("TAVILY_API_KEY")))
+//	// Local web fetch (content extraction)
+//	fetch := vai.LocalVAIWebFetch(tavily.NewExtract(os.Getenv("TAVILY_API_KEY")))
 package tavily
 
 import (

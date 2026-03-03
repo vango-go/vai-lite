@@ -607,8 +607,9 @@ func (s *MessagesService) executeToolCall(ctx context.Context, toolUse types.Too
 		return result
 	}
 
-	// Execute handler
-	output, err := handler(ctx, inputJSON)
+	// Execute handler with SDK client bound in context for gateway-native tool handlers.
+	toolCtx := contextWithToolExecutionClient(ctx, s.client)
+	output, err := handler(toolCtx, inputJSON)
 
 	// Call hook
 	if cfg.onToolCall != nil {

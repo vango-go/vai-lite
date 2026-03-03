@@ -15,7 +15,6 @@ import (
 	"github.com/vango-go/vai-lite/internal/dotenv"
 	"github.com/vango-go/vai-lite/pkg/core"
 	vai "github.com/vango-go/vai-lite/sdk"
-	"github.com/vango-go/vai-lite/sdk/adapters/tavily"
 )
 
 const (
@@ -37,7 +36,6 @@ type chatConfig struct {
 	Timeout       time.Duration
 	SystemPrompt  string
 	GatewayAPIKey string
-	TavilyAPIKey  string
 	ProviderKeys  map[string]string
 }
 
@@ -81,7 +79,6 @@ func parseChatConfig(args []string, getenv func(string) string) (chatConfig, err
 		return chatConfig{}, err
 	}
 
-	cfg.TavilyAPIKey = strings.TrimSpace(getenv("TAVILY_API_KEY"))
 	cfg.ProviderKeys = collectProviderKeys(getenv)
 
 	canonicalCfg, err := canonicalizeAndValidateChatConfig(cfg)
@@ -193,7 +190,6 @@ func canonicalizeAndValidateChatConfig(cfg chatConfig) (chatConfig, error) {
 	cfg.Model = strings.TrimSpace(cfg.Model)
 	cfg.SystemPrompt = strings.TrimSpace(cfg.SystemPrompt)
 	cfg.GatewayAPIKey = strings.TrimSpace(cfg.GatewayAPIKey)
-	cfg.TavilyAPIKey = strings.TrimSpace(cfg.TavilyAPIKey)
 	cfg.ProviderKeys = canonicalizeProviderKeys(cfg.ProviderKeys)
 
 	if cfg.BaseURL == "" {
@@ -217,8 +213,8 @@ func canonicalizeAndValidateChatConfig(cfg chatConfig) (chatConfig, error) {
 	if cfg.Timeout <= 0 {
 		return chatConfig{}, errors.New("timeout must be > 0")
 	}
-	if cfg.TavilyAPIKey == "" {
-		return chatConfig{}, errors.New("TAVILY_API_KEY is required to enable vai_web_search and vai_web_fetch")
+	if !hasKeyForProvider("tavily", cfg.ProviderKeys) {
+		return chatConfig{}, errors.New("TAVILY_API_KEY is required to enable gateway vai_web_search and vai_web_fetch")
 	}
 	return cfg, nil
 }
@@ -256,13 +252,13 @@ func buildClientOptions(cfg chatConfig) []vai.ClientOption {
 	return opts
 }
 
-func buildChatTools(cfg chatConfig) []vai.ToolWithHandler {
+func buildChatTools(_ chatConfig) []vai.ToolWithHandler {
 	type talkToUserInput struct {
 		Content string `json:"content" desc:"Exact text to speak to the user"`
 	}
 	return []vai.ToolWithHandler{
-		vai.VAIWebSearch(tavily.NewSearch(cfg.TavilyAPIKey)),
-		vai.VAIWebFetch(tavily.NewExtract(cfg.TavilyAPIKey)),
+		vai.VAIWebSearch(vai.Tavily),
+		vai.VAIWebFetch(vai.Tavily),
 		vai.MakeTool("talk_to_user", "Speak text directly to the user via the voice/output channel.", func(ctx context.Context, input talkToUserInput) (string, error) {
 			return "delivered", nil
 		}),

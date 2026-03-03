@@ -83,10 +83,16 @@ func TestServer_RunsRoutes_Reachable(t *testing.T) {
 		FirecrawlBaseURL:              "https://api.firecrawl.dev",
 	}, logger)
 
-	for _, path := range []string{"/v1/runs", "/v1/runs:stream"} {
+	for _, path := range []string{"/v1/runs", "/v1/runs:stream", "/v1/server-tools:execute"} {
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]}}`))
-		req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+		body := `{"request":{"model":"anthropic/test","messages":[{"role":"user","content":"hi"}]}}`
+		if path == "/v1/server-tools:execute" {
+			body = `{"tool":"vai_web_search","input":{"query":"hi"}}`
+		}
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		if path != "/v1/server-tools:execute" {
+			req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+		}
 		s.Handler().ServeHTTP(rr, req)
 		if rr.Code == http.StatusNotFound {
 			t.Fatalf("path %s unexpectedly returned 404", path)
