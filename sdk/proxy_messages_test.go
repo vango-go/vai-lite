@@ -129,11 +129,11 @@ func TestProxyMessagesCreate_UsesOpenAIHeaderForResponsesModels(t *testing.T) {
 	}
 }
 
-func TestProxyMessagesCreate_ForwardsVoiceInputAndCartesiaHeader(t *testing.T) {
+func TestProxyMessagesCreate_ForwardsAudioSTTAndCartesiaHeader(t *testing.T) {
 	t.Parallel()
 
 	var gotCartesiaKey string
-	var gotAudioBlock bool
+	var gotAudioSTTBlock bool
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotCartesiaKey = r.Header.Get("X-Provider-Key-Cartesia")
@@ -144,7 +144,7 @@ func TestProxyMessagesCreate_ForwardsVoiceInputAndCartesiaHeader(t *testing.T) {
 		}
 		blocks := req.Messages[0].ContentBlocks()
 		if len(blocks) > 0 {
-			_, gotAudioBlock = blocks[0].(types.AudioBlock)
+			_, gotAudioSTTBlock = blocks[0].(types.AudioSTTBlock)
 		}
 
 		resp := types.MessageResponse{
@@ -174,11 +174,10 @@ func TestProxyMessagesCreate_ForwardsVoiceInputAndCartesiaHeader(t *testing.T) {
 			{
 				Role: "user",
 				Content: ContentBlocks(
-					Audio([]byte("voice-bytes"), "audio/wav"),
+					AudioSTT([]byte("voice-bytes"), "audio/wav"),
 				),
 			},
 		},
-		Voice: VoiceInput(),
 	})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -186,11 +185,49 @@ func TestProxyMessagesCreate_ForwardsVoiceInputAndCartesiaHeader(t *testing.T) {
 	if gotCartesiaKey != "sk-cartesia" {
 		t.Fatalf("X-Provider-Key-Cartesia = %q, want %q", gotCartesiaKey, "sk-cartesia")
 	}
-	if !gotAudioBlock {
-		t.Fatalf("expected request audio block to be forwarded unchanged in proxy mode")
+	if !gotAudioSTTBlock {
+		t.Fatalf("expected request audio_stt block to be forwarded unchanged in proxy mode")
 	}
 	if resp.UserTranscript() != "hello transcript" {
 		t.Fatalf("UserTranscript() = %q, want %q", resp.UserTranscript(), "hello transcript")
+	}
+}
+
+func TestProxyMessagesCreate_TTSModelSetsCartesiaHeader(t *testing.T) {
+	t.Parallel()
+
+	var gotCartesiaKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCartesiaKey = r.Header.Get("X-Provider-Key-Cartesia")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.MessageResponse{
+			Type:       "message",
+			ID:         "msg_voice_model",
+			Model:      "openai/gpt-4o-mini",
+			Role:       "assistant",
+			Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "done"}},
+			StopReason: types.StopReasonEndTurn,
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("openai", "sk-openai"),
+		WithProviderKey("cartesia", "sk-cartesia"),
+		WithHTTPClient(server.Client()),
+	)
+
+	_, err := client.Messages.Create(context.Background(), &MessageRequest{
+		Model:    "openai/gpt-4o-mini",
+		Messages: []Message{{Role: "user", Content: Text("hello")}},
+		TTSModel: "cartesia/sonic-3",
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if gotCartesiaKey != "sk-cartesia" {
+		t.Fatalf("X-Provider-Key-Cartesia = %q, want %q", gotCartesiaKey, "sk-cartesia")
 	}
 }
 

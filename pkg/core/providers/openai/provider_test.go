@@ -178,3 +178,38 @@ func TestStreamMessage_StreamIncludeUsageOption(t *testing.T) {
 		}
 	})
 }
+
+func TestCreateMessage_RejectsAudioSTTBlocks(t *testing.T) {
+	p := New("test-key")
+	_, err := p.CreateMessage(t.Context(), &types.MessageRequest{
+		Model: "gpt-4o-mini",
+		Messages: []types.Message{
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioSTTBlock{
+						Type: "audio_stt",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected invalid request error")
+	}
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error type = %T, want *Error", err)
+	}
+	if oe.Type != ErrInvalidRequest {
+		t.Fatalf("error type = %q, want %q", oe.Type, ErrInvalidRequest)
+	}
+	if oe.Param != "messages" {
+		t.Fatalf("param = %q, want messages", oe.Param)
+	}
+}

@@ -25,6 +25,7 @@ type Provider interface {
 
 // StreamingContextOptions configures a streaming context.
 type StreamingContextOptions struct {
+	Model            string  // Provider model identifier (e.g. "sonic-3")
 	Voice            string  // Voice identifier
 	Speed            float64 // Speed multiplier (0.6-1.5)
 	Volume           float64 // Volume multiplier (0.5-2.0)
@@ -138,6 +139,7 @@ func (e *contextClosedError) Error() string { return "streaming context closed" 
 
 // SynthesizeOptions configures synthesis.
 type SynthesizeOptions struct {
+	Model      string  // Provider model identifier (e.g. "sonic-3")
 	Voice      string  // Voice identifier (Cartesia voice ID)
 	Speed      float64 // Speed multiplier (0.6-1.5, default 1.0)
 	Volume     float64 // Volume multiplier (0.5-2.0, default 1.0)

@@ -61,6 +61,32 @@ func Audio(data []byte, mediaType string) types.ContentBlock {
 	}
 }
 
+// AudioSTT creates an audio_stt content block for transcribe-before-LLM input.
+func AudioSTT(data []byte, mediaType string, opts ...AudioSTTOption) types.ContentBlock {
+	block := types.AudioSTTBlock{
+		Type: "audio_stt",
+		Source: types.AudioSource{
+			Type:      "base64",
+			MediaType: mediaType,
+			Data:      base64.StdEncoding.EncodeToString(data),
+		},
+	}
+	for _, opt := range opts {
+		opt(&block)
+	}
+	return block
+}
+
+// AudioSTTOption configures an audio_stt block.
+type AudioSTTOption func(*types.AudioSTTBlock)
+
+// WithSTTLanguage sets the optional STT language hint for audio_stt blocks.
+func WithSTTLanguage(language string) AudioSTTOption {
+	return func(b *types.AudioSTTBlock) {
+		b.Language = language
+	}
+}
+
 // Document creates a document content block.
 func Document(data []byte, mediaType, filename string) types.ContentBlock {
 	return types.DocumentBlock{

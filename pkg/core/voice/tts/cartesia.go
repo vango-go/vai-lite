@@ -63,10 +63,14 @@ func (c *CartesiaProvider) Synthesize(ctx context.Context, text string, opts Syn
 
 	// Build output format
 	outputFormat := c.buildOutputFormat(opts)
+	modelID := strings.TrimSpace(opts.Model)
+	if modelID == "" {
+		modelID = "sonic-3"
+	}
 
 	// Build request body
 	reqBody := cartesiaTTSRequest{
-		ModelID:    "sonic-3",
+		ModelID:    modelID,
 		Transcript: text,
 		Voice: cartesiaVoiceSpec{
 			Mode: "id",
@@ -242,10 +246,14 @@ func (c *CartesiaProvider) SynthesizeStream(ctx context.Context, text string, op
 
 	// Build output format (WebSocket streaming currently requires raw PCM).
 	outputFormat := buildStreamingOutputFormat(opts.SampleRate)
+	modelID := strings.TrimSpace(opts.Model)
+	if modelID == "" {
+		modelID = "sonic-3"
+	}
 
 	// Send generation request
 	wsReq := cartesiaWSRequest{
-		ModelID:    "sonic-3",
+		ModelID:    modelID,
 		Transcript: text,
 		Voice: cartesiaVoiceSpec{
 			Mode: "id",
@@ -392,8 +400,12 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 	}
 
 	// Build base request template
+	modelID := strings.TrimSpace(opts.Model)
+	if modelID == "" {
+		modelID = "sonic-3"
+	}
 	baseReq := cartesiaStreamingRequest{
-		ModelID: "sonic-3",
+		ModelID: modelID,
 		Voice: cartesiaVoiceSpec{
 			Mode: "id",
 			ID:   voiceID,

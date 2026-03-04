@@ -9,21 +9,26 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
-// PreprocessMessageRequestInputAudio preprocesses req for voice input (STT).
-// If req.Voice.Input is set, it transcribes any audio blocks into text blocks and returns a copy of req.
+// PreprocessMessageRequestAudioSTT preprocesses req for audio_stt input blocks.
+// It transcribes audio_stt blocks into text blocks and returns a copied request.
 // It never mutates the caller's req in-place.
-func PreprocessMessageRequestInputAudio(ctx context.Context, pipeline *Pipeline, req *types.MessageRequest) (*types.MessageRequest, string, error) {
+func PreprocessMessageRequestAudioSTT(ctx context.Context, pipeline *Pipeline, req *types.MessageRequest) (*types.MessageRequest, string, error) {
 	if req == nil {
 		return nil, "", fmt.Errorf("req must not be nil")
 	}
-	if req.Voice == nil || req.Voice.Input == nil {
+	if !types.RequestHasAudioSTT(req) {
 		return req, "", nil
 	}
 	if pipeline == nil {
 		return nil, "", fmt.Errorf("voice pipeline is not configured")
 	}
 
-	processed, transcript, err := pipeline.ProcessInputAudio(ctx, req.Messages, req.Voice)
+	resolvedSTTModel, err := ResolveSTTModel(req.STTModel)
+	if err != nil {
+		return nil, "", err
+	}
+
+	processed, transcript, err := pipeline.ProcessAudioSTT(ctx, req.Messages, resolvedSTTModel.Model)
 	if err != nil {
 		return nil, "", err
 	}
@@ -33,9 +38,20 @@ func PreprocessMessageRequestInputAudio(ctx context.Context, pipeline *Pipeline,
 	return &reqCopy, transcript, nil
 }
 
+// PreprocessMessageRequestInputAudio is a compatibility alias for PreprocessMessageRequestAudioSTT.
+func PreprocessMessageRequestInputAudio(ctx context.Context, pipeline *Pipeline, req *types.MessageRequest) (*types.MessageRequest, string, error) {
+	return PreprocessMessageRequestAudioSTT(ctx, pipeline, req)
+}
+
 // AppendVoiceOutputToMessageResponse appends synthesized voice output (TTS) to resp when cfg.Output is set.
 // It mutates resp by appending an audio content block when synthesis succeeds.
-func AppendVoiceOutputToMessageResponse(ctx context.Context, pipeline *Pipeline, cfg *types.VoiceConfig, resp *types.MessageResponse) error {
+func AppendVoiceOutputToMessageResponse(
+	ctx context.Context,
+	pipeline *Pipeline,
+	cfg *types.VoiceConfig,
+	ttsModelRaw string,
+	resp *types.MessageResponse,
+) error {
 	if pipeline == nil {
 		return fmt.Errorf("voice pipeline is not configured")
 	}
@@ -48,7 +64,12 @@ func AppendVoiceOutputToMessageResponse(ctx context.Context, pipeline *Pipeline,
 		return nil
 	}
 
-	audioData, err := pipeline.SynthesizeResponse(ctx, text, cfg)
+	resolvedTTSModel, err := ResolveTTSModel(ttsModelRaw)
+	if err != nil {
+		return err
+	}
+
+	audioData, err := pipeline.SynthesizeResponse(ctx, text, cfg, resolvedTTSModel.Model)
 	if err != nil {
 		return err
 	}

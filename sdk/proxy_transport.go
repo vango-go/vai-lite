@@ -113,7 +113,7 @@ func (c *Client) proxyCreateMessage(ctx context.Context, req *types.MessageReque
 	ctx, cancel := withDefaultGatewayTimeout(ctx)
 	defer cancel()
 
-	headers, err := c.buildGatewayHeaders(req.Model, req.Voice, false)
+	headers, err := c.buildGatewayHeaders(req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +148,7 @@ func (c *Client) proxyCreateMessage(ctx context.Context, req *types.MessageReque
 }
 
 func (c *Client) proxyStreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
-	headers, err := c.buildGatewayHeaders(req.Model, req.Voice, true)
+	headers, err := c.buildGatewayHeaders(req, true)
 	if err != nil {
 		return nil, err
 	}
@@ -203,12 +203,15 @@ func (c *Client) postGatewayJSON(ctx context.Context, endpointPath string, paylo
 	return resp, endpoint, nil
 }
 
-func (c *Client) buildGatewayHeaders(publicModel string, voiceCfg *types.VoiceConfig, stream bool) (http.Header, error) {
+func (c *Client) buildGatewayHeaders(req *types.MessageRequest, stream bool) (http.Header, error) {
 	if !c.isProxyMode() {
 		return nil, core.NewInvalidRequestError("proxy mode is not enabled (set WithBaseURL)")
 	}
+	if req == nil {
+		return nil, core.NewInvalidRequestError("req must not be nil")
+	}
 
-	providerName, _, err := core.ParseModelString(publicModel)
+	providerName, _, err := core.ParseModelString(req.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +231,9 @@ func (c *Client) buildGatewayHeaders(publicModel string, voiceCfg *types.VoiceCo
 			headers.Set(byokHeader, key)
 		}
 	}
-	if voiceCfg != nil && (voiceCfg.Input != nil || voiceCfg.Output != nil) {
+	needsSTT := types.RequestHasAudioSTT(req)
+	needsTTS := (req.Voice != nil && req.Voice.Output != nil) || strings.TrimSpace(req.TTSModel) != ""
+	if needsSTT || needsTTS {
 		if key := c.getCartesiaAPIKey(); key != "" {
 			headers.Set("X-Provider-Key-Cartesia", key)
 		}

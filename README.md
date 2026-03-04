@@ -238,15 +238,13 @@ req := &vai.MessageRequest{
 		{
 			Role: "user",
 			Content: vai.ContentBlocks(
-				vai.Audio(wavBytes, "audio/wav"),
+				vai.AudioSTT(wavBytes, "audio/wav", vai.WithSTTLanguage("en")),
 			),
 		},
 	},
-	Voice: vai.VoiceFull(
-		"a0e99841-438c-4a64-b679-ae501e7d6091",
-		vai.WithLanguage("en"),
-		vai.WithAudioFormat(vai.AudioFormatWAV),
-	),
+	STTModel: "cartesia/ink-whisper", // optional (default shown)
+	TTSModel: "cartesia/sonic-3",     // optional (default shown)
+	Voice:    vai.VoiceOutput("a0e99841-438c-4a64-b679-ae501e7d6091", vai.WithAudioFormat(vai.AudioFormatWAV)),
 }
 
 resp, err := client.Messages.Create(ctx, req)
@@ -258,6 +256,8 @@ if audio := resp.AudioContent(); audio != nil {
 	fmt.Println("Synthesized media type:", audio.Source.MediaType)
 }
 ```
+
+`audio_stt` blocks are transcribed before model execution. Raw `audio` blocks remain raw multimodal input.
 
 ### `Stream` with text events + audio side channel
 

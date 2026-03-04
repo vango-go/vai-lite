@@ -71,6 +71,12 @@ func UnmarshalContentBlockStrict(data []byte) (ContentBlock, error) {
 			return nil, err
 		}
 		return block, nil
+	case "audio_stt":
+		var block AudioSTTBlock
+		if err := json.Unmarshal(data, &block); err != nil {
+			return nil, err
+		}
+		return block, nil
 	case "video":
 		var block VideoBlock
 		if err := json.Unmarshal(data, &block); err != nil {
@@ -415,9 +421,11 @@ func UnmarshalMessageRequestStrict(data []byte) (*MessageRequest, error) {
 		Tools         []json.RawMessage `json:"tools,omitempty"`
 		ToolChoice    *ToolChoice       `json:"tool_choice,omitempty"`
 		Stream        bool              `json:"stream,omitempty"`
+		STTModel      string            `json:"stt_model,omitempty"`
+		TTSModel      string            `json:"tts_model,omitempty"`
 		OutputFormat  *OutputFormat     `json:"output_format,omitempty"`
 		Output        *OutputConfig     `json:"output,omitempty"`
-		Voice         *VoiceConfig      `json:"voice,omitempty"`
+		Voice         json.RawMessage   `json:"voice,omitempty"`
 		Extensions    map[string]any    `json:"extensions,omitempty"`
 		Metadata      map[string]any    `json:"metadata,omitempty"`
 		Extra         map[string]any    `json:"-"`
@@ -441,11 +449,36 @@ func UnmarshalMessageRequestStrict(data []byte) (*MessageRequest, error) {
 		StopSequences: raw.StopSequences,
 		ToolChoice:    raw.ToolChoice,
 		Stream:        raw.Stream,
+		STTModel:      raw.STTModel,
+		TTSModel:      raw.TTSModel,
 		OutputFormat:  raw.OutputFormat,
 		Output:        raw.Output,
-		Voice:         raw.Voice,
 		Extensions:    raw.Extensions,
 		Metadata:      raw.Metadata,
+	}
+	if err := validateProviderModelIDStrict(out.STTModel, "stt_model"); err != nil {
+		return nil, err
+	}
+	if err := validateProviderModelIDStrict(out.TTSModel, "tts_model"); err != nil {
+		return nil, err
+	}
+
+	if !isNullOrEmptyJSON(raw.Voice) {
+		var voiceFields map[string]json.RawMessage
+		if err := json.Unmarshal(raw.Voice, &voiceFields); err != nil {
+			return nil, strictErr("voice", "voice must be an object")
+		}
+		if _, hasInput := voiceFields["input"]; hasInput {
+			return nil, strictErr("voice.input", "voice.input has been removed; use audio_stt blocks and top-level stt_model")
+		}
+
+		dec := json.NewDecoder(bytes.NewReader(raw.Voice))
+		dec.DisallowUnknownFields()
+		var voiceCfg VoiceConfig
+		if err := dec.Decode(&voiceCfg); err != nil {
+			return nil, strictErr("voice", fmt.Sprintf("invalid voice config: %v", err))
+		}
+		out.Voice = &voiceCfg
 	}
 
 	// system: string or []ContentBlock
@@ -588,5 +621,23 @@ func validateJSONSchemaStrict(schema *JSONSchema, paramPrefix string) error {
 		}
 	}
 
+	return nil
+}
+
+func validateProviderModelIDStrict(raw string, param string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, "/")
+	if len(parts) != 2 {
+		return strictErr(param, param+" must be in provider/model format")
+	}
+	provider := strings.TrimSpace(parts[0])
+	model := strings.TrimSpace(parts[1])
+	if provider == "" || model == "" {
+		return strictErr(param, param+" must be in provider/model format")
+	}
 	return nil
 }

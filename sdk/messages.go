@@ -38,7 +38,7 @@ func (s *MessagesService) Create(ctx context.Context, req *MessageRequest) (*Res
 
 	if !s.client.isProxyMode() {
 		var err error
-		processedReq, userTranscript, err = s.preprocessVoiceInput(ctx, req)
+		processedReq, userTranscript, err = s.preprocessAudioSTT(ctx, req)
 		if err != nil {
 			return nil, err
 		}
@@ -76,7 +76,7 @@ func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (*Str
 
 	if !s.client.isProxyMode() {
 		var err error
-		processedReq, userTranscript, err = s.preprocessVoiceInput(ctx, req)
+		processedReq, userTranscript, err = s.preprocessAudioSTT(ctx, req)
 		if err != nil {
 			return nil, err
 		}
@@ -99,7 +99,11 @@ func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (*Str
 		if err := s.requireVoicePipeline(); err != nil {
 			return nil, err
 		}
-		ttsCtx, err := s.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice)
+		ttsModel, err := s.resolveTTSModel(req)
+		if err != nil {
+			return nil, err
+		}
+		ttsCtx, err := s.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice, ttsModel)
 		if err != nil {
 			return nil, fmt.Errorf("initialize voice stream: %w", err)
 		}
@@ -217,18 +221,18 @@ func (s *MessagesService) streamTurn(ctx context.Context, req *types.MessageRequ
 	return newStreamFromEventStream(eventStream), nil
 }
 
-func (s *MessagesService) preprocessVoiceInput(ctx context.Context, req *MessageRequest) (*MessageRequest, string, error) {
+func (s *MessagesService) preprocessAudioSTT(ctx context.Context, req *MessageRequest) (*MessageRequest, string, error) {
 	if req == nil {
 		return nil, "", fmt.Errorf("req must not be nil")
 	}
-	if req.Voice == nil || req.Voice.Input == nil {
+	if !types.RequestHasAudioSTT(req) {
 		return req, "", nil
 	}
 	if err := s.requireVoicePipeline(); err != nil {
 		return nil, "", err
 	}
 
-	processedReq, transcript, err := voice.PreprocessMessageRequestInputAudio(ctx, s.client.voicePipeline, req)
+	processedReq, transcript, err := voice.PreprocessMessageRequestAudioSTT(ctx, s.client.voicePipeline, req)
 	if err != nil {
 		return nil, "", fmt.Errorf("transcribe input audio: %w", err)
 	}
@@ -243,7 +247,7 @@ func (s *MessagesService) appendVoiceOutput(ctx context.Context, req *MessageReq
 		return err
 	}
 
-	err := voice.AppendVoiceOutputToMessageResponse(ctx, s.client.voicePipeline, req.Voice, resp)
+	err := voice.AppendVoiceOutputToMessageResponse(ctx, s.client.voicePipeline, req.Voice, req.TTSModel, resp)
 	if err != nil {
 		return fmt.Errorf("synthesize voice output: %w", err)
 	}
@@ -254,7 +258,18 @@ func (s *MessagesService) requireVoicePipeline() error {
 	if s.client != nil && s.client.voicePipeline != nil {
 		return nil
 	}
-	return fmt.Errorf("voice mode requested but Cartesia is not configured (set CARTESIA_API_KEY or WithProviderKey(\"cartesia\", ...))")
+	return fmt.Errorf("audio_stt/voice.output requested but Cartesia is not configured (set CARTESIA_API_KEY or WithProviderKey(\"cartesia\", ...))")
+}
+
+func (s *MessagesService) resolveTTSModel(req *MessageRequest) (string, error) {
+	if req == nil {
+		return "", fmt.Errorf("req must not be nil")
+	}
+	resolved, err := voice.ResolveTTSModel(req.TTSModel)
+	if err != nil {
+		return "", err
+	}
+	return resolved.Model, nil
 }
 
 func normalizeAudioFormat(format string) string {

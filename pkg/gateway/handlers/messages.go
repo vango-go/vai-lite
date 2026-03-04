@@ -151,7 +151,9 @@ func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var voicePipeline *voice.Pipeline
 	var userTranscript string
-	if req.Voice != nil && (req.Voice.Input != nil || req.Voice.Output != nil) {
+	needsSTT := types.RequestHasAudioSTT(req)
+	needsTTS := req.Voice != nil && req.Voice.Output != nil
+	if needsSTT || needsTTS {
 		cartesiaKey := strings.TrimSpace(r.Header.Get("X-Provider-Key-Cartesia"))
 		if cartesiaKey == "" {
 			h.writeErrorJSON(w, reqID, &core.Error{
@@ -172,8 +174,8 @@ func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			tts.NewCartesiaWithClient(cartesiaKey, voiceHTTPClient),
 		)
 
-		if req.Voice.Input != nil {
-			processedReq, transcript, err := voice.PreprocessMessageRequestInputAudio(ctx, voicePipeline, &workingReq)
+		if needsSTT {
+			processedReq, transcript, err := voice.PreprocessMessageRequestAudioSTT(ctx, voicePipeline, &workingReq)
 			if err != nil {
 				h.writeErr(w, reqID, err, false)
 				return
@@ -228,7 +230,7 @@ func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if voicePipeline != nil && req.Voice != nil && req.Voice.Output != nil {
-		if err := voice.AppendVoiceOutputToMessageResponse(ctx, voicePipeline, req.Voice, resp); err != nil {
+		if err := voice.AppendVoiceOutputToMessageResponse(ctx, voicePipeline, req.Voice, req.TTSModel, resp); err != nil {
 			h.writeErr(w, reqID, err, false)
 			return
 		}
@@ -317,8 +319,13 @@ func (h MessagesHandler) serveStream(
 	}
 
 	if voicePipeline != nil && req.Voice != nil && req.Voice.Output != nil {
+		resolvedTTSModel, resolveErr := voice.ResolveTTSModel(req.TTSModel)
+		if resolveErr != nil {
+			h.writeErr(w, reqID, resolveErr, true)
+			return
+		}
 		var err error
-		ttsCtx, err = voicePipeline.NewStreamingTTSContext(ctx, req.Voice)
+		ttsCtx, err = voicePipeline.NewStreamingTTSContext(ctx, req.Voice, resolvedTTSModel.Model)
 		if err != nil {
 			h.writeErr(w, reqID, err, true)
 			return
@@ -508,6 +515,32 @@ func (h MessagesHandler) serveStream(
 
 				// Feed text deltas into TTS.
 				if ttsStream != nil {
+					if cbs, ok := res.ev.(types.ContentBlockStartEvent); ok {
+						if tb, ok := cbs.ContentBlock.(types.TextBlock); ok && strings.TrimSpace(tb.Text) != "" {
+							if sendErr := ttsStream.OnTextDelta(tb.Text); sendErr != nil {
+								_ = ttsStream.Close()
+								<-audioDone
+								ttsStream = nil
+								if ttsCtx != nil {
+									_ = ttsCtx.Close()
+								}
+								audioUnavailable := types.AudioUnavailableEvent{
+									Type:    "audio_unavailable",
+									Reason:  "tts_failed",
+									Message: "TTS synthesis failed: " + sendErr.Error(),
+								}
+								audioStopped = true
+								pendingAudio = nil
+								if sendErr := send(audioUnavailable.EventType(), audioUnavailable); sendErr != nil {
+									_ = stream.Close()
+									if ttsCtx != nil {
+										_ = ttsCtx.Close()
+									}
+									return
+								}
+							}
+						}
+					}
 					if cbd, ok := res.ev.(types.ContentBlockDeltaEvent); ok {
 						if td, ok := cbd.Delta.(types.TextDelta); ok {
 							if sendErr := ttsStream.OnTextDelta(td.Text); sendErr != nil {

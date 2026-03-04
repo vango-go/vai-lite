@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 )
@@ -30,6 +31,8 @@ type StreamingTTS struct {
 
 	errMu sync.Mutex
 	err   error
+
+	hasSpoken bool
 }
 
 func NewStreamingTTS(ttsCtx *tts.StreamingContext, opts StreamingTTSOptions) *StreamingTTS {
@@ -115,6 +118,12 @@ func (s *StreamingTTS) OnTextDelta(text string) error {
 		return err
 	}
 	for _, sentence := range s.buf.Add(text) {
+		if !s.hasSpoken && !containsSpeech(sentence) {
+			continue
+		}
+		if containsSpeech(sentence) {
+			s.hasSpoken = true
+		}
 		if err := s.ttsCtx.SendText(sentence, false); err != nil {
 			s.setErr(err)
 			_ = s.ttsCtx.Close()
@@ -135,10 +144,20 @@ func (s *StreamingTTS) Flush() error {
 
 	remaining := strings.TrimSpace(s.buf.Flush())
 	if remaining != "" {
+		if !s.hasSpoken && !containsSpeech(remaining) {
+			return nil
+		}
+		if containsSpeech(remaining) {
+			s.hasSpoken = true
+		}
 		if err := s.ttsCtx.SendText(remaining, true); err != nil {
 			s.setErr(err)
 			return err
 		}
+		return nil
+	}
+
+	if !s.hasSpoken {
 		return nil
 	}
 
@@ -197,4 +216,13 @@ func (s *StreamingTTS) setErr(err error) {
 	if s.err == nil {
 		s.err = err
 	}
+}
+
+func containsSpeech(text string) bool {
+	for _, r := range strings.TrimSpace(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }

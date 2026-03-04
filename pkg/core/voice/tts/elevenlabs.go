@@ -79,6 +79,7 @@ func (e *ElevenLabsProvider) Synthesize(ctx context.Context, text string, opts S
 
 func (e *ElevenLabsProvider) SynthesizeStream(ctx context.Context, text string, opts SynthesizeOptions) (*SynthesisStream, error) {
 	sc, err := e.NewStreamingContext(ctx, StreamingContextOptions{
+		Model:      opts.Model,
 		Voice:      opts.Voice,
 		Language:   opts.Language,
 		Speed:      opts.Speed,
@@ -124,7 +125,7 @@ func (e *ElevenLabsProvider) NewStreamingContext(ctx context.Context, opts Strea
 	if voiceID == "" {
 		return nil, fmt.Errorf("voice id is required")
 	}
-	wsURL, err := buildElevenLabsProviderWSURL(e.wsBaseURL, voiceID)
+	wsURL, err := buildElevenLabsProviderWSURL(e.wsBaseURL, voiceID, opts.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +212,7 @@ func (e *ElevenLabsProvider) NewStreamingContext(ctx context.Context, opts Strea
 	return sc, nil
 }
 
-func buildElevenLabsProviderWSURL(base, voiceID string) (string, error) {
+func buildElevenLabsProviderWSURL(base, voiceID, modelID string) (string, error) {
 	if strings.TrimSpace(base) == "" {
 		base = elevenLabsDefaultWSBase
 	}
@@ -228,7 +229,11 @@ func buildElevenLabsProviderWSURL(base, voiceID string) (string, error) {
 	}
 	q := u.Query()
 	if q.Get("model_id") == "" {
-		q.Set("model_id", "eleven_flash_v2_5")
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			modelID = "eleven_flash_v2_5"
+		}
+		q.Set("model_id", modelID)
 	}
 	if q.Get("output_format") == "" {
 		q.Set("output_format", "pcm_24000")

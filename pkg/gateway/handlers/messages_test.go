@@ -200,6 +200,93 @@ func TestMessagesHandler_MissingUpstreamHeader(t *testing.T) {
 	}
 }
 
+func TestMessagesHandler_RejectsLegacyVoiceInput(t *testing.T) {
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"anthropic/test",
+		"messages":[{"role":"user","content":"hello"}],
+		"voice":{"input":{"model":"ink-whisper"}}
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"param":"voice.input"`) {
+		t.Fatalf("expected voice.input param, body=%s", rr.Body.String())
+	}
+}
+
+func TestMessagesHandler_AudioSTTRequiresCartesiaHeader(t *testing.T) {
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"anthropic/test",
+		"messages":[{"role":"user","content":[{"type":"audio_stt","source":{"type":"base64","media_type":"audio/wav","data":"AAAA"}}]}]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"param":"X-Provider-Key-Cartesia"`) {
+		t.Fatalf("expected cartesia header param, body=%s", rr.Body.String())
+	}
+}
+
+func TestMessagesHandler_AudioSTTUnsupportedModelProviderRejected(t *testing.T) {
+	h := MessagesHandler{
+		Config: config.Config{
+			MaxBodyBytes:         1 << 20,
+			ModelAllowlist:       map[string]struct{}{},
+			SSEMaxStreamDuration: time.Minute,
+			SSEPingInterval:      time.Second,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{
+		"model":"anthropic/test",
+		"stt_model":"elevenlabs/whisper-v3",
+		"messages":[{"role":"user","content":[{"type":"audio_stt","source":{"type":"base64","media_type":"audio/wav","data":"AAAA"}}]}]
+	}`)))
+	req.Header.Set("X-Provider-Key-Anthropic", "sk-test")
+	req.Header.Set("X-Provider-Key-Cartesia", "sk-cartesia")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"param":"stt_model"`) {
+		t.Fatalf("expected stt_model param, body=%s", rr.Body.String())
+	}
+}
+
 func TestMessagesHandler_CompatibilityError_OpenAIVideo(t *testing.T) {
 	h := MessagesHandler{
 		Config: config.Config{

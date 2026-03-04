@@ -97,6 +97,14 @@ func (p *Provider) Capabilities() ProviderCapabilities {
 
 // CreateMessage sends a non-streaming request to OpenAI.
 func (p *Provider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	if types.RequestHasAudioSTT(req) {
+		return nil, &Error{
+			Type:    ErrInvalidRequest,
+			Message: "audio_stt blocks must be transcribed before OpenAI request translation",
+			Param:   "messages",
+		}
+	}
+
 	// Build the OpenAI request
 	openaiReq := p.buildRequest(req)
 
@@ -112,6 +120,14 @@ func (p *Provider) CreateMessage(ctx context.Context, req *types.MessageRequest)
 
 // StreamMessage sends a streaming request to OpenAI.
 func (p *Provider) StreamMessage(ctx context.Context, req *types.MessageRequest) (EventStream, error) {
+	if types.RequestHasAudioSTT(req) {
+		return nil, &Error{
+			Type:    ErrInvalidRequest,
+			Message: "audio_stt blocks must be transcribed before OpenAI request translation",
+			Param:   "messages",
+		}
+	}
+
 	// Build request with stream=true
 	openaiReq := p.buildRequest(req)
 	openaiReq.Stream = true

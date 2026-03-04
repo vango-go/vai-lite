@@ -66,6 +66,74 @@ func TestUnmarshalMessageRequestStrict_UnknownBlockRejected(t *testing.T) {
 	}
 }
 
+func TestUnmarshalMessageRequestStrict_AudioSTTBlockAccepted(t *testing.T) {
+	req, err := UnmarshalMessageRequestStrict([]byte(`{
+		"model":"anthropic/claude",
+		"messages":[
+			{"role":"user","content":[{"type":"audio_stt","source":{"type":"base64","media_type":"audio/wav","data":"AAAA"},"language":"en"}]}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("expected audio_stt to decode, got err=%v", err)
+	}
+	blocks := req.Messages[0].ContentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("len(blocks)=%d, want 1", len(blocks))
+	}
+	if _, ok := blocks[0].(AudioSTTBlock); !ok {
+		t.Fatalf("expected AudioSTTBlock, got %T", blocks[0])
+	}
+}
+
+func TestUnmarshalMessageRequestStrict_RejectsLegacyVoiceInput(t *testing.T) {
+	_, err := UnmarshalMessageRequestStrict([]byte(`{
+		"model":"anthropic/claude",
+		"messages":[{"role":"user","content":"hi"}],
+		"voice":{"input":{"model":"ink-whisper"}}
+	}`))
+	se := requireStrictDecodeError(t, err)
+	if se.Param != "voice.input" {
+		t.Fatalf("param=%q, want voice.input", se.Param)
+	}
+}
+
+func TestUnmarshalMessageRequestStrict_ModelFieldShapeValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		payload   string
+		wantParam string
+	}{
+		{
+			name: "invalid stt_model format",
+			payload: `{
+				"model":"anthropic/claude",
+				"stt_model":"ink-whisper",
+				"messages":[{"role":"user","content":"hi"}]
+			}`,
+			wantParam: "stt_model",
+		},
+		{
+			name: "invalid tts_model format",
+			payload: `{
+				"model":"anthropic/claude",
+				"tts_model":"cartesia/",
+				"messages":[{"role":"user","content":"hi"}]
+			}`,
+			wantParam: "tts_model",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := UnmarshalMessageRequestStrict([]byte(tt.payload))
+			se := requireStrictDecodeError(t, err)
+			if se.Param != tt.wantParam {
+				t.Fatalf("param=%q, want %q", se.Param, tt.wantParam)
+			}
+		})
+	}
+}
+
 func TestUnmarshalMessageRequestStrict_ToolConfigTyping(t *testing.T) {
 	req, err := UnmarshalMessageRequestStrict([]byte(`{
 		"model":"anthropic/claude",

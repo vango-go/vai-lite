@@ -39,6 +39,20 @@ func TestAudio(t *testing.T) {
 	}
 }
 
+func TestAudioSTT(t *testing.T) {
+	block := AudioSTT([]byte("audio data"), "audio/wav", WithSTTLanguage("en"))
+	if block.BlockType() != "audio_stt" {
+		t.Errorf("BlockType() = %q, want %q", block.BlockType(), "audio_stt")
+	}
+	audioBlock, ok := block.(AudioSTTBlock)
+	if !ok {
+		t.Fatalf("expected AudioSTTBlock, got %T", block)
+	}
+	if audioBlock.Language != "en" {
+		t.Fatalf("language=%q, want en", audioBlock.Language)
+	}
+}
+
 func TestDocument(t *testing.T) {
 	block := Document([]byte("pdf data"), "application/pdf", "report.pdf")
 	if block.BlockType() != "document" {

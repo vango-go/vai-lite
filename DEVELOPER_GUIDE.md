@@ -362,35 +362,42 @@ Important:
 
 ### 5.5 VoiceConfig (Cartesia non-live)
 
-`MessageRequest` supports:
+`MessageRequest` supports top-level voice model routing plus output voice config:
 
 ```go
-req.Voice = &vai.VoiceConfig{
-	Input: &vai.VoiceInputConfig{
-		Model:    "ink-whisper", // default
-		Language: "en",          // default
+req := &vai.MessageRequest{
+	Model: "openai/gpt-4o",
+	Messages: []vai.Message{
+		{
+			Role: "user",
+			Content: vai.ContentBlocks(
+				vai.AudioSTT(wavBytes, "audio/wav", vai.WithSTTLanguage("en")),
+			),
+		},
 	},
-	Output: &vai.VoiceOutputConfig{
-		Voice:      "a0e99841-438c-4a64-b679-ae501e7d6091",
-		Format:     vai.AudioFormatWAV, // wav/mp3/pcm
-		Speed:      1.0,
-		Volume:     1.0,
-		SampleRate: 24000,
-	},
+	STTModel: "cartesia/ink-whisper", // optional; default shown
+	TTSModel: "cartesia/sonic-3",     // optional; default shown
+	Voice: vai.VoiceOutput(
+		"a0e99841-438c-4a64-b679-ae501e7d6091",
+		vai.WithAudioFormat(vai.AudioFormatWAV), // wav/mp3/pcm
+	),
 }
 ```
 
 Convenience helpers:
 
-- `vai.VoiceInput(...)`
+- `vai.AudioSTT(...)`
+- `vai.WithSTTLanguage(...)`
 - `vai.VoiceOutput(voiceID, ...)`
-- `vai.VoiceFull(voiceID, ...)`
 
 Semantics:
 
-- Voice mode is opt-in (`req.Voice != nil`).
-- Missing Cartesia configuration while voice mode is requested is a fail-fast error.
-- `Messages.Create` and `Messages.Stream` store concatenated input transcript in response metadata (`user_transcript`) when input audio was present.
+- `audio_stt` blocks are transcribed to `text` before model execution.
+- Raw `audio` blocks are never auto-transcribed; they remain raw multimodal input.
+- Output synthesis is opt-in via `req.Voice.Output`.
+- `voice.input` has been removed and is rejected (`param=voice.input`).
+- Missing Cartesia configuration while STT/TTS is requested is a fail-fast error.
+- `Messages.Create` and `Messages.Stream` store concatenated `audio_stt` transcript in response metadata (`user_transcript`).
 - `Messages.Stream` preserves `Events()` and emits audio deltas through `AudioEvents()`.
 - `RunStream` emits `AudioChunkEvent` in `Events()` and appends final audio to terminal `RunResult.Response`.
 
@@ -1334,7 +1341,6 @@ Live mode uses a tool to represent “assistant speech”:
 V1 requirement:
 - For live mode, models should be prompted to respond by calling `talk_to_user` (or choose to wait).
 - If the model returns plain text without calling `talk_to_user`, decide a policy:
-  - **lenient (recommended to start):** synthesize the plain text as if it were `talk_to_user`
   - **strict:** treat as a policy violation and fail the turn (better once prompts are stable)
 
 Terminal semantics:

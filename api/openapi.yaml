@@ -39,7 +39,7 @@ paths:
         Authentication:
         - Gateway auth is configured server-side (`auth_mode=required|optional|disabled`).
         - Upstream provider auth is BYOK-first via `X-Provider-Key-*` headers, determined by `model` provider.
-        - If `voice` is set, `X-Provider-Key-Cartesia` is required.
+        - If the request contains `audio_stt` blocks or `voice.output`, `X-Provider-Key-Cartesia` is required.
       operationId: postV1Messages
       parameters:
         - $ref: "#/components/parameters/XVAIversion"
@@ -491,7 +491,7 @@ components:
       in: header
       required: false
       schema: { type: string }
-      description: BYOK header for voice STT/TTS (Cartesia). Required when `voice` is set.
+      description: BYOK header for voice STT/TTS (Cartesia). Required when the request includes `audio_stt` blocks or `voice.output`.
 
     XProviderKeyElevenLabs:
       name: X-Provider-Key-ElevenLabs
@@ -669,6 +669,14 @@ components:
           $ref: "#/components/schemas/OutputFormat"
         output:
           $ref: "#/components/schemas/OutputConfig"
+        stt_model:
+          type: string
+          description: STT model identifier in `provider/model` format, used for `audio_stt` preprocessing.
+          default: cartesia/ink-whisper
+        tts_model:
+          type: string
+          description: TTS model identifier in `provider/model` format, used when `voice.output` is set.
+          default: cartesia/sonic-3
         voice:
           $ref: "#/components/schemas/VoiceConfig"
         extensions:
@@ -827,6 +835,7 @@ components:
         - $ref: "#/components/schemas/TextBlock"
         - $ref: "#/components/schemas/ImageBlock"
         - $ref: "#/components/schemas/AudioBlock"
+        - $ref: "#/components/schemas/AudioSTTBlock"
         - $ref: "#/components/schemas/VideoBlock"
         - $ref: "#/components/schemas/DocumentBlock"
         - $ref: "#/components/schemas/ToolUseBlock"
@@ -845,6 +854,7 @@ components:
         - $ref: "#/components/schemas/TextBlock"
         - $ref: "#/components/schemas/ImageBlock"
         - $ref: "#/components/schemas/AudioBlock"
+        - $ref: "#/components/schemas/AudioSTTBlock"
         - $ref: "#/components/schemas/VideoBlock"
         - $ref: "#/components/schemas/DocumentBlock"
         - $ref: "#/components/schemas/ToolUseBlock"
@@ -902,6 +912,17 @@ components:
         transcript:
           type: string
           description: Optional transcript for output audio blocks.
+
+    AudioSTTBlock:
+      type: object
+      required: [type, source]
+      properties:
+        type: { type: string, const: audio_stt }
+        source:
+          $ref: "#/components/schemas/AudioSource"
+        language:
+          type: string
+          description: Optional language hint for speech-to-text.
 
     AudioSource:
       type: object
@@ -1255,21 +1276,10 @@ components:
     # --- Voice ---
     VoiceConfig:
       type: object
+      description: Output-side voice synthesis config.
       properties:
-        input:
-          $ref: "#/components/schemas/VoiceInputConfig"
         output:
           $ref: "#/components/schemas/VoiceOutputConfig"
-
-    VoiceInputConfig:
-      type: object
-      properties:
-        model:
-          type: string
-          example: ink-whisper
-        language:
-          type: string
-          example: en
 
     VoiceOutputConfig:
       type: object

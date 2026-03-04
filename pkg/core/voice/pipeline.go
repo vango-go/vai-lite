@@ -46,14 +46,10 @@ func (p *Pipeline) TTSProvider() tts.Provider {
 	return p.ttsProvider
 }
 
-// ProcessInputAudio transcribes audio content blocks in messages.
-// It returns the processed messages with audio blocks replaced by text,
-// and the concatenated transcript of all audio blocks.
-func (p *Pipeline) ProcessInputAudio(ctx context.Context, messages []types.Message, cfg *types.VoiceConfig) ([]types.Message, string, error) {
-	if cfg == nil || cfg.Input == nil {
-		return messages, "", nil // No voice input config
-	}
-
+// ProcessAudioSTT transcribes audio_stt content blocks in messages.
+// It returns processed messages with audio_stt blocks replaced by text
+// and a concatenated transcript string for metadata.user_transcript.
+func (p *Pipeline) ProcessAudioSTT(ctx context.Context, messages []types.Message, sttModel string) ([]types.Message, string, error) {
 	var transcriptParts []string
 	result := make([]types.Message, 0, len(messages))
 
@@ -62,7 +58,7 @@ func (p *Pipeline) ProcessInputAudio(ctx context.Context, messages []types.Messa
 		newBlocks := make([]types.ContentBlock, 0, len(blocks))
 
 		for _, block := range blocks {
-			audioBlock, ok := block.(types.AudioBlock)
+			audioBlock, ok := asAudioSTTBlock(block)
 			if !ok {
 				newBlocks = append(newBlocks, block)
 				continue
@@ -76,8 +72,8 @@ func (p *Pipeline) ProcessInputAudio(ctx context.Context, messages []types.Messa
 
 			// Transcribe
 			trans, err := p.sttProvider.Transcribe(ctx, bytes.NewReader(audioData), stt.TranscribeOptions{
-				Model:      cfg.Input.Model,
-				Language:   cfg.Input.Language,
+				Model:      sttModel,
+				Language:   audioBlock.Language,
 				Format:     getFormatFromMediaType(audioBlock.Source.MediaType),
 				Timestamps: true,
 			})
@@ -107,7 +103,7 @@ func (p *Pipeline) ProcessInputAudio(ctx context.Context, messages []types.Messa
 }
 
 // SynthesizeResponse converts text response to audio.
-func (p *Pipeline) SynthesizeResponse(ctx context.Context, text string, cfg *types.VoiceConfig) ([]byte, error) {
+func (p *Pipeline) SynthesizeResponse(ctx context.Context, text string, cfg *types.VoiceConfig, ttsModel string) ([]byte, error) {
 	if cfg == nil || cfg.Output == nil {
 		return nil, nil
 	}
@@ -123,6 +119,7 @@ func (p *Pipeline) SynthesizeResponse(ctx context.Context, text string, cfg *typ
 	}
 
 	synth, err := p.ttsProvider.Synthesize(ctx, text, tts.SynthesizeOptions{
+		Model:      ttsModel,
 		Voice:      cfg.Output.Voice,
 		Speed:      cfg.Output.Speed,
 		Volume:     cfg.Output.Volume,
@@ -141,6 +138,7 @@ func (p *Pipeline) SynthesizeResponse(ctx context.Context, text string, cfg *typ
 type StreamingSynthesizer struct {
 	pipeline *Pipeline
 	cfg      *types.VoiceConfig
+	ttsModel string
 	buffer   *SentenceBuffer
 	chunks   chan AudioChunk
 	done     chan struct{}
@@ -155,10 +153,11 @@ type AudioChunk struct {
 }
 
 // NewStreamingSynthesizer creates a synthesizer for streaming text.
-func (p *Pipeline) NewStreamingSynthesizer(ctx context.Context, cfg *types.VoiceConfig) *StreamingSynthesizer {
+func (p *Pipeline) NewStreamingSynthesizer(ctx context.Context, cfg *types.VoiceConfig, ttsModel string) *StreamingSynthesizer {
 	return &StreamingSynthesizer{
 		pipeline: p,
 		cfg:      cfg,
+		ttsModel: ttsModel,
 		buffer:   NewSentenceBuffer(),
 		chunks:   make(chan AudioChunk, 10),
 		done:     make(chan struct{}),
@@ -183,6 +182,7 @@ func (s *StreamingSynthesizer) AddText(text string) {
 			defer s.wg.Done()
 
 			synth, err := s.pipeline.ttsProvider.Synthesize(s.ctx, sent, tts.SynthesizeOptions{
+				Model:      s.ttsModel,
 				Voice:      s.cfg.Output.Voice,
 				Speed:      s.cfg.Output.Speed,
 				Volume:     s.cfg.Output.Volume,
@@ -244,12 +244,13 @@ func getFormatFromMediaType(mediaType string) string {
 
 // NewStreamingTTSContext creates a streaming TTS context for incremental synthesis.
 // Text can be sent incrementally via SendText(), and audio is streamed back via Audio().
-func (p *Pipeline) NewStreamingTTSContext(ctx context.Context, cfg *types.VoiceConfig) (*tts.StreamingContext, error) {
+func (p *Pipeline) NewStreamingTTSContext(ctx context.Context, cfg *types.VoiceConfig, ttsModel string) (*tts.StreamingContext, error) {
 	if cfg == nil || cfg.Output == nil {
 		return nil, fmt.Errorf("voice output config required")
 	}
 
 	opts := tts.StreamingContextOptions{
+		Model:   ttsModel,
 		Voice:   cfg.Output.Voice,
 		Speed:   cfg.Output.Speed,
 		Volume:  cfg.Output.Volume,
@@ -264,4 +265,16 @@ func (p *Pipeline) NewStreamingTTSContext(ctx context.Context, cfg *types.VoiceC
 	}
 
 	return p.ttsProvider.NewStreamingContext(ctx, opts)
+}
+
+func asAudioSTTBlock(block types.ContentBlock) (types.AudioSTTBlock, bool) {
+	switch b := block.(type) {
+	case types.AudioSTTBlock:
+		return b, true
+	case *types.AudioSTTBlock:
+		if b != nil {
+			return *b, true
+		}
+	}
+	return types.AudioSTTBlock{}, false
 }

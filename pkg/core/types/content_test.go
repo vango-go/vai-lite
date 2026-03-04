@@ -167,6 +167,11 @@ func TestUnmarshalContentBlock(t *testing.T) {
 			wantType: "tool_use",
 		},
 		{
+			name:     "audio stt block",
+			json:     `{"type":"audio_stt","source":{"type":"base64","media_type":"audio/wav","data":"AAAA"},"language":"en"}`,
+			wantType: "audio_stt",
+		},
+		{
 			name:     "thinking block",
 			json:     `{"type":"thinking","thinking":"Let me think..."}`,
 			wantType: "thinking",
@@ -268,6 +273,7 @@ func TestContentBlock_Interface(t *testing.T) {
 	var _ ContentBlock = TextBlock{}
 	var _ ContentBlock = ImageBlock{}
 	var _ ContentBlock = AudioBlock{}
+	var _ ContentBlock = AudioSTTBlock{}
 	var _ ContentBlock = VideoBlock{}
 	var _ ContentBlock = DocumentBlock{}
 	var _ ContentBlock = ToolResultBlock{}

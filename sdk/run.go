@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"github.com/vango-go/vai-lite/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 )
 
@@ -279,8 +280,8 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 	userTranscript := ""
 	proxyMode := s.client != nil && s.client.isProxyMode()
 
-	if !proxyMode && req.Voice != nil && req.Voice.Input != nil {
-		processedReq, transcript, err := s.preprocessVoiceInput(ctx, req)
+	if !proxyMode && types.RequestHasAudioSTT(req) {
+		processedReq, transcript, err := s.preprocessAudioSTT(ctx, req)
 		if err != nil {
 			return nil, err
 		}
@@ -387,8 +388,16 @@ func (s *MessagesService) runLoop(ctx context.Context, req *MessageRequest, cfg 
 			StopSequences: workingReq.StopSequences,
 			Tools:         mergeTools(workingReq.Tools, cfg.extraTools),
 			ToolChoice:    workingReq.ToolChoice,
+			STTModel:      workingReq.STTModel,
+			TTSModel:      workingReq.TTSModel,
 			OutputFormat:  workingReq.OutputFormat,
 			Output:        workingReq.Output,
+			Voice: func() *types.VoiceConfig {
+				if proxyMode {
+					return workingReq.Voice
+				}
+				return nil
+			}(),
 			Extensions:    workingReq.Extensions,
 			Metadata:      workingReq.Metadata,
 		}
@@ -902,6 +911,7 @@ type runVoiceStreamer struct {
 	maxChars     int
 	maxDelay     time.Duration
 	sentenceEnds string
+	sentSpoken   bool
 
 	errMu sync.Mutex
 	err   error
@@ -967,8 +977,17 @@ func (vs *runVoiceStreamer) sendBufferLocked(isFinal bool) error {
 
 	var err error
 	if content != "" {
+		if !vs.sentSpoken && !hasSpokenText(content) {
+			return nil
+		}
+		if hasSpokenText(content) {
+			vs.sentSpoken = true
+		}
 		err = vs.ttsCtx.SendText(content, isFinal)
 	} else {
+		if !vs.sentSpoken {
+			return nil
+		}
 		err = vs.ttsCtx.Flush()
 	}
 	if err != nil {
@@ -1070,8 +1089,8 @@ func (s *MessagesService) runStreamLoop(ctx context.Context, req *MessageRequest
 	proxyMode := s.client != nil && s.client.isProxyMode()
 
 	workingReq := req
-	if !proxyMode && req != nil && req.Voice != nil && req.Voice.Input != nil {
-		workingReq, userTranscript, prepErr = s.preprocessVoiceInput(ctx, req)
+	if !proxyMode && req != nil && types.RequestHasAudioSTT(req) {
+		workingReq, userTranscript, prepErr = s.preprocessAudioSTT(ctx, req)
 	}
 	if !proxyMode && prepErr == nil && req != nil && req.Voice != nil && req.Voice.Output != nil {
 		prepErr = s.requireVoicePipeline()
@@ -1137,7 +1156,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 	voiceEnabled := !proxyMode && req.Voice != nil && req.Voice.Output != nil
 	var voiceStream *runVoiceStreamer
 	newVoiceStream := func() (*runVoiceStreamer, error) {
-		ttsCtx, err := svc.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice)
+		ttsModel, err := svc.resolveTTSModel(req)
+		if err != nil {
+			return nil, err
+		}
+		ttsCtx, err := svc.client.voicePipeline.NewStreamingTTSContext(ctx, req.Voice, ttsModel)
 		if err != nil {
 			return nil, fmt.Errorf("initialize voice output stream: %w", err)
 		}
@@ -1292,6 +1315,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 		rs.mu.RLock()
 		historySnapshot := make([]types.Message, len(rs.messages))
 		copy(historySnapshot, rs.messages)
+		var turnVoice *types.VoiceConfig
+		if proxyMode {
+			// In proxy mode, gateway handles STT/TTS and requires Voice on each turn request.
+			turnVoice = req.Voice
+		}
 		turnReq := &types.MessageRequest{
 			Model:         req.Model,
 			Messages:      historySnapshot,
@@ -1304,8 +1332,11 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 			Tools:         mergeTools(req.Tools, cfg.extraTools),
 			ToolChoice:    req.ToolChoice,
 			Stream:        true, // Always stream in RunStream
+			STTModel:      req.STTModel,
+			TTSModel:      req.TTSModel,
 			OutputFormat:  req.OutputFormat,
 			Output:        req.Output,
+			Voice:         turnVoice,
 			Extensions:    req.Extensions,
 			Metadata:      req.Metadata,
 		}
@@ -1407,8 +1438,13 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 					}
 
 					injectedMessage := intReq.message
-					if !proxyMode && req.Voice != nil && req.Voice.Input != nil {
-						processed, transcript, err := svc.client.voicePipeline.ProcessInputAudio(ctx, []types.Message{injectedMessage}, req.Voice)
+					if !proxyMode && types.ContentBlocksHaveAudioSTT(injectedMessage.ContentBlocks()) {
+						tmpReq := &types.MessageRequest{
+							Model:    req.Model,
+							Messages: []types.Message{injectedMessage},
+							STTModel: req.STTModel,
+						}
+						processedReq, transcript, err := voice.PreprocessMessageRequestAudioSTT(ctx, svc.client.voicePipeline, tmpReq)
 						if err != nil {
 							intReq.result <- fmt.Errorf("transcribe interrupt audio: %w", err)
 							result.StopReason = RunStopError
@@ -1417,8 +1453,8 @@ func (rs *RunStream) run(ctx context.Context, svc *MessagesService, req *Message
 							rs.err = err
 							return
 						}
-						if len(processed) > 0 {
-							injectedMessage = processed[0]
+						if len(processedReq.Messages) > 0 {
+							injectedMessage = processedReq.Messages[0]
 						}
 						appendTranscript(transcript)
 					}

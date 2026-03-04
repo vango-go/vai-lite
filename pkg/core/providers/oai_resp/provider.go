@@ -120,6 +120,13 @@ func (p *Provider) StreamMessage(ctx context.Context, req *types.MessageRequest)
 
 // validateRequest checks for unsupported features and returns an error if found.
 func (p *Provider) validateRequest(req *types.MessageRequest) error {
+	if types.RequestHasAudioSTT(req) {
+		return &Error{
+			Type:    ErrInvalidRequest,
+			Message: "audio_stt blocks must be transcribed before OpenAI Responses request translation",
+			Param:   "messages",
+		}
+	}
 	if len(req.StopSequences) > 0 {
 		return &Error{
 			Type:    "unsupported_feature",

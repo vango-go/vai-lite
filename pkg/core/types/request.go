@@ -21,6 +21,10 @@ type MessageRequest struct {
 	// Streaming
 	Stream bool `json:"stream,omitempty"`
 
+	// Voice model defaults (provider/model format)
+	STTModel string `json:"stt_model,omitempty"`
+	TTSModel string `json:"tts_model,omitempty"`
+
 	// Output configuration
 	OutputFormat *OutputFormat `json:"output_format,omitempty"`
 	Output       *OutputConfig `json:"output,omitempty"`

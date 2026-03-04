@@ -39,19 +39,19 @@ func (f *fakeTTS) NewStreamingContext(ctx context.Context, opts tts.StreamingCon
 	return nil, nil
 }
 
-func TestPreprocessMessageRequestInputAudio_DoesNotMutateOriginal(t *testing.T) {
+func TestPreprocessMessageRequestAudioSTT_DoesNotMutateOriginal(t *testing.T) {
 	p := NewPipelineWithProviders(&fakeSTT{}, &fakeTTS{})
 
 	audioData := []byte{0x00, 0x01, 0x02}
 	req := &types.MessageRequest{
-		Model: "anthropic/test",
-		Voice: &types.VoiceConfig{Input: &types.VoiceInputConfig{}},
+		Model:    "anthropic/test",
+		STTModel: "cartesia/ink-whisper",
 		Messages: []types.Message{
 			{
 				Role: "user",
 				Content: []types.ContentBlock{
-					types.AudioBlock{
-						Type: "audio",
+					types.AudioSTTBlock{
+						Type: "audio_stt",
 						Source: types.AudioSource{
 							Type:      "base64",
 							MediaType: "audio/wav",
@@ -63,7 +63,7 @@ func TestPreprocessMessageRequestInputAudio_DoesNotMutateOriginal(t *testing.T) 
 		},
 	}
 
-	processed, transcript, err := PreprocessMessageRequestInputAudio(context.Background(), p, req)
+	processed, transcript, err := PreprocessMessageRequestAudioSTT(context.Background(), p, req)
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -74,10 +74,10 @@ func TestPreprocessMessageRequestInputAudio_DoesNotMutateOriginal(t *testing.T) 
 		t.Fatalf("transcript=%q, expected hello", transcript)
 	}
 
-	// Original request still contains audio block.
+	// Original request still contains audio_stt block.
 	origBlocks := req.Messages[0].ContentBlocks()
-	if _, ok := origBlocks[0].(types.AudioBlock); !ok {
-		t.Fatalf("expected original to contain audio block, got %T", origBlocks[0])
+	if _, ok := origBlocks[0].(types.AudioSTTBlock); !ok {
+		t.Fatalf("expected original to contain audio_stt block, got %T", origBlocks[0])
 	}
 
 	// Processed request contains text block.
@@ -112,7 +112,7 @@ func TestAppendVoiceOutputToMessageResponse_AppendsAudioBlock(t *testing.T) {
 		StopReason: types.StopReasonEndTurn,
 	}
 
-	if err := AppendVoiceOutputToMessageResponse(context.Background(), p, cfg, resp); err != nil {
+	if err := AppendVoiceOutputToMessageResponse(context.Background(), p, cfg, "cartesia/sonic-3", resp); err != nil {
 		t.Fatalf("err = %v", err)
 	}
 	if len(resp.Content) != 2 {

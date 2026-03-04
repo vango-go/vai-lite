@@ -5,7 +5,7 @@ import (
 )
 
 // ContentBlock is the interface for all content types.
-// INPUT:  text, image, audio, video, document, tool_result
+// INPUT:  text, image, audio, audio_stt, video, document, tool_result
 // OUTPUT: text, tool_use, thinking, image, audio
 type ContentBlock interface {
 	BlockType() string
@@ -45,6 +45,15 @@ type AudioBlock struct {
 }
 
 func (t AudioBlock) BlockType() string { return "audio" }
+
+// AudioSTTBlock represents audio input that must be transcribed before LLM execution.
+type AudioSTTBlock struct {
+	Type     string      `json:"type"` // "audio_stt"
+	Source   AudioSource `json:"source"`
+	Language string      `json:"language,omitempty"` // Optional ISO language code hint for STT.
+}
+
+func (t AudioSTTBlock) BlockType() string { return "audio_stt" }
 
 // AudioSource contains the audio data.
 type AudioSource struct {
@@ -224,6 +233,13 @@ func UnmarshalContentBlock(data []byte) (ContentBlock, error) {
 
 	case "audio":
 		var block AudioBlock
+		if err := json.Unmarshal(data, &block); err != nil {
+			return nil, err
+		}
+		return block, nil
+
+	case "audio_stt":
+		var block AudioSTTBlock
 		if err := json.Unmarshal(data, &block); err != nil {
 			return nil, err
 		}

@@ -238,6 +238,41 @@ func TestValidateRequest_RejectsStopSequences(t *testing.T) {
 	}
 }
 
+func TestValidateRequest_RejectsAudioSTTBlocks(t *testing.T) {
+	p := &Provider{}
+	err := p.validateRequest(&types.MessageRequest{
+		Model: "gpt-5-mini",
+		Messages: []types.Message{
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioSTTBlock{
+						Type: "audio_stt",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected audio_stt validation error")
+	}
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error type = %T, want *Error", err)
+	}
+	if oe.Type != ErrInvalidRequest {
+		t.Fatalf("error type = %q, want %q", oe.Type, ErrInvalidRequest)
+	}
+	if oe.Param != "messages" {
+		t.Fatalf("param = %q, want messages", oe.Param)
+	}
+}
+
 func TestEnsurePropertiesInSchema_AlwaysIncludesProperties(t *testing.T) {
 	schema := &types.JSONSchema{Type: "object"}
 	raw := ensurePropertiesInSchema(schema)

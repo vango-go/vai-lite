@@ -13,7 +13,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
-func TestMessagesRun_InputVoicePreprocessesHistory(t *testing.T) {
+func TestMessagesRun_AudioSTTPreprocessesHistory(t *testing.T) {
 	provider := newScriptedProvider("test").withCreateResponses(textResponse("done"))
 	svc := newMessagesServiceForMessagesTest(provider)
 	attachVoicePipelineForSDKTests(svc, &fakeSDKSTTProvider{transcripts: []string{"from audio"}}, &fakeSDKTTSProvider{})
@@ -22,9 +22,9 @@ func TestMessagesRun_InputVoicePreprocessesHistory(t *testing.T) {
 		Model: "test/model",
 		Messages: []Message{{
 			Role:    "user",
-			Content: ContentBlocks(Audio([]byte("bytes"), "audio/wav")),
+			Content: ContentBlocks(AudioSTT([]byte("bytes"), "audio/wav")),
 		}},
-		Voice: VoiceInput(),
+		STTModel: "cartesia/ink-whisper",
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -38,6 +38,33 @@ func TestMessagesRun_InputVoicePreprocessesHistory(t *testing.T) {
 	}
 	if tb, ok := blocks[0].(types.TextBlock); !ok || tb.Text != "from audio" {
 		t.Fatalf("expected transcribed text block, got %#v", blocks[0])
+	}
+}
+
+func TestMessagesRun_RawAudioIsNotTranscribedImplicitly(t *testing.T) {
+	provider := newScriptedProvider("test").withCreateResponses(textResponse("done"))
+	svc := newMessagesServiceForMessagesTest(provider)
+	attachVoicePipelineForSDKTests(svc, &fakeSDKSTTProvider{transcripts: []string{"unused"}}, &fakeSDKTTSProvider{})
+
+	_, err := svc.Run(context.Background(), &MessageRequest{
+		Model: "test/model",
+		Messages: []Message{{
+			Role:    "user",
+			Content: ContentBlocks(Audio([]byte("bytes"), "audio/wav")),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(provider.createRequests) == 0 {
+		t.Fatalf("expected create request")
+	}
+	blocks := provider.createRequests[0].Messages[0].ContentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("len(blocks) = %d, want 1", len(blocks))
+	}
+	if _, ok := blocks[0].(types.AudioBlock); !ok {
+		t.Fatalf("expected raw audio passthrough, got %#v", blocks[0])
 	}
 }
 

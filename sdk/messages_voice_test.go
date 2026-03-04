@@ -10,7 +10,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
-func TestMessagesCreate_TranscribesAudioInputAndSetsUserTranscript(t *testing.T) {
+func TestMessagesCreate_TranscribesAudioSTTAndSetsUserTranscript(t *testing.T) {
 	provider := newScriptedProvider("test").withCreateResponses(textResponse("hello"))
 	svc := newMessagesServiceForMessagesTest(provider)
 	attachVoicePipelineForSDKTests(
@@ -24,10 +24,10 @@ func TestMessagesCreate_TranscribesAudioInputAndSetsUserTranscript(t *testing.T)
 		Messages: []Message{{
 			Role: "user",
 			Content: ContentBlocks(
-				Audio([]byte("audio-data"), "audio/wav"),
+				AudioSTT([]byte("audio-data"), "audio/wav"),
 			),
 		}},
-		Voice: VoiceInput(),
+		STTModel: "cartesia/ink-whisper",
 	})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -48,6 +48,42 @@ func TestMessagesCreate_TranscribesAudioInputAndSetsUserTranscript(t *testing.T)
 	}
 	if textBlock.Text != "transcribed user audio" {
 		t.Fatalf("transcribed text = %q, want %q", textBlock.Text, "transcribed user audio")
+	}
+}
+
+func TestMessagesCreate_RawAudioIsNotTranscribedImplicitly(t *testing.T) {
+	provider := newScriptedProvider("test").withCreateResponses(textResponse("hello"))
+	svc := newMessagesServiceForMessagesTest(provider)
+	attachVoicePipelineForSDKTests(
+		svc,
+		&fakeSDKSTTProvider{transcripts: []string{"should-not-be-used"}},
+		&fakeSDKTTSProvider{},
+	)
+
+	resp, err := svc.Create(context.Background(), &MessageRequest{
+		Model: "test/model",
+		Messages: []Message{{
+			Role: "user",
+			Content: ContentBlocks(
+				Audio([]byte("audio-data"), "audio/wav"),
+			),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if resp.UserTranscript() != "" {
+		t.Fatalf("UserTranscript() = %q, want empty", resp.UserTranscript())
+	}
+	if len(provider.createRequests) != 1 {
+		t.Fatalf("len(createRequests) = %d, want 1", len(provider.createRequests))
+	}
+	requestBlocks := provider.createRequests[0].Messages[0].ContentBlocks()
+	if len(requestBlocks) != 1 {
+		t.Fatalf("len(request blocks) = %d, want 1", len(requestBlocks))
+	}
+	if _, ok := requestBlocks[0].(types.AudioBlock); !ok {
+		t.Fatalf("expected raw audio block passthrough, got %T", requestBlocks[0])
 	}
 }
 
@@ -84,17 +120,18 @@ func TestMessagesCreate_AppendsSynthesizedAudioBlock(t *testing.T) {
 	}
 }
 
-func TestMessagesCreate_VoiceRequestedWithoutPipelineErrors(t *testing.T) {
+func TestMessagesCreate_AudioSTTWithoutPipelineErrors(t *testing.T) {
 	provider := newScriptedProvider("test").withCreateResponses(textResponse("hello"))
 	svc := newMessagesServiceForMessagesTest(provider)
 
 	_, err := svc.Create(context.Background(), &MessageRequest{
 		Model: "test/model",
 		Messages: []Message{{
-			Role:    "user",
-			Content: Text("hello"),
+			Role: "user",
+			Content: ContentBlocks(
+				AudioSTT([]byte("audio-data"), "audio/wav"),
+			),
 		}},
-		Voice: VoiceInput(),
 	})
 	if err == nil {
 		t.Fatalf("expected missing Cartesia error")

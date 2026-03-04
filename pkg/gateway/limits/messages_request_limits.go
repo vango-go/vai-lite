@@ -152,6 +152,19 @@ func validateBlocks(
 				}
 			}
 
+		case types.AudioSTTBlock:
+			if isBase64Source(b.Source.Type) {
+				if err := addB64(path+".source.data", b.Source.Data); err != nil {
+					return err
+				}
+			}
+		case *types.AudioSTTBlock:
+			if b != nil && isBase64Source(b.Source.Type) {
+				if err := addB64(path+".source.data", b.Source.Data); err != nil {
+					return err
+				}
+			}
+
 		case types.VideoBlock:
 			if isBase64Source(b.Source.Type) {
 				if err := addB64(path+".source.data", b.Source.Data); err != nil {

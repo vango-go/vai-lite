@@ -1,16 +1,8 @@
 package types
 
-// VoiceConfig configures the voice pipeline (STT -> LLM -> TTS).
+// VoiceConfig configures output-side voice synthesis (TTS).
 type VoiceConfig struct {
-	Input  *VoiceInputConfig  `json:"input,omitempty"`
 	Output *VoiceOutputConfig `json:"output,omitempty"`
-}
-
-// VoiceInputConfig configures speech-to-text.
-// Currently only Cartesia (ink-whisper) is supported.
-type VoiceInputConfig struct {
-	Model    string `json:"model,omitempty"`    // Model: "ink-whisper" (default)
-	Language string `json:"language,omitempty"` // ISO language code (default: "en")
 }
 
 // VoiceOutputConfig configures text-to-speech.

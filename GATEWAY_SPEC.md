@@ -444,6 +444,8 @@ Single-turn LLM execution. Provider-routed based on `request.model`.
       ]
     }
   ],
+  "stt_model": "cartesia/ink-whisper",
+  "tts_model": "cartesia/sonic-3",
   "tools": [],
   "tool_choice": null,
   "output_format": null,
@@ -455,7 +457,9 @@ Single-turn LLM execution. Provider-routed based on `request.model`.
 - `model` is a `provider/model-name` string. Routing splits on the **first `/` only**; the remainder may contain additional `/` characters (e.g., `openrouter/openai/gpt-4o`).
 - `system` may be a string or `[]ContentBlock` (union; see [5.2](#52-messagerequestsystem-union)).
 - `messages[].content` may be a string or `[]ContentBlock` (union; see [5.3](#53-messagecontent-union)).
-- `voice` is optional; see [section 10](#10-voice-support-on-v1messages).
+- `stt_model` is optional (`provider/model`, default `cartesia/ink-whisper`).
+- `tts_model` is optional (`provider/model`, default `cartesia/sonic-3`).
+- `voice` is optional output config (`voice.output`); see [section 10](#10-voice-support-on-v1messages).
 - `output_format` is optional; see [5.8](#58-structured-output-output_format-handling).
 - `stream` must be `false` or omitted for non-streaming.
 
@@ -495,9 +499,9 @@ X-Output-Tokens: 8
 3. Resolve BYOK provider key header.
 4. Validate model against allowlist (if configured).
 5. Provider feature compatibility validation (reject unsupported blocks/tools for this provider).
-6. Voice input preprocessing (STT) if `req.Voice.Input` is set.
+6. Voice input preprocessing (STT) when `audio_stt` blocks are present.
 7. Call upstream provider `CreateMessage`.
-8. Voice output post-processing (TTS) if `req.Voice.Output` is set.
+8. Voice output post-processing (TTS) if `req.Voice.Output` is set (using `tts_model` defaulting).
 9. Return `types.MessageResponse`.
 
 ### 4.2 POST /v1/messages (SSE streaming)
@@ -793,6 +797,7 @@ Known content block types (request-valid):
 - `text`
 - `image` (with `source` or `url`)
 - `audio` (with `source`)
+- `audio_stt` (with `source`, optional `language`) for transcribe-before-LLM audio
 - `video` (with `source`)
 - `document` (with `source`)
 - `tool_use` (in assistant messages — tool call history)
@@ -800,6 +805,7 @@ Known content block types (request-valid):
 - `thinking` (in assistant messages — extended thinking)
 
 Unknown `type` values in request bodies are rejected with an error.
+`audio_stt` is preprocessed by the gateway voice pipeline; raw `audio` remains provider multimodal input.
 
 ### 5.5 Tool config strict decoding
 
@@ -851,8 +857,8 @@ All limits are configurable. Defaults:
 | `max_messages` | 64 | Messages per request |
 | `max_total_text_bytes` | 512 KiB | Total text content across all messages |
 | `max_tools` | 64 | Tools per request |
-| `max_b64_bytes_per_block` | 4 MiB decoded | Per content block (images, audio, documents) |
-| `max_b64_bytes_total` | 12 MiB decoded | Total across all blocks in request |
+| `max_b64_bytes_per_block` | 4 MiB decoded | Per content block (images, audio, audio_stt, documents) |
+| `max_b64_bytes_total` | 12 MiB decoded | Total across all blocks in request (including `audio_stt`) |
 
 ### 5.8 Structured output (`output_format`) handling
 
@@ -1415,20 +1421,22 @@ Voice processing on `/v1/messages` uses shared helper code (in `pkg/core/voice/`
 
 ### 10.1 Voice input (STT)
 
-When `request.voice.input` is set:
-1. The gateway transcribes `audio` content blocks (base64 PCM/WAV) to `text` blocks via Cartesia STT prior to provider execution.
-2. The original audio blocks are replaced with transcribed text blocks in the request sent to the LLM.
+When the request contains `audio_stt` blocks:
+1. The gateway resolves `stt_model` (default `cartesia/ink-whisper`) and transcribes each `audio_stt` block to a `text` block prior to provider execution.
+2. The original `audio_stt` blocks are replaced with transcribed text blocks in the request sent to the LLM, preserving block order.
 3. The response includes `metadata.user_transcript` with the concatenated transcript.
 
-Shared helper: `voice.PreprocessMessageRequestInputAudio(ctx, pipeline, req)`.
+Raw `audio` blocks are not transcribed implicitly and are forwarded as raw multimodal input.
+
+Shared helper: `voice.PreprocessMessageRequestAudioSTT(ctx, pipeline, req)`.
 
 ### 10.2 Voice output (TTS, non-streaming)
 
 When `request.voice.output` is set and `stream=false`:
-1. The gateway synthesizes the final assistant text into audio via Cartesia TTS.
+1. The gateway resolves `tts_model` (default `cartesia/sonic-3`) and synthesizes the final assistant text into audio via Cartesia TTS.
 2. An `audio` content block (base64) is appended to the response, with a `transcript` field.
 
-Shared helper: `voice.AppendVoiceOutputToMessageResponse(ctx, pipeline, resp)`.
+Shared helper: `voice.AppendVoiceOutputToMessageResponse(ctx, pipeline, voiceCfg, ttsModel, resp)`.
 
 ### 10.3 Voice output (TTS, streaming)
 
@@ -1460,7 +1468,9 @@ Voice uses Cartesia for both STT and TTS. The Cartesia API key is provided via:
 - Or gateway-managed Cartesia key (future).
 
 Fail-fast behavior:
-- If `request.voice` is set but the Cartesia key is not available, return `401` with a clear error message indicating which credential is missing.
+- If `audio_stt` blocks are present but the Cartesia key is not available, return `401` with a clear missing-credential error.
+- If `request.voice.output` is set but the Cartesia key is not available, return `401` with a clear missing-credential error.
+- If `stt_model` or `tts_model` uses a non-Cartesia provider in v1, return `400 invalid_request_error` with `param=stt_model` or `param=tts_model`.
 
 ---
 
@@ -1966,7 +1976,7 @@ flowchart LR
   - BYOK headers (send only what’s required for the routed provider/model):
     - Determine provider prefix from the *public* model string (before `core.Engine` strips it) and set the correct `X-Provider-Key-*` header per [3.3](#33-byok-provider-key-headers).
     - Voice BYOK headers are orthogonal to the model/provider:
-      - If `request.voice.input` and/or `request.voice.output` is set, and the caller configured a Cartesia key, the SDK MUST send `X-Provider-Key-Cartesia` regardless of which LLM provider is selected (because the gateway will perform STT/TTS).
+      - If the request includes `audio_stt`, `request.voice.output`, or `tts_model`, and the caller configured a Cartesia key, the SDK MUST send `X-Provider-Key-Cartesia` regardless of which LLM provider is selected (because the gateway will perform STT/TTS).
       - Future: Live mode may require `X-Provider-Key-ElevenLabs` for TTS; do not hardcode “only the LLM provider needs a key”.
     - Allow missing BYOK headers to support future managed keys (Phase 2); the gateway will return a canonical auth error if a key is required and missing.
     - Never log or return BYOK header values.

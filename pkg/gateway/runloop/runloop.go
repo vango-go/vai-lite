@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,11 +63,11 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 
 	workingReq := req.Request
 	userTranscript := ""
-	if req.Request.Voice != nil && req.Request.Voice.Input != nil {
+	if types.RequestHasAudioSTT(&req.Request) {
 		if c.VoicePipeline == nil {
-			return nil, &core.Error{Type: core.ErrInvalidRequest, Message: "voice input is not configured", Code: "unsupported_voice"}
+			return nil, &core.Error{Type: core.ErrInvalidRequest, Message: "audio_stt is not configured", Code: "unsupported_voice"}
 		}
-		processed, transcript, err := voice.PreprocessMessageRequestInputAudio(ctx, c.VoicePipeline, &workingReq)
+		processed, transcript, err := voice.PreprocessMessageRequestAudioSTT(ctx, c.VoicePipeline, &workingReq)
 		if err != nil {
 			return nil, err
 		}
@@ -139,6 +140,8 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 			StopSequences: workingReq.StopSequences,
 			Tools:         workingReq.Tools,
 			ToolChoice:    workingReq.ToolChoice,
+			STTModel:      workingReq.STTModel,
+			TTSModel:      workingReq.TTSModel,
 			OutputFormat:  workingReq.OutputFormat,
 			Output:        workingReq.Output,
 			Voice:         workingReq.Voice,
@@ -182,7 +185,7 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 		toolUses := resp.ToolUses()
 		if resp.StopReason != types.StopReasonToolUse || len(toolUses) == 0 {
 			if req.Request.Voice != nil && req.Request.Voice.Output != nil {
-				if err := voice.AppendVoiceOutputToMessageResponse(ctx, c.VoicePipeline, req.Request.Voice, resp); err != nil {
+				if err := voice.AppendVoiceOutputToMessageResponse(ctx, c.VoicePipeline, req.Request.Voice, req.Request.TTSModel, resp); err != nil {
 					result.StopReason = types.RunStopReasonError
 					result.Messages = snapshotHistory()
 					if emit != nil {
@@ -344,7 +347,11 @@ func (c *Controller) streamTurn(ctx context.Context, req *types.MessageRequest, 
 	var ttsStream *voice.StreamingTTS
 	var audioCh <-chan []byte
 	if req.Voice != nil && req.Voice.Output != nil {
-		ttsCtx, err := c.VoicePipeline.NewStreamingTTSContext(ctx, req.Voice)
+		resolvedTTSModel, resolveErr := voice.ResolveTTSModel(req.TTSModel)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		ttsCtx, err := c.VoicePipeline.NewStreamingTTSContext(ctx, req.Voice, resolvedTTSModel.Model)
 		if err != nil {
 			return nil, err
 		}
@@ -419,6 +426,14 @@ func (c *Controller) streamTurn(ctx context.Context, req *types.MessageRequest, 
 					return nil, err
 				}
 				if ttsStream != nil {
+					if cbs, ok := n.ev.(types.ContentBlockStartEvent); ok {
+						if tb, ok := cbs.ContentBlock.(types.TextBlock); ok && strings.TrimSpace(tb.Text) != "" {
+							if err := ttsStream.OnTextDelta(tb.Text); err != nil {
+								_ = emit(types.AudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "TTS synthesis failed: " + err.Error()})
+								ttsStream = nil
+							}
+						}
+					}
 					if cbd, ok := n.ev.(types.ContentBlockDeltaEvent); ok {
 						if td, ok := cbd.Delta.(types.TextDelta); ok {
 							if err := ttsStream.OnTextDelta(td.Text); err != nil {

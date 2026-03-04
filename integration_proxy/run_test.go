@@ -45,6 +45,9 @@ func TestProxy_MessagesRun_ToolExecution_OAIResp(t *testing.T) {
 			vai.WithRunTimeout(60*time.Second),
 		)
 		if err != nil {
+			if isTransientProviderError(err) {
+				t.Skipf("%s transient upstream provider error in non-streaming tool execution test: %v", provider.Name, err)
+			}
 			t.Fatalf("Messages.Run error: %v", err)
 		}
 		if result == nil {

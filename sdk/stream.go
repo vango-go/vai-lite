@@ -195,6 +195,32 @@ streamLoop:
 				currentContent = append(currentContent, nil)
 			}
 			currentContent[e.Index] = e.ContentBlock
+			if s.voiceOutput != nil {
+				switch block := e.ContentBlock.(type) {
+				case types.TextBlock:
+					if strings.TrimSpace(block.Text) != "" {
+						if err := ttsStream.OnTextDelta(block.Text); err != nil {
+							voiceAborted = true
+							if s.err == nil || errors.Is(s.err, io.EOF) {
+								s.err = fmt.Errorf("voice output stream send failed: %w", err)
+							}
+							_ = s.eventStream.Close()
+							break streamLoop
+						}
+					}
+				case *types.TextBlock:
+					if block != nil && strings.TrimSpace(block.Text) != "" {
+						if err := ttsStream.OnTextDelta(block.Text); err != nil {
+							voiceAborted = true
+							if s.err == nil || errors.Is(s.err, io.EOF) {
+								s.err = fmt.Errorf("voice output stream send failed: %w", err)
+							}
+							_ = s.eventStream.Close()
+							break streamLoop
+						}
+					}
+				}
+			}
 		case types.ContentBlockDeltaEvent:
 			// Apply delta to current content block
 			if e.Index < len(currentContent) {

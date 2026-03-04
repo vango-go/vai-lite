@@ -262,6 +262,12 @@ func contentBlockType(block types.ContentBlock) string {
 		if b != nil {
 			return b.Type
 		}
+	case types.AudioSTTBlock:
+		return b.Type
+	case *types.AudioSTTBlock:
+		if b != nil {
+			return b.Type
+		}
 	case types.VideoBlock:
 		return b.Type
 	case *types.VideoBlock:

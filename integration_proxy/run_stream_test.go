@@ -358,6 +358,15 @@ func isModelToolRefusal(err error) bool {
 	return strings.Contains(lower, "tool_use_failed") || strings.Contains(lower, "did not call a tool")
 }
 
+func isTransientProviderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "provider_error:") &&
+		strings.Contains(lower, "an error occurred while processing your request")
+}
+
 func TestProxy_MessagesRunStream_ToolExecution_OAIResp(t *testing.T) {
 	forEachProxyProvider(t, func(t *testing.T, provider proxyProviderConfig) {
 		ctx := testContext(t, 120*time.Second)
@@ -413,6 +422,9 @@ func TestProxy_MessagesRunStream_ToolExecution_OAIResp(t *testing.T) {
 		}
 
 		if streamErr := stream.Err(); streamErr != nil {
+			if isTransientProviderError(streamErr) {
+				t.Skipf("%s transient upstream provider error in streaming tool execution test: %v", provider.Name, streamErr)
+			}
 			t.Fatalf("unexpected stream error: %v", streamErr)
 		}
 

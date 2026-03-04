@@ -124,3 +124,38 @@ func TestValidateMessageRequest_Base64TotalBudget(t *testing.T) {
 		t.Fatalf("param=%q", coreErr.Param)
 	}
 }
+
+func TestValidateMessageRequest_AudioSTTCountsTowardBase64Budgets(t *testing.T) {
+	req := &types.MessageRequest{
+		Model: "anthropic/test",
+		Messages: []types.Message{
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioSTTBlock{
+						Type: "audio_stt",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err := ValidateMessageRequest(req, config.Config{
+		MaxMessages:         64,
+		MaxTotalTextBytes:   1 << 20,
+		MaxB64BytesPerBlock: 1,
+		MaxB64BytesTotal:    100,
+	})
+	var coreErr *core.Error
+	if !errors.As(err, &coreErr) {
+		t.Fatalf("expected core.Error, got %T (%v)", err, err)
+	}
+	if coreErr.Param != "messages[0].content[0].source.data" {
+		t.Fatalf("param=%q", coreErr.Param)
+	}
+}

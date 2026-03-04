@@ -100,8 +100,10 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	workingReq := *runReq
 	workingReq.Request.Model = modelName
 
+	needsSTT := types.RequestHasAudioSTT(&workingReq.Request)
+	needsTTS := workingReq.Request.Voice != nil && workingReq.Request.Voice.Output != nil
 	voicePipeline := h.resolveVoicePipeline(r)
-	if workingReq.Request.Voice != nil && voicePipeline == nil {
+	if (needsSTT || needsTTS) && voicePipeline == nil {
 		writeCoreErrorJSON(w, reqID, &core.Error{Type: core.ErrAuthentication, Message: "missing voice provider api key header", Param: "X-Provider-Key-Cartesia", RequestID: reqID}, http.StatusUnauthorized)
 		return
 	}

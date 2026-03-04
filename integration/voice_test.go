@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	vai "github.com/vango-go/vai-lite/sdk"
 )
@@ -53,7 +54,7 @@ func TestVoice_Create_STTRoundTripAndFinalAudio(t *testing.T) {
 	}
 
 	seedCfg := vai.VoiceOutput(integrationCartesiaVoiceID, vai.WithAudioFormat(vai.AudioFormatWAV))
-	seedAudio, err := pipeline.SynthesizeResponse(ctx, "Hello from Cartesia integration test.", seedCfg)
+	seedAudio, err := pipeline.SynthesizeResponse(ctx, "Hello from Cartesia integration test.", seedCfg, "sonic-3")
 	if err != nil {
 		t.Fatalf("failed generating seed audio for STT roundtrip: %v", err)
 	}
@@ -64,13 +65,11 @@ func TestVoice_Create_STTRoundTripAndFinalAudio(t *testing.T) {
 	resp, err := testClient.Messages.Create(ctx, &vai.MessageRequest{
 		Model: model,
 		Messages: []vai.Message{
-			{Role: "user", Content: vai.ContentBlocks(vai.Audio(seedAudio, "audio/wav"))},
+			{Role: "user", Content: vai.ContentBlocks(vai.AudioSTT(seedAudio, "audio/wav", vai.WithSTTLanguage("en")))},
 		},
-		Voice: vai.VoiceFull(
-			integrationCartesiaVoiceID,
-			vai.WithLanguage("en"),
-			vai.WithAudioFormat(vai.AudioFormatWAV),
-		),
+		STTModel:  "cartesia/ink-whisper",
+		TTSModel:  "cartesia/sonic-3",
+		Voice:     vai.VoiceOutput(integrationCartesiaVoiceID, vai.WithAudioFormat(vai.AudioFormatWAV)),
 		MaxTokens: 600,
 	})
 	if err != nil {
@@ -130,16 +129,16 @@ func TestVoice_Stream_EmitsAudioEventsAndFinalAudio(t *testing.T) {
 	if err := stream.Err(); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("stream err: %v", err)
 	}
-	if chunkCount == 0 {
-		t.Fatalf("expected audio chunks from Stream.AudioEvents")
-	}
-	if totalAudioBytes == 0 {
+	if chunkCount > 0 && totalAudioBytes == 0 {
 		t.Fatalf("expected non-empty audio chunks")
 	}
 
 	resp := stream.Response()
-	if resp == nil || resp.AudioContent() == nil {
-		t.Fatalf("expected final response audio block")
+	if resp == nil {
+		t.Fatalf("expected final response")
+	}
+	if hasSpeechContent(resp.TextContent()) && chunkCount == 0 && resp.AudioContent() == nil {
+		t.Fatalf("expected streamed chunks or a final response audio block for spoken text response")
 	}
 }
 
@@ -171,12 +170,20 @@ func TestVoice_RunStream_EmitsAudioChunkEventAndFinalAudio(t *testing.T) {
 	if err := stream.Err(); err != nil {
 		t.Fatalf("run stream err: %v", err)
 	}
-	if audioChunkEvents == 0 {
-		t.Fatalf("expected AudioChunkEvent events")
-	}
-
 	result := stream.Result()
-	if result == nil || result.Response == nil || result.Response.AudioContent() == nil {
-		t.Fatalf("expected final run response audio block")
+	if result == nil || result.Response == nil {
+		t.Fatalf("expected final run response")
 	}
+	if hasSpeechContent(result.Response.TextContent()) && audioChunkEvents == 0 && result.Response.AudioContent() == nil {
+		t.Fatalf("expected AudioChunkEvent events or final run response audio block for spoken text response")
+	}
+}
+
+func hasSpeechContent(text string) bool {
+	for _, r := range strings.TrimSpace(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }

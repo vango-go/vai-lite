@@ -198,3 +198,20 @@ func TestUnmarshalRunRequestStrict_UnknownTopLevelField(t *testing.T) {
 		t.Fatalf("err=%T %#v", err, err)
 	}
 }
+
+func TestUnmarshalRunRequestStrict_RejectsLegacyVoiceInput(t *testing.T) {
+	_, err := UnmarshalRunRequestStrict([]byte(`{
+		"request":{
+			"model":"anthropic/x",
+			"messages":[{"role":"user","content":"hi"}],
+			"voice":{"input":{"model":"ink-whisper"}}
+		}
+	}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	se, ok := err.(*StrictDecodeError)
+	if !ok || se.Param != "request.voice.input" {
+		t.Fatalf("err=%T %#v", err, err)
+	}
+}

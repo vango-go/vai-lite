@@ -14,6 +14,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/providers/gem"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 	"github.com/vango-go/vai-lite/pkg/core/voice"
+	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/builtins"
 )
@@ -391,6 +392,50 @@ func (f *fakeTTSProvider) NewStreamingContext(ctx context.Context, opts tts.Stre
 	return sc, nil
 }
 
+type fakeRunloopSTTProvider struct {
+	transcript string
+}
+
+func (f *fakeRunloopSTTProvider) Name() string { return "fake-stt" }
+func (f *fakeRunloopSTTProvider) Transcribe(ctx context.Context, audio io.Reader, opts stt.TranscribeOptions) (*stt.Transcript, error) {
+	return &stt.Transcript{Text: f.transcript}, nil
+}
+func (f *fakeRunloopSTTProvider) TranscribeStream(context.Context, io.Reader, stt.TranscribeOptions) (<-chan stt.TranscriptDelta, error) {
+	return nil, nil
+}
+func (f *fakeRunloopSTTProvider) NewStreamingSTT(context.Context, stt.TranscribeOptions) (*stt.StreamingSTT, error) {
+	return nil, nil
+}
+
+type captureCreateProvider struct {
+	lastReq *types.MessageRequest
+	resp    *types.MessageResponse
+}
+
+func (p *captureCreateProvider) Name() string { return "test" }
+func (p *captureCreateProvider) Capabilities() core.ProviderCapabilities {
+	return core.ProviderCapabilities{Tools: true}
+}
+func (p *captureCreateProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
+	if req != nil {
+		reqCopy := *req
+		p.lastReq = &reqCopy
+	}
+	if p.resp != nil {
+		return p.resp, nil
+	}
+	return &types.MessageResponse{
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "m",
+		StopReason: types.StopReasonEndTurn,
+		Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}},
+	}, nil
+}
+func (p *captureCreateProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
+	return nil, io.EOF
+}
+
 func TestRunBlocking_VoiceOutputAppended(t *testing.T) {
 	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{{
 		Type:       "message",
@@ -408,6 +453,88 @@ func TestRunBlocking_VoiceOutputAppended(t *testing.T) {
 	}
 	if audio := result.Response.AudioContent(); audio == nil {
 		t.Fatalf("expected audio content in response: %+v", result.Response.Content)
+	}
+}
+
+func TestRunBlocking_AudioSTTPreprocessedAndTranscriptStored(t *testing.T) {
+	provider := &captureCreateProvider{
+		resp: &types.MessageResponse{
+			Type:       "message",
+			Role:       "assistant",
+			Model:      "m",
+			StopReason: types.StopReasonEndTurn,
+			Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "hello"}},
+		},
+	}
+
+	pipeline := voice.NewPipelineWithProviders(&fakeRunloopSTTProvider{transcript: "from audio stt"}, &fakeTTSProvider{})
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch}), VoicePipeline: pipeline}
+	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model:    "m",
+			STTModel: "cartesia/ink-whisper",
+			Messages: []types.Message{{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioSTTBlock{
+						Type: "audio_stt",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			}},
+		},
+		Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if provider.lastReq == nil {
+		t.Fatalf("expected provider request capture")
+	}
+	blocks := provider.lastReq.Messages[0].ContentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("len(blocks)=%d, want 1", len(blocks))
+	}
+	tb, ok := blocks[0].(types.TextBlock)
+	if !ok {
+		t.Fatalf("expected transcribed text block, got %T", blocks[0])
+	}
+	if tb.Text != "from audio stt" {
+		t.Fatalf("text=%q, want %q", tb.Text, "from audio stt")
+	}
+	if got := result.Response.UserTranscript(); got != "from audio stt" {
+		t.Fatalf("user transcript=%q, want %q", got, "from audio stt")
+	}
+}
+
+func TestRunBlocking_AudioSTTWithoutPipelineRejected(t *testing.T) {
+	provider := &captureCreateProvider{}
+	controller := &Controller{Provider: provider, Tools: builtins.NewRegistry(fakeExecutor{name: builtins.BuiltinWebSearch})}
+	_, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model: "m",
+			Messages: []types.Message{{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioSTTBlock{
+						Type: "audio_stt",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			}},
+		},
+		Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err == nil {
+		t.Fatalf("expected error")
 	}
 }
 

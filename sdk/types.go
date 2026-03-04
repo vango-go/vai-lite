@@ -67,6 +67,9 @@ type (
 	// AudioBlock represents audio content.
 	AudioBlock = types.AudioBlock
 
+	// AudioSTTBlock represents transcribe-before-LLM audio input.
+	AudioSTTBlock = types.AudioSTTBlock
+
 	// VideoBlock represents video content.
 	VideoBlock = types.VideoBlock
 
@@ -153,9 +156,6 @@ type (
 
 	// VoiceConfig configures STT/TTS processing.
 	VoiceConfig = types.VoiceConfig
-
-	// VoiceInputConfig configures speech-to-text options.
-	VoiceInputConfig = types.VoiceInputConfig
 
 	// VoiceOutputConfig configures text-to-speech options.
 	VoiceOutputConfig = types.VoiceOutputConfig

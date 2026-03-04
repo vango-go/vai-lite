@@ -108,7 +108,7 @@ func (r *MessageResponse) AudioContent() *AudioBlock {
 }
 
 // UserTranscript returns the transcribed user audio input, if any.
-// This is populated when the request contained audio input and voice.input was configured.
+// This is populated when the request contained audio_stt input blocks.
 // Returns empty string if this request didn't contain audio input.
 func (r *MessageResponse) UserTranscript() string {
 	if r.Metadata != nil {

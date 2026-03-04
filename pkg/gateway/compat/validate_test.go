@@ -159,3 +159,58 @@ func TestValidateMessageRequest_IssuesHaveErrorSeverity(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateMessageRequest_RawAudioRejectedWhenProviderDoesNotSupportAudioInput(t *testing.T) {
+	req := &types.MessageRequest{
+		Model: "cerebras/llama-3.3-70b",
+		Messages: []types.Message{
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioBlock{
+						Type: "audio",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	issues := ValidateMessageRequest(req, "cerebras", req.Model)
+	if len(issues) != 1 {
+		t.Fatalf("issues len=%d, want 1", len(issues))
+	}
+	if issues[0].Code != "unsupported_content_block" {
+		t.Fatalf("code=%q, want unsupported_content_block", issues[0].Code)
+	}
+}
+
+func TestValidateMessageRequest_AudioSTTAllowedForSTTPreprocessing(t *testing.T) {
+	req := &types.MessageRequest{
+		Model: "cerebras/llama-3.3-70b",
+		Messages: []types.Message{
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioSTTBlock{
+						Type: "audio_stt",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	issues := ValidateMessageRequest(req, "cerebras", req.Model)
+	if len(issues) != 0 {
+		t.Fatalf("issues len=%d, want 0", len(issues))
+	}
+}

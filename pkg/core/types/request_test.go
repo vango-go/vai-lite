@@ -119,11 +119,9 @@ func TestMessageRequest_WithVoice(t *testing.T) {
 		Messages: []Message{
 			{Role: "user", Content: "Transcribe and respond"},
 		},
+		STTModel: "cartesia/ink-whisper",
+		TTSModel: "cartesia/sonic-3",
 		Voice: &VoiceConfig{
-			Input: &VoiceInputConfig{
-				Model:    "ink-whisper",
-				Language: "en",
-			},
 			Output: &VoiceOutputConfig{
 				Voice:      "voice-123",
 				Format:     VoiceFormatWAV,
@@ -144,8 +142,11 @@ func TestMessageRequest_WithVoice(t *testing.T) {
 	if unmarshaled.Voice == nil {
 		t.Fatalf("Voice config is nil after unmarshal")
 	}
-	if unmarshaled.Voice.Input == nil || unmarshaled.Voice.Input.Model != "ink-whisper" {
-		t.Fatalf("Voice input mismatch: %#v", unmarshaled.Voice.Input)
+	if unmarshaled.STTModel != "cartesia/ink-whisper" {
+		t.Fatalf("STTModel mismatch: %q", unmarshaled.STTModel)
+	}
+	if unmarshaled.TTSModel != "cartesia/sonic-3" {
+		t.Fatalf("TTSModel mismatch: %q", unmarshaled.TTSModel)
 	}
 	if unmarshaled.Voice.Output == nil || unmarshaled.Voice.Output.Voice != "voice-123" {
 		t.Fatalf("Voice output mismatch: %#v", unmarshaled.Voice.Output)
