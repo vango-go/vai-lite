@@ -504,6 +504,53 @@ func TestRunChatbot_CanonicalizesConfigForRuntimeState(t *testing.T) {
 	}
 }
 
+func TestShouldUseTurnVoice(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		cfg   chatConfig
+		audio []byte
+		want  bool
+	}{
+		{
+			name:  "voice disabled ignores recorded audio",
+			cfg:   chatConfig{VoiceEnabled: false},
+			audio: []byte{0x01},
+			want:  false,
+		},
+		{
+			name:  "voice enabled typed turn stays text-only",
+			cfg:   chatConfig{VoiceEnabled: true},
+			audio: nil,
+			want:  false,
+		},
+		{
+			name:  "voice enabled empty audio stays text-only",
+			cfg:   chatConfig{VoiceEnabled: true},
+			audio: []byte{},
+			want:  false,
+		},
+		{
+			name:  "voice enabled recorded turn uses tts",
+			cfg:   chatConfig{VoiceEnabled: true},
+			audio: []byte{0x01},
+			want:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := shouldUseTurnVoice(tc.cfg, tc.audio)
+			if got != tc.want {
+				t.Fatalf("shouldUseTurnVoice=%v, want %v (audioLen=%d, voiceEnabled=%v)", got, tc.want, len(tc.audio), tc.cfg.VoiceEnabled)
+			}
+		})
+	}
+}
+
 func TestBuildStreamCallbacks_PrintsSingleLineToolStreamAndText(t *testing.T) {
 	t.Parallel()
 

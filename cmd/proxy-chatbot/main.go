@@ -425,6 +425,10 @@ func handleSlashCommand(line string, state *chatRuntime, cfg chatConfig, out io.
 	}
 }
 
+func shouldUseTurnVoice(cfg chatConfig, audioWAV []byte) bool {
+	return cfg.VoiceEnabled && len(audioWAV) > 0
+}
+
 func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer, errOut io.Writer) error {
 	canonicalCfg, err := canonicalizeAndValidateChatConfig(cfg)
 	if err != nil {
@@ -557,8 +561,9 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 			Messages:  state.history,
 			MaxTokens: cfg.MaxTokens,
 		}
+		turnVoiceEnabled := shouldUseTurnVoice(cfg, audioWAV)
 		req.System = composeSystemPrompt(cfg.SystemPrompt, cfg.VoiceEnabled)
-		if cfg.VoiceEnabled {
+		if turnVoiceEnabled {
 			req.Voice = vai.VoiceOutput(cfg.VoiceID)
 		}
 
@@ -574,7 +579,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 		}
 
 		var player *pcmPlayer
-		if cfg.VoiceEnabled {
+		if turnVoiceEnabled {
 			if turnPrewarmedPlayer != nil {
 				player = turnPrewarmedPlayer
 				turnPrewarmedPlayer = nil
