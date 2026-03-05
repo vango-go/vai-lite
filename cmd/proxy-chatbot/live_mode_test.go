@@ -596,3 +596,125 @@ func TestHandleServerEvent_UserTurnCommittedFinalizesOpenTurnAudio(t *testing.T)
 		t.Fatal("expected turnAudioOpen=false")
 	}
 }
+
+func TestHandleServerEvent_TurnCancelledFinalizesAndIgnoresLateDeltas(t *testing.T) {
+	oldClose := closePCMPlayerFunc
+	t.Cleanup(func() { closePCMPlayerFunc = oldClose })
+
+	closeCalls := 0
+	closePCMPlayerFunc = func(p *pcmPlayer) error {
+		closeCalls++
+		return nil
+	}
+
+	var out bytes.Buffer
+	session := &liveModeSession{
+		player:         &pcmPlayer{},
+		playerRate:     24000,
+		turnAudioOpen:  true,
+		out:            &out,
+		errOut:         io.Discard,
+		cancelledTurns: make(map[string]struct{}),
+	}
+	session.setActiveTurn("turn_1")
+
+	if err := session.handleServerEvent([]byte(`{"type":"turn_cancelled","turn_id":"turn_1","reason":"grace_period"}`)); err != nil {
+		t.Fatalf("handleServerEvent(turn_cancelled) error: %v", err)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("closeCalls=%d, want 1", closeCalls)
+	}
+	if session.turnAudioOpen {
+		t.Fatal("expected turnAudioOpen=false")
+	}
+
+	if err := session.handleServerEvent([]byte(`{"type":"assistant_text_delta","turn_id":"turn_1","text":"late text"}`)); err != nil {
+		t.Fatalf("handleServerEvent(assistant_text_delta) error: %v", err)
+	}
+	if out.String() != "" {
+		t.Fatalf("expected cancelled turn delta to be ignored, out=%q", out.String())
+	}
+}
+
+func TestHandleServerEvent_IgnoresOlderTurnDeltas(t *testing.T) {
+	var out bytes.Buffer
+	session := &liveModeSession{
+		out:            &out,
+		errOut:         io.Discard,
+		cancelledTurns: make(map[string]struct{}),
+	}
+	session.setActiveTurn("turn_2")
+
+	if err := session.handleServerEvent([]byte(`{"type":"assistant_text_delta","turn_id":"turn_1","text":"old"}`)); err != nil {
+		t.Fatalf("handleServerEvent(old turn) error: %v", err)
+	}
+	if out.String() != "" {
+		t.Fatalf("expected stale turn delta to be ignored, out=%q", out.String())
+	}
+
+	if err := session.handleServerEvent([]byte(`{"type":"assistant_text_delta","turn_id":"turn_2","text":"new"}`)); err != nil {
+		t.Fatalf("handleServerEvent(active turn) error: %v", err)
+	}
+	if !strings.Contains(out.String(), "assistant: new") {
+		t.Fatalf("expected active turn delta to render, out=%q", out.String())
+	}
+}
+
+func TestFinalizeTurnAudio_SendsPlaybackStopped(t *testing.T) {
+	oldClose := closePCMPlayerFunc
+	t.Cleanup(func() { closePCMPlayerFunc = oldClose })
+	closePCMPlayerFunc = func(p *pcmPlayer) error { return nil }
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	received := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer conn.Close()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read playback_state frame: %v", err)
+		}
+		received <- payload
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	session := &liveModeSession{
+		conn:           conn,
+		player:         &pcmPlayer{},
+		turnAudioOpen:  true,
+		out:            io.Discard,
+		errOut:         io.Discard,
+		cancelledTurns: make(map[string]struct{}),
+	}
+	session.setAudioTurn("turn_42")
+	session.finalizeTurnAudio("test close", "stopped")
+
+	select {
+	case payload := <-received:
+		var frame types.LivePlaybackStateFrame
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			t.Fatalf("decode playback_state frame: %v", err)
+		}
+		if frame.Type != "playback_state" {
+			t.Fatalf("type=%q, want playback_state", frame.Type)
+		}
+		if frame.TurnID != "turn_42" {
+			t.Fatalf("turn_id=%q, want turn_42", frame.TurnID)
+		}
+		if frame.State != "stopped" {
+			t.Fatalf("state=%q, want stopped", frame.State)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for playback_state frame")
+	}
+}

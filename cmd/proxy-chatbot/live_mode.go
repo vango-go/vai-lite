@@ -79,6 +79,11 @@ type liveModeSession struct {
 	talkLineOpen           bool
 	audioUnavailableWarned bool
 
+	liveMu         sync.Mutex
+	activeTurnID   string
+	audioTurnID    string
+	cancelledTurns map[string]struct{}
+
 	errMu sync.RWMutex
 	err   error
 
@@ -138,6 +143,7 @@ func startLiveMode(ctx context.Context, cfg chatConfig, state *chatRuntime, tool
 		errOut:                     errOut,
 		done:                       make(chan struct{}),
 		negotiatedOutputSampleRate: started.OutputSampleRateHz,
+		cancelledTurns:             make(map[string]struct{}),
 	}
 	if session.out == nil {
 		session.out = os.Stdout
@@ -542,11 +548,17 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode assistant_text_delta: %w", err)
 		}
+		if s.shouldIgnoreTurn(ev.TurnID) {
+			return nil
+		}
 		s.writeAssistantDelta(ev.Text)
 	case "talk_to_user_text_delta":
 		var ev types.LiveTalkToUserTextDeltaEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode talk_to_user_text_delta: %w", err)
+		}
+		if s.shouldIgnoreTurn(ev.TurnID) {
+			return nil
 		}
 		s.writeTalkDelta(ev.Text)
 	case "audio_chunk":
@@ -554,42 +566,72 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode audio_chunk: %w", err)
 		}
+		if s.shouldIgnoreTurn(ev.TurnID) {
+			return nil
+		}
 		s.handleAudioChunk(ev)
 	case "tool_call":
 		var ev types.LiveToolCallEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode tool_call: %w", err)
 		}
+		if s.shouldIgnoreTurn(ev.TurnID) {
+			return nil
+		}
 		go s.handleToolCall(ev)
 	case "user_turn_committed":
+		var ev types.LiveUserTurnCommittedEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return fmt.Errorf("decode user_turn_committed: %w", err)
+		}
+		s.setActiveTurn(ev.TurnID)
 		s.outputMu.Lock()
 		s.closeOpenLinesLocked()
 		s.audioUnavailableWarned = false
 		s.outputMu.Unlock()
 		if s.turnAudioOpen {
-			s.finalizeTurnAudio("live player close (user_turn_committed)")
+			s.finalizeTurnAudio("live player close (user_turn_committed)", "stopped")
 		}
 	case "turn_complete":
 		var ev types.LiveTurnCompleteEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode turn_complete: %w", err)
 		}
+		if s.shouldIgnoreTurn(ev.TurnID) {
+			return nil
+		}
 		s.outputMu.Lock()
 		s.closeOpenLinesLocked()
 		s.audioUnavailableWarned = false
 		s.outputMu.Unlock()
 		if s.turnAudioOpen {
-			s.finalizeTurnAudio("live player close (turn_complete)")
+			s.finalizeTurnAudio("live player close (turn_complete)", "stopped")
 		}
 		s.updateHistory(ev.History)
+	case "turn_cancelled":
+		var ev types.LiveTurnCancelledEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return fmt.Errorf("decode turn_cancelled: %w", err)
+		}
+		s.markTurnCancelled(ev.TurnID)
+		s.outputMu.Lock()
+		s.closeOpenLinesLocked()
+		s.audioUnavailableWarned = false
+		s.outputMu.Unlock()
+		if s.turnAudioOpen {
+			s.finalizeTurnAudio("live player close (turn_cancelled)", "stopped")
+		}
 	case "audio_unavailable":
 		var ev types.LiveAudioUnavailableEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode audio_unavailable: %w", err)
 		}
+		if s.shouldIgnoreTurn(ev.TurnID) {
+			return nil
+		}
 		s.writeAudioUnavailable(ev.Reason, ev.Message)
 		if s.turnAudioOpen {
-			s.finalizeTurnAudio("live player close (audio_unavailable)")
+			s.finalizeTurnAudio("live player close (audio_unavailable)", "stopped")
 		}
 	case "error":
 		var ev types.LiveErrorEvent
@@ -624,8 +666,11 @@ func (s *liveModeSession) handleAudioChunk(ev types.LiveAudioChunkEvent) {
 	if s == nil {
 		return
 	}
+	if strings.TrimSpace(ev.TurnID) != "" {
+		s.setAudioTurn(ev.TurnID)
+	}
 	if ev.IsFinal {
-		defer s.finalizeTurnAudio("live player close (audio_chunk final)")
+		defer s.finalizeTurnAudio("live player close (audio_chunk final)", "finished")
 	}
 
 	format := strings.TrimSpace(strings.ToLower(ev.Format))
@@ -671,9 +716,13 @@ func (s *liveModeSession) handleAudioChunk(ev types.LiveAudioChunkEvent) {
 	}
 }
 
-func (s *liveModeSession) finalizeTurnAudio(label string) {
+func (s *liveModeSession) finalizeTurnAudio(label, playbackState string) {
 	if s == nil {
 		return
+	}
+	turnID := s.audioTurn()
+	if turnID == "" {
+		turnID = s.activeTurn()
 	}
 	if s.player != nil {
 		closePlayerWithDebug(s.player, label)
@@ -681,6 +730,14 @@ func (s *liveModeSession) finalizeTurnAudio(label string) {
 	}
 	s.playerRate = 0
 	s.turnAudioOpen = false
+	if playbackState != "" && turnID != "" {
+		_ = s.sendJSON(types.LivePlaybackStateFrame{
+			Type:   "playback_state",
+			TurnID: turnID,
+			State:  playbackState,
+		})
+	}
+	s.clearAudioTurn(turnID)
 }
 
 func (s *liveModeSession) handleToolCall(ev types.LiveToolCallEvent) {
@@ -809,6 +866,106 @@ func (s *liveModeSession) writeAudioUnavailable(reason, message string) {
 	default:
 		fmt.Fprintln(s.errOut, "audio unavailable")
 	}
+}
+
+func (s *liveModeSession) setActiveTurn(turnID string) {
+	if s == nil {
+		return
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if s.cancelledTurns == nil {
+		s.cancelledTurns = make(map[string]struct{})
+	}
+	s.activeTurnID = turnID
+	delete(s.cancelledTurns, turnID)
+}
+
+func (s *liveModeSession) activeTurn() string {
+	if s == nil {
+		return ""
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	return s.activeTurnID
+}
+
+func (s *liveModeSession) setAudioTurn(turnID string) {
+	if s == nil {
+		return
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	s.audioTurnID = turnID
+}
+
+func (s *liveModeSession) audioTurn() string {
+	if s == nil {
+		return ""
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	return s.audioTurnID
+}
+
+func (s *liveModeSession) clearAudioTurn(turnID string) {
+	if s == nil {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if strings.TrimSpace(turnID) == "" || s.audioTurnID == turnID {
+		s.audioTurnID = ""
+	}
+}
+
+func (s *liveModeSession) markTurnCancelled(turnID string) {
+	if s == nil {
+		return
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if s.cancelledTurns == nil {
+		s.cancelledTurns = make(map[string]struct{})
+	}
+	s.cancelledTurns[turnID] = struct{}{}
+	if s.activeTurnID == turnID {
+		s.activeTurnID = ""
+	}
+	if s.audioTurnID == turnID {
+		s.audioTurnID = ""
+	}
+}
+
+func (s *liveModeSession) shouldIgnoreTurn(turnID string) bool {
+	if s == nil {
+		return false
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return false
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if _, cancelled := s.cancelledTurns[turnID]; cancelled {
+		return true
+	}
+	if strings.TrimSpace(s.activeTurnID) == "" {
+		return false
+	}
+	return turnID != s.activeTurnID
 }
 
 func decodeLiveEventType(data []byte) (string, error) {

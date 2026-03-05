@@ -36,22 +36,32 @@ type LiveStopFrame struct {
 
 func (f LiveStopFrame) LiveClientFrameType() string { return "stop" }
 
+// LivePlaybackStateFrame reports whether assistant audio playback for a turn has stopped or finished.
+type LivePlaybackStateFrame struct {
+	Type   string `json:"type"` // "playback_state"
+	TurnID string `json:"turn_id,omitempty"`
+	State  string `json:"state"` // "finished" | "stopped"
+}
+
+func (f LivePlaybackStateFrame) LiveClientFrameType() string { return "playback_state" }
+
 // LiveSessionStartedEvent confirms session startup and fixed audio contracts.
 type LiveSessionStartedEvent struct {
-	Type              string `json:"type"` // "session_started"
-	InputFormat       string `json:"input_format"`
-	InputSampleRateHz int    `json:"input_sample_rate_hz"`
-	OutputFormat      string `json:"output_format"`
-	OutputSampleRateHz int   `json:"output_sample_rate_hz"`
-	SilenceCommitMS   int    `json:"silence_commit_ms"`
+	Type               string `json:"type"` // "session_started"
+	InputFormat        string `json:"input_format"`
+	InputSampleRateHz  int    `json:"input_sample_rate_hz"`
+	OutputFormat       string `json:"output_format"`
+	OutputSampleRateHz int    `json:"output_sample_rate_hz"`
+	SilenceCommitMS    int    `json:"silence_commit_ms"`
 }
 
 func (e LiveSessionStartedEvent) LiveServerEventType() string { return "session_started" }
 
 // LiveAssistantTextDeltaEvent streams assistant text output.
 type LiveAssistantTextDeltaEvent struct {
-	Type string `json:"type"` // "assistant_text_delta"
-	Text string `json:"text"`
+	Type   string `json:"type"` // "assistant_text_delta"
+	TurnID string `json:"turn_id,omitempty"`
+	Text   string `json:"text"`
 }
 
 func (e LiveAssistantTextDeltaEvent) LiveServerEventType() string { return "assistant_text_delta" }
@@ -59,6 +69,7 @@ func (e LiveAssistantTextDeltaEvent) LiveServerEventType() string { return "assi
 // LiveTalkToUserTextDeltaEvent streams talk_to_user text output.
 type LiveTalkToUserTextDeltaEvent struct {
 	Type   string `json:"type"` // "talk_to_user_text_delta"
+	TurnID string `json:"turn_id,omitempty"`
 	CallID string `json:"call_id,omitempty"`
 	Index  int    `json:"index"`
 	Text   string `json:"text"`
@@ -69,6 +80,7 @@ func (e LiveTalkToUserTextDeltaEvent) LiveServerEventType() string { return "tal
 // LiveAudioChunkEvent streams synthesized audio chunks for talk_to_user output.
 type LiveAudioChunkEvent struct {
 	Type         string `json:"type"` // "audio_chunk"
+	TurnID       string `json:"turn_id,omitempty"`
 	Format       string `json:"format"`
 	SampleRateHz int    `json:"sample_rate_hz"`
 	Audio        string `json:"audio"` // base64
@@ -80,6 +92,7 @@ func (e LiveAudioChunkEvent) LiveServerEventType() string { return "audio_chunk"
 // LiveToolCallEvent requests client execution for an arbitrary function tool.
 type LiveToolCallEvent struct {
 	Type        string         `json:"type"` // "tool_call"
+	TurnID      string         `json:"turn_id,omitempty"`
 	ExecutionID string         `json:"execution_id"`
 	Name        string         `json:"name"`
 	Input       map[string]any `json:"input"`
@@ -90,6 +103,7 @@ func (e LiveToolCallEvent) LiveServerEventType() string { return "tool_call" }
 // LiveUserTurnCommittedEvent indicates an utterance has been committed and sent as audio_stt.
 type LiveUserTurnCommittedEvent struct {
 	Type       string `json:"type"` // "user_turn_committed"
+	TurnID     string `json:"turn_id,omitempty"`
 	AudioBytes int    `json:"audio_bytes"`
 }
 
@@ -98,6 +112,7 @@ func (e LiveUserTurnCommittedEvent) LiveServerEventType() string { return "user_
 // LiveTurnCompleteEvent indicates a turn has completed and includes synced history.
 type LiveTurnCompleteEvent struct {
 	Type       string        `json:"type"` // "turn_complete"
+	TurnID     string        `json:"turn_id,omitempty"`
 	StopReason RunStopReason `json:"stop_reason"`
 	History    []Message     `json:"history"`
 }
@@ -107,11 +122,21 @@ func (e LiveTurnCompleteEvent) LiveServerEventType() string { return "turn_compl
 // LiveAudioUnavailableEvent indicates voice output is unavailable for the current response.
 type LiveAudioUnavailableEvent struct {
 	Type    string `json:"type"` // "audio_unavailable"
+	TurnID  string `json:"turn_id,omitempty"`
 	Reason  string `json:"reason"`
 	Message string `json:"message"`
 }
 
 func (e LiveAudioUnavailableEvent) LiveServerEventType() string { return "audio_unavailable" }
+
+// LiveTurnCancelledEvent indicates a turn was cancelled during the grace period.
+type LiveTurnCancelledEvent struct {
+	Type   string `json:"type"` // "turn_cancelled"
+	TurnID string `json:"turn_id,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func (e LiveTurnCancelledEvent) LiveServerEventType() string { return "turn_cancelled" }
 
 // LiveErrorEvent reports protocol/runtime errors over /v1/live.
 type LiveErrorEvent struct {

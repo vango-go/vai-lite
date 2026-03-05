@@ -1106,3 +1106,19 @@ Log sampling:
   - played history matches `played_ms` truncation
 
 ---
+
+## 15. Stage 2 Implementation Notes
+
+Current `/v1/live` stage-2 grace behavior is implemented with explicit turn identifiers and playback-state signaling:
+
+- Server events carry `turn_id` for turn-scoped frames (`assistant_text_delta`, `talk_to_user_text_delta`, `audio_chunk`, `tool_call`, `user_turn_committed`, `turn_complete`, `audio_unavailable`).
+- New server event: `turn_cancelled` with `reason="grace_period"`.
+- New client control frame: `playback_state` with `{turn_id, state}` where `state` is `finished` or `stopped`.
+
+Grace-cancel decision rules:
+
+- STT emits non-empty transcript text within 5 seconds of the prior committed speech end.
+- Active turn has not started non-`talk_to_user` tool execution.
+- Playback has not already been reported as `finished`/`stopped`.
+
+When all three are true, the active turn is cancelled, `turn_cancelled` is emitted, and the next committed user utterance prepends the original committed audio before re-running.

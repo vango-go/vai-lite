@@ -491,7 +491,7 @@ func TestLiveTalkTurnState_PreservesWhitespaceTextDelta(t *testing.T) {
 		ctx:    context.Background(),
 		sendCh: make(chan any, 1),
 	}
-	state := newLiveTalkTurnState(session)
+	state := newLiveTalkTurnState(session, "turn_1")
 
 	err := state.handleStreamEvent(types.ContentBlockDeltaEvent{
 		Type:  "content_block_delta",
@@ -808,4 +808,263 @@ done:
 	if finalCount != 1 {
 		t.Fatalf("final chunk count=%d, want 1", finalCount)
 	}
+}
+
+func TestLiveSession_STTGraceCancelsRunningTurn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sttSession := newFakeLiveSTTSession()
+	runCancelCalled := make(chan struct{}, 1)
+
+	session := &liveSession{
+		ctx:        ctx,
+		cancel:     cancel,
+		sendCh:     make(chan any, 8),
+		sttSession: sttSession,
+		activeTurn: &liveTurnRuntime{
+			id:            "turn_1",
+			lifecycle:     liveTurnLifecycleRunning,
+			graceDeadline: time.Now().Add(2 * time.Second),
+			baseUserPCM:   []byte{0x01, 0x02, 0x03},
+			runCancel: func() {
+				select {
+				case runCancelCalled <- struct{}{}:
+				default:
+				}
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	session.wg.Add(1)
+	go func() {
+		session.sttLoop()
+		close(done)
+	}()
+
+	sttSession.transcripts <- stt.TranscriptDelta{Text: "hello again"}
+
+	select {
+	case <-runCancelCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected run cancel to be invoked")
+	}
+
+	select {
+	case raw := <-session.sendCh:
+		ev, ok := raw.(types.LiveTurnCancelledEvent)
+		if !ok {
+			t.Fatalf("unexpected event type %T", raw)
+		}
+		if ev.TurnID != "turn_1" {
+			t.Fatalf("turn_id=%q, want turn_1", ev.TurnID)
+		}
+	default:
+		t.Fatal("expected turn_cancelled event")
+	}
+
+	session.mu.Lock()
+	if session.activeTurn.lifecycle != liveTurnLifecycleCancelled {
+		t.Fatalf("lifecycle=%q, want cancelled", session.activeTurn.lifecycle)
+	}
+	if got := session.aggregatePrefix; len(got) != 3 {
+		t.Fatalf("aggregatePrefix length=%d, want 3", len(got))
+	}
+	session.mu.Unlock()
+
+	cancel()
+	close(sttSession.transcripts)
+	<-done
+}
+
+func TestLiveSession_STTGraceDoesNotCancelAfterNonTalkToolCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sttSession := newFakeLiveSTTSession()
+	runCancelCalled := make(chan struct{}, 1)
+
+	session := &liveSession{
+		ctx:        ctx,
+		cancel:     cancel,
+		sendCh:     make(chan any, 8),
+		sttSession: sttSession,
+		activeTurn: &liveTurnRuntime{
+			id:                "turn_1",
+			lifecycle:         liveTurnLifecycleRunning,
+			graceDeadline:     time.Now().Add(2 * time.Second),
+			nonTalkToolCalled: true,
+			baseUserPCM:       []byte{0x01},
+			runCancel: func() {
+				select {
+				case runCancelCalled <- struct{}{}:
+				default:
+				}
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	session.wg.Add(1)
+	go func() {
+		session.sttLoop()
+		close(done)
+	}()
+
+	sttSession.transcripts <- stt.TranscriptDelta{Text: "should not cancel"}
+	time.Sleep(20 * time.Millisecond)
+
+	select {
+	case <-runCancelCalled:
+		t.Fatal("run cancel should not be invoked when non-talk tool was called")
+	default:
+	}
+	select {
+	case raw := <-session.sendCh:
+		t.Fatalf("unexpected event: %#v", raw)
+	default:
+	}
+
+	session.mu.Lock()
+	if session.activeTurn.lifecycle == liveTurnLifecycleCancelled {
+		t.Fatal("turn should not be cancelled")
+	}
+	if len(session.aggregatePrefix) != 0 {
+		t.Fatalf("aggregatePrefix length=%d, want 0", len(session.aggregatePrefix))
+	}
+	session.mu.Unlock()
+
+	cancel()
+	close(sttSession.transcripts)
+	<-done
+}
+
+func TestLiveSession_AwaitingGraceFinalizesOnPlaybackState(t *testing.T) {
+	session := &liveSession{
+		ctx:    context.Background(),
+		sendCh: make(chan any, 4),
+		activeTurn: &liveTurnRuntime{
+			id:            "turn_1",
+			lifecycle:     liveTurnLifecycleRunning,
+			graceDeadline: time.Now().Add(2 * time.Second),
+			audioStarted:  true,
+		},
+	}
+
+	ok := session.setPendingTurnResult("turn_1", &livePendingTurnResult{
+		stopReason: types.RunStopReasonEndTurn,
+		history: []types.Message{
+			{Role: "assistant", Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}}},
+		},
+	})
+	if !ok {
+		t.Fatal("setPendingTurnResult returned false")
+	}
+	if session.shouldFinalizeTurnNow("turn_1") {
+		t.Fatal("shouldFinalizeTurnNow=true before playback_state")
+	}
+	if err := session.handlePlaybackStateFrame([]byte(`{"type":"playback_state","turn_id":"turn_1","state":"finished"}`)); err != nil {
+		t.Fatalf("handlePlaybackStateFrame error: %v", err)
+	}
+	if !session.shouldFinalizeTurnNow("turn_1") {
+		t.Fatal("shouldFinalizeTurnNow=false after playback_state finished")
+	}
+
+	session.finalizeTurn("turn_1")
+	select {
+	case raw := <-session.sendCh:
+		ev, ok := raw.(types.LiveTurnCompleteEvent)
+		if !ok {
+			t.Fatalf("unexpected event type %T", raw)
+		}
+		if ev.TurnID != "turn_1" {
+			t.Fatalf("turn_id=%q, want turn_1", ev.TurnID)
+		}
+	default:
+		t.Fatal("expected turn_complete event")
+	}
+}
+
+func TestLiveSession_AwaitingGraceFinalizesOnDeadline(t *testing.T) {
+	session := &liveSession{
+		ctx:    context.Background(),
+		sendCh: make(chan any, 4),
+		activeTurn: &liveTurnRuntime{
+			id:            "turn_1",
+			lifecycle:     liveTurnLifecycleRunning,
+			graceDeadline: time.Now().Add(-10 * time.Millisecond),
+			audioStarted:  true,
+		},
+	}
+
+	ok := session.setPendingTurnResult("turn_1", &livePendingTurnResult{
+		stopReason: types.RunStopReasonEndTurn,
+		history: []types.Message{
+			{Role: "assistant", Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}}},
+		},
+	})
+	if !ok {
+		t.Fatal("setPendingTurnResult returned false")
+	}
+	if !session.shouldFinalizeTurnNow("turn_1") {
+		t.Fatal("shouldFinalizeTurnNow=false, want true after grace deadline")
+	}
+}
+
+func TestLiveSession_STTGraceCancelsAwaitingGraceTurn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sttSession := newFakeLiveSTTSession()
+	session := &liveSession{
+		ctx:        ctx,
+		cancel:     cancel,
+		sendCh:     make(chan any, 8),
+		sttSession: sttSession,
+		activeTurn: &liveTurnRuntime{
+			id:            "turn_1",
+			lifecycle:     liveTurnLifecycleAwaitingGrace,
+			graceDeadline: time.Now().Add(2 * time.Second),
+			audioStarted:  true,
+			baseUserPCM:   []byte{0x01, 0x02},
+			pendingResult: &livePendingTurnResult{
+				stopReason: types.RunStopReasonEndTurn,
+				history:    []types.Message{{Role: "assistant"}},
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	session.wg.Add(1)
+	go func() {
+		session.sttLoop()
+		close(done)
+	}()
+
+	sttSession.transcripts <- stt.TranscriptDelta{Text: "interruption"}
+	select {
+	case raw := <-session.sendCh:
+		if _, ok := raw.(types.LiveTurnCancelledEvent); !ok {
+			t.Fatalf("unexpected event type %T", raw)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected turn_cancelled event")
+	}
+
+	session.mu.Lock()
+	if session.activeTurn.lifecycle != liveTurnLifecycleCancelled {
+		t.Fatalf("lifecycle=%q, want cancelled", session.activeTurn.lifecycle)
+	}
+	if session.activeTurn.pendingResult != nil {
+		t.Fatal("pendingResult should be cleared after grace cancel")
+	}
+	if len(session.aggregatePrefix) != 2 {
+		t.Fatalf("aggregatePrefix length=%d, want 2", len(session.aggregatePrefix))
+	}
+	session.mu.Unlock()
+
+	cancel()
+	close(sttSession.transcripts)
+	<-done
 }
