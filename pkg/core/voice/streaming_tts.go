@@ -187,6 +187,15 @@ func (s *StreamingTTS) Audio() <-chan []byte {
 	return s.audioCh
 }
 
+func (s *StreamingTTS) Timestamps() <-chan tts.WordTimestampsBatch {
+	if s == nil || s.ttsCtx == nil {
+		ch := make(chan tts.WordTimestampsBatch)
+		close(ch)
+		return ch
+	}
+	return s.ttsCtx.Timestamps()
+}
+
 func (s *StreamingTTS) AudioBytes() []byte {
 	if s == nil || !s.opts.BufferAudio {
 		return nil

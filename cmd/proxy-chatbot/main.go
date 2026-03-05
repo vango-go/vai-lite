@@ -312,6 +312,12 @@ var (
 		}
 		return p.Close()
 	}
+	killPCMPlayerFunc = func(p *pcmPlayer) error {
+		if p == nil {
+			return nil
+		}
+		return p.Kill()
+	}
 )
 
 func closePlayerWithDebug(player *pcmPlayer, label string) {
@@ -321,6 +327,18 @@ func closePlayerWithDebug(player *pcmPlayer, label string) {
 	if err := closePCMPlayerFunc(player); err != nil {
 		if strings.TrimSpace(label) == "" {
 			label = "player.Close"
+		}
+		fmt.Fprintf(os.Stderr, "[debug] %s error: %v\n", label, err)
+	}
+}
+
+func killPlayerWithDebug(player *pcmPlayer, label string) {
+	if player == nil {
+		return
+	}
+	if err := killPCMPlayerFunc(player); err != nil {
+		if strings.TrimSpace(label) == "" {
+			label = "player.Kill"
 		}
 		fmt.Fprintf(os.Stderr, "[debug] %s error: %v\n", label, err)
 	}

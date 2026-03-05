@@ -84,6 +84,21 @@ func (p *pcmPlayer) Close() error {
 	return nil
 }
 
+// Kill stops playback immediately without draining buffers.
+func (p *pcmPlayer) Kill() error {
+	if p == nil {
+		return nil
+	}
+	if p.stdin != nil {
+		_ = p.stdin.Close()
+	}
+	if p.cmd != nil && p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
+		return p.cmd.Wait()
+	}
+	return nil
+}
+
 // pcmRecorder captures audio from the default microphone via sox.
 type pcmRecorder struct {
 	cmd    *exec.Cmd

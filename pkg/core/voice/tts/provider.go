@@ -25,26 +25,38 @@ type Provider interface {
 
 // StreamingContextOptions configures a streaming context.
 type StreamingContextOptions struct {
-	Model            string  // Provider model identifier (e.g. "sonic-3")
-	Voice            string  // Voice identifier
-	Speed            float64 // Speed multiplier (0.6-1.5)
-	Volume           float64 // Volume multiplier (0.5-2.0)
-	Emotion          string  // Emotion hint
-	Language         string  // Language code
-	Format           string  // Output format: "wav", "mp3", or "pcm"
-	SampleRate       int     // Sample rate
-	MaxBufferDelayMs int     // Max time to buffer text before generating (0-5000ms, default 500)
+	Model                   string  // Provider model identifier (e.g. "sonic-3")
+	Voice                   string  // Voice identifier
+	Speed                   float64 // Speed multiplier (0.6-1.5)
+	Volume                  float64 // Volume multiplier (0.5-2.0)
+	Emotion                 string  // Emotion hint
+	Language                string  // Language code
+	Format                  string  // Output format: "wav", "mp3", or "pcm"
+	SampleRate              int     // Sample rate
+	MaxBufferDelayMs        int     // Max time to buffer text before generating (0-5000ms, default 500)
+	AddTimestamps           bool    // Whether to request word-level timestamps when supported.
+	UseNormalizedTimestamps bool    // Whether to request normalized timestamps when supported.
+}
+
+// WordTimestampsBatch represents a batch of word-level timestamps.
+// StartSec/EndSec are relative to the start of the context audio.
+type WordTimestampsBatch struct {
+	Words    []string
+	StartSec []float64
+	EndSec   []float64
 }
 
 // StreamingContext manages an incremental TTS session.
 // Text can be sent in chunks via SendText(), and audio chunks are received via Audio().
 type StreamingContext struct {
-	audio     chan []byte
-	err       error
-	errMu     sync.Mutex
-	done      chan struct{}
-	closed    atomic.Bool
-	closeOnce sync.Once
+	audio       chan []byte
+	timestamps  chan WordTimestampsBatch
+	tsCloseOnce sync.Once
+	err         error
+	errMu       sync.Mutex
+	done        chan struct{}
+	closed      atomic.Bool
+	closeOnce   sync.Once
 
 	// For implementations to use
 	SendFunc  func(text string, isFinal bool) error
@@ -54,8 +66,9 @@ type StreamingContext struct {
 // NewStreamingContext creates a new streaming context.
 func NewStreamingContext() *StreamingContext {
 	return &StreamingContext{
-		audio: make(chan []byte, 100),
-		done:  make(chan struct{}),
+		audio:      make(chan []byte, 100),
+		timestamps: make(chan WordTimestampsBatch, 100),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -81,6 +94,17 @@ func (sc *StreamingContext) Audio() <-chan []byte {
 	return sc.audio
 }
 
+// Timestamps returns a channel of word-level timestamp batches when supported by the provider.
+// If timestamps are not supported or not requested, the channel may remain empty.
+func (sc *StreamingContext) Timestamps() <-chan WordTimestampsBatch {
+	if sc == nil || sc.timestamps == nil {
+		ch := make(chan WordTimestampsBatch)
+		close(ch)
+		return ch
+	}
+	return sc.timestamps
+}
+
 // Err returns any error that occurred.
 func (sc *StreamingContext) Err() error {
 	sc.errMu.Lock()
@@ -97,6 +121,7 @@ func (sc *StreamingContext) Close() error {
 			err = sc.CloseFunc()
 		}
 		close(sc.done)
+		sc.FinishTimestamps()
 	})
 	return err
 }
@@ -118,6 +143,24 @@ func (sc *StreamingContext) PushAudio(chunk []byte) bool {
 	}
 }
 
+// PushTimestamps sends a timestamps batch. Returns false if the context is closed.
+// If the timestamps channel buffer is full, the batch is dropped to avoid stalling
+// the provider read loop.
+func (sc *StreamingContext) PushTimestamps(batch WordTimestampsBatch) bool {
+	if sc == nil {
+		return false
+	}
+	select {
+	case sc.timestamps <- batch:
+		return true
+	case <-sc.done:
+		return false
+	default:
+		// Drop on backpressure.
+		return true
+	}
+}
+
 // SetError sets the context error.
 func (sc *StreamingContext) SetError(err error) {
 	sc.errMu.Lock()
@@ -128,6 +171,16 @@ func (sc *StreamingContext) SetError(err error) {
 // FinishAudio closes the audio channel.
 func (sc *StreamingContext) FinishAudio() {
 	close(sc.audio)
+}
+
+// FinishTimestamps closes the timestamps channel.
+func (sc *StreamingContext) FinishTimestamps() {
+	if sc == nil || sc.timestamps == nil {
+		return
+	}
+	sc.tsCloseOnce.Do(func() {
+		close(sc.timestamps)
+	})
 }
 
 // ErrContextClosed is returned when sending to a closed context.

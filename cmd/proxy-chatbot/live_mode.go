@@ -33,6 +33,11 @@ const (
 	liveToolExecTimeout = 30 * time.Second
 )
 
+var (
+	livePlaybackMarkInterval     = 250 * time.Millisecond
+	livePlaybackMarkSafetyMargin = 100 * time.Millisecond
+)
+
 var liveProviderByokHeaders = map[string]string{
 	"anthropic":  "X-Provider-Key-Anthropic",
 	"openai":     "X-Provider-Key-OpenAI",
@@ -61,6 +66,7 @@ type liveModeSession struct {
 
 	conn                       *websocket.Conn
 	recorder                   *livePCMRecorder
+	audioMu                    sync.Mutex
 	player                     *pcmPlayer
 	playerRate                 int
 	turnAudioOpen              bool
@@ -79,10 +85,23 @@ type liveModeSession struct {
 	talkLineOpen           bool
 	audioUnavailableWarned bool
 
-	liveMu         sync.Mutex
-	activeTurnID   string
-	audioTurnID    string
-	cancelledTurns map[string]struct{}
+	liveMu          sync.Mutex
+	activeTurnID    string
+	audioTurnID     string
+	cancelledTurns  map[string]struct{}
+	audioResetTurns map[string]struct{}
+
+	playbackMarkCancel   context.CancelFunc
+	playbackMarkTurnID   string
+	playbackMarkRateHz   int
+	playbackMarkStart    time.Time
+	playbackMarkBytesPCM int64
+	playbackMarkLastSent int
+
+	audioQueueMu     sync.Mutex
+	audioQueueCond   *sync.Cond
+	audioQueue       []liveAudioPacket
+	audioQueueClosed bool
 
 	errMu sync.RWMutex
 	err   error
@@ -90,6 +109,22 @@ type liveModeSession struct {
 	wg        sync.WaitGroup
 	done      chan struct{}
 	closeOnce sync.Once
+}
+
+type liveAudioPacket struct {
+	turnID  string
+	rateHz  int
+	pcm     []byte
+	isFinal bool
+}
+
+func (s *liveModeSession) isTurnAudioOpen() bool {
+	if s == nil {
+		return false
+	}
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	return s.turnAudioOpen
 }
 
 func startLiveMode(ctx context.Context, cfg chatConfig, state *chatRuntime, tools []vai.ToolWithHandler, out io.Writer, errOut io.Writer) (*liveModeSession, error) {
@@ -144,7 +179,9 @@ func startLiveMode(ctx context.Context, cfg chatConfig, state *chatRuntime, tool
 		done:                       make(chan struct{}),
 		negotiatedOutputSampleRate: started.OutputSampleRateHz,
 		cancelledTurns:             make(map[string]struct{}),
+		audioResetTurns:            make(map[string]struct{}),
 	}
+	session.audioQueueCond = sync.NewCond(&session.audioQueueMu)
 	if session.out == nil {
 		session.out = os.Stdout
 	}
@@ -174,6 +211,8 @@ func startLiveMode(ctx context.Context, cfg chatConfig, state *chatRuntime, tool
 
 	session.wg.Add(1)
 	go session.readerLoop()
+	session.wg.Add(1)
+	go session.audioPlaybackLoop()
 	go func() {
 		<-session.ctx.Done()
 		session.shutdown(false)
@@ -486,6 +525,7 @@ func (s *liveModeSession) shutdown(wait bool) {
 		return
 	}
 	s.closeOnce.Do(func() {
+		s.closeAudioQueue()
 		if s.cancel != nil {
 			s.cancel()
 		}
@@ -500,10 +540,12 @@ func (s *liveModeSession) shutdown(wait bool) {
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
+		s.audioMu.Lock()
 		if s.player != nil {
 			closePlayerWithDebug(s.player, "live player close")
 			s.player = nil
 		}
+		s.audioMu.Unlock()
 		if s.done != nil {
 			close(s.done)
 		}
@@ -548,7 +590,7 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode assistant_text_delta: %w", err)
 		}
-		if s.shouldIgnoreTurn(ev.TurnID) {
+		if s.shouldIgnoreStreamingTurn(ev.TurnID) {
 			return nil
 		}
 		s.writeAssistantDelta(ev.Text)
@@ -557,7 +599,7 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode talk_to_user_text_delta: %w", err)
 		}
-		if s.shouldIgnoreTurn(ev.TurnID) {
+		if s.shouldIgnoreStreamingTurn(ev.TurnID) {
 			return nil
 		}
 		s.writeTalkDelta(ev.Text)
@@ -566,7 +608,7 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode audio_chunk: %w", err)
 		}
-		if s.shouldIgnoreTurn(ev.TurnID) {
+		if s.shouldIgnoreStreamingTurn(ev.TurnID) {
 			return nil
 		}
 		s.handleAudioChunk(ev)
@@ -575,7 +617,7 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode tool_call: %w", err)
 		}
-		if s.shouldIgnoreTurn(ev.TurnID) {
+		if s.shouldIgnoreStreamingTurn(ev.TurnID) {
 			return nil
 		}
 		go s.handleToolCall(ev)
@@ -589,7 +631,7 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		s.closeOpenLinesLocked()
 		s.audioUnavailableWarned = false
 		s.outputMu.Unlock()
-		if s.turnAudioOpen {
+		if s.isTurnAudioOpen() {
 			s.finalizeTurnAudio("live player close (user_turn_committed)", "stopped")
 		}
 	case "turn_complete":
@@ -604,7 +646,7 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		s.closeOpenLinesLocked()
 		s.audioUnavailableWarned = false
 		s.outputMu.Unlock()
-		if s.turnAudioOpen {
+		if s.isTurnAudioOpen() {
 			s.finalizeTurnAudio("live player close (turn_complete)", "stopped")
 		}
 		s.updateHistory(ev.History)
@@ -618,19 +660,30 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		s.closeOpenLinesLocked()
 		s.audioUnavailableWarned = false
 		s.outputMu.Unlock()
-		if s.turnAudioOpen {
+		if s.isTurnAudioOpen() {
 			s.finalizeTurnAudio("live player close (turn_cancelled)", "stopped")
 		}
+	case "audio_reset":
+		var ev types.LiveAudioResetEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return fmt.Errorf("decode audio_reset: %w", err)
+		}
+		s.markTurnAudioReset(ev.TurnID)
+		s.outputMu.Lock()
+		s.closeOpenLinesLocked()
+		s.audioUnavailableWarned = false
+		s.outputMu.Unlock()
+		s.hardStopTurnAudio(ev.TurnID, "live player kill (audio_reset)")
 	case "audio_unavailable":
 		var ev types.LiveAudioUnavailableEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return fmt.Errorf("decode audio_unavailable: %w", err)
 		}
-		if s.shouldIgnoreTurn(ev.TurnID) {
+		if s.shouldIgnoreStreamingTurn(ev.TurnID) {
 			return nil
 		}
 		s.writeAudioUnavailable(ev.Reason, ev.Message)
-		if s.turnAudioOpen {
+		if s.isTurnAudioOpen() {
 			s.finalizeTurnAudio("live player close (audio_unavailable)", "stopped")
 		}
 	case "error":
@@ -669,9 +722,6 @@ func (s *liveModeSession) handleAudioChunk(ev types.LiveAudioChunkEvent) {
 	if strings.TrimSpace(ev.TurnID) != "" {
 		s.setAudioTurn(ev.TurnID)
 	}
-	if ev.IsFinal {
-		defer s.finalizeTurnAudio("live player close (audio_chunk final)", "finished")
-	}
 
 	format := strings.TrimSpace(strings.ToLower(ev.Format))
 	if format != "" && format != "pcm_s16le" {
@@ -687,21 +737,6 @@ func (s *liveModeSession) handleAudioChunk(ev types.LiveAudioChunkEvent) {
 		rate = liveClientDefaultOutputSampleRateHz
 	}
 
-	if s.player == nil || s.playerRate != rate {
-		if s.player != nil {
-			closePlayerWithDebug(s.player, "live player reconfigure")
-		}
-		player, err := newLivePCMPlayerFunc(rate)
-		if err != nil {
-			s.player = nil
-			s.playerRate = 0
-			fmt.Fprintf(s.errOut, "live audio player warning: %v\n", err)
-			return
-		}
-		s.player = player
-		s.playerRate = rate
-	}
-
 	audioBytes, err := base64.StdEncoding.DecodeString(ev.Audio)
 	if err != nil {
 		fmt.Fprintf(s.errOut, "live audio decode warning: %v\n", err)
@@ -710,10 +745,12 @@ func (s *liveModeSession) handleAudioChunk(ev types.LiveAudioChunkEvent) {
 	if len(audioBytes) == 0 {
 		return
 	}
-	s.turnAudioOpen = true
-	if _, err := s.player.Write(audioBytes); err != nil {
-		fmt.Fprintf(s.errOut, "live audio playback warning: %v\n", err)
-	}
+	s.enqueueAudio(liveAudioPacket{
+		turnID:  strings.TrimSpace(ev.TurnID),
+		rateHz:  rate,
+		pcm:     append([]byte(nil), audioBytes...),
+		isFinal: ev.IsFinal,
+	})
 }
 
 func (s *liveModeSession) finalizeTurnAudio(label, playbackState string) {
@@ -724,12 +761,23 @@ func (s *liveModeSession) finalizeTurnAudio(label, playbackState string) {
 	if turnID == "" {
 		turnID = s.activeTurn()
 	}
+	playedMS := s.snapshotPlayedMS(turnID)
+	if playedMS >= 0 && turnID != "" {
+		_ = s.sendJSON(types.LivePlaybackMarkFrame{
+			Type:     "playback_mark",
+			TurnID:   turnID,
+			PlayedMS: playedMS,
+		})
+	}
+	s.audioMu.Lock()
 	if s.player != nil {
 		closePlayerWithDebug(s.player, label)
 		s.player = nil
 	}
 	s.playerRate = 0
 	s.turnAudioOpen = false
+	s.audioMu.Unlock()
+	s.stopPlaybackMarkLoop(turnID)
 	if playbackState != "" && turnID != "" {
 		_ = s.sendJSON(types.LivePlaybackStateFrame{
 			Type:   "playback_state",
@@ -738,6 +786,161 @@ func (s *liveModeSession) finalizeTurnAudio(label, playbackState string) {
 		})
 	}
 	s.clearAudioTurn(turnID)
+}
+
+func (s *liveModeSession) hardStopTurnAudio(turnID, label string) {
+	if s == nil {
+		return
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		turnID = s.audioTurn()
+	}
+	playedMS := s.snapshotPlayedMS(turnID)
+	if playedMS >= 0 && turnID != "" {
+		_ = s.sendJSON(types.LivePlaybackMarkFrame{
+			Type:     "playback_mark",
+			TurnID:   turnID,
+			PlayedMS: playedMS,
+		})
+	}
+	s.audioMu.Lock()
+	if s.player != nil {
+		killPlayerWithDebug(s.player, label)
+		s.player = nil
+	}
+	s.playerRate = 0
+	s.turnAudioOpen = false
+	s.audioMu.Unlock()
+	s.stopPlaybackMarkLoop(turnID)
+	if turnID != "" {
+		_ = s.sendJSON(types.LivePlaybackStateFrame{
+			Type:   "playback_state",
+			TurnID: turnID,
+			State:  "stopped",
+		})
+	}
+	s.clearAudioTurn(turnID)
+}
+
+func (s *liveModeSession) enqueueAudio(pkt liveAudioPacket) {
+	if s == nil {
+		return
+	}
+	if pkt.turnID == "" {
+		pkt.turnID = s.audioTurn()
+		if pkt.turnID == "" {
+			pkt.turnID = s.activeTurn()
+		}
+	}
+	if pkt.turnID == "" || len(pkt.pcm) == 0 {
+		return
+	}
+
+	s.audioQueueMu.Lock()
+	if s.audioQueueClosed {
+		s.audioQueueMu.Unlock()
+		return
+	}
+	s.audioQueue = append(s.audioQueue, pkt)
+	if s.audioQueueCond != nil {
+		s.audioQueueCond.Signal()
+	}
+	s.audioQueueMu.Unlock()
+}
+
+func (s *liveModeSession) closeAudioQueue() {
+	if s == nil {
+		return
+	}
+	s.audioQueueMu.Lock()
+	if s.audioQueueClosed {
+		s.audioQueueMu.Unlock()
+		return
+	}
+	s.audioQueueClosed = true
+	if s.audioQueueCond != nil {
+		s.audioQueueCond.Broadcast()
+	}
+	s.audioQueueMu.Unlock()
+}
+
+func (s *liveModeSession) popAudio() (liveAudioPacket, bool) {
+	s.audioQueueMu.Lock()
+	defer s.audioQueueMu.Unlock()
+	for len(s.audioQueue) == 0 && !s.audioQueueClosed {
+		if s.audioQueueCond == nil {
+			return liveAudioPacket{}, false
+		}
+		s.audioQueueCond.Wait()
+	}
+	if len(s.audioQueue) == 0 {
+		return liveAudioPacket{}, false
+	}
+	pkt := s.audioQueue[0]
+	s.audioQueue[0] = liveAudioPacket{}
+	s.audioQueue = s.audioQueue[1:]
+	return pkt, true
+}
+
+func (s *liveModeSession) audioPlaybackLoop() {
+	defer s.wg.Done()
+	for {
+		pkt, ok := s.popAudio()
+		if !ok {
+			return
+		}
+		if s.ctx.Err() != nil {
+			return
+		}
+		if s.shouldIgnoreStreamingTurn(pkt.turnID) {
+			continue
+		}
+
+		rate := pkt.rateHz
+		if rate <= 0 {
+			rate = s.negotiatedOutputSampleRate
+		}
+		if rate <= 0 {
+			rate = liveClientDefaultOutputSampleRateHz
+		}
+
+		// Start/maintain playback marks based on PCM successfully written to the player.
+		s.ensurePlaybackMarkLoop(pkt.turnID, rate)
+
+		s.audioMu.Lock()
+		if s.player == nil || s.playerRate != rate {
+			if s.player != nil {
+				closePlayerWithDebug(s.player, "live player reconfigure")
+			}
+			player, err := newLivePCMPlayerFunc(rate)
+			if err != nil {
+				s.player = nil
+				s.playerRate = 0
+				s.turnAudioOpen = false
+				s.audioMu.Unlock()
+				fmt.Fprintf(s.errOut, "live audio player warning: %v\n", err)
+				continue
+			}
+			s.player = player
+			s.playerRate = rate
+		}
+		player := s.player
+		s.turnAudioOpen = true
+		s.audioMu.Unlock()
+
+		if player == nil {
+			continue
+		}
+		if _, err := player.Write(pkt.pcm); err != nil {
+			fmt.Fprintf(s.errOut, "live audio playback warning: %v\n", err)
+			continue
+		}
+		s.addPlaybackBytes(pkt.turnID, rate, int64(len(pkt.pcm)))
+		if pkt.isFinal {
+			s.finalizeTurnAudio("live player close (audio_chunk final)", "finished")
+		}
+	}
 }
 
 func (s *liveModeSession) handleToolCall(ev types.LiveToolCallEvent) {
@@ -881,8 +1084,12 @@ func (s *liveModeSession) setActiveTurn(turnID string) {
 	if s.cancelledTurns == nil {
 		s.cancelledTurns = make(map[string]struct{})
 	}
+	if s.audioResetTurns == nil {
+		s.audioResetTurns = make(map[string]struct{})
+	}
 	s.activeTurnID = turnID
 	delete(s.cancelledTurns, turnID)
+	delete(s.audioResetTurns, turnID)
 }
 
 func (s *liveModeSession) activeTurn() string {
@@ -949,7 +1156,31 @@ func (s *liveModeSession) markTurnCancelled(turnID string) {
 	}
 }
 
+func (s *liveModeSession) markTurnAudioReset(turnID string) {
+	if s == nil {
+		return
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if s.audioResetTurns == nil {
+		s.audioResetTurns = make(map[string]struct{})
+	}
+	s.audioResetTurns[turnID] = struct{}{}
+}
+
 func (s *liveModeSession) shouldIgnoreTurn(turnID string) bool {
+	return s.shouldIgnoreTurnWithMode(turnID, false)
+}
+
+func (s *liveModeSession) shouldIgnoreStreamingTurn(turnID string) bool {
+	return s.shouldIgnoreTurnWithMode(turnID, true)
+}
+
+func (s *liveModeSession) shouldIgnoreTurnWithMode(turnID string, includeAudioReset bool) bool {
 	if s == nil {
 		return false
 	}
@@ -962,10 +1193,136 @@ func (s *liveModeSession) shouldIgnoreTurn(turnID string) bool {
 	if _, cancelled := s.cancelledTurns[turnID]; cancelled {
 		return true
 	}
+	if includeAudioReset {
+		if _, reset := s.audioResetTurns[turnID]; reset {
+			return true
+		}
+	}
 	if strings.TrimSpace(s.activeTurnID) == "" {
 		return false
 	}
 	return turnID != s.activeTurnID
+}
+
+func (s *liveModeSession) ensurePlaybackMarkLoop(turnID string, sampleRateHz int) {
+	if s == nil || s.ctx == nil || strings.TrimSpace(turnID) == "" || sampleRateHz <= 0 {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+
+	if s.playbackMarkTurnID == turnID && s.playbackMarkRateHz == sampleRateHz && !s.playbackMarkStart.IsZero() {
+		return
+	}
+
+	if s.playbackMarkCancel != nil {
+		s.playbackMarkCancel()
+		s.playbackMarkCancel = nil
+	}
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	s.playbackMarkCancel = cancel
+	s.playbackMarkTurnID = turnID
+	s.playbackMarkRateHz = sampleRateHz
+	s.playbackMarkStart = time.Now()
+	s.playbackMarkBytesPCM = 0
+	s.playbackMarkLastSent = -1
+
+	go s.playbackMarkLoop(ctx, turnID)
+}
+
+func (s *liveModeSession) stopPlaybackMarkLoop(turnID string) {
+	if s == nil {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if strings.TrimSpace(turnID) != "" && s.playbackMarkTurnID != "" && turnID != s.playbackMarkTurnID {
+		return
+	}
+	if s.playbackMarkCancel != nil {
+		s.playbackMarkCancel()
+		s.playbackMarkCancel = nil
+	}
+	s.playbackMarkTurnID = ""
+	s.playbackMarkRateHz = 0
+	s.playbackMarkStart = time.Time{}
+	s.playbackMarkBytesPCM = 0
+	s.playbackMarkLastSent = -1
+}
+
+func (s *liveModeSession) addPlaybackBytes(turnID string, sampleRateHz int, bytesPCM int64) {
+	if s == nil || strings.TrimSpace(turnID) == "" || bytesPCM <= 0 || sampleRateHz <= 0 {
+		return
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if s.playbackMarkTurnID != turnID || s.playbackMarkRateHz != sampleRateHz {
+		return
+	}
+	s.playbackMarkBytesPCM += bytesPCM
+}
+
+func (s *liveModeSession) snapshotPlayedMS(turnID string) int {
+	if s == nil || strings.TrimSpace(turnID) == "" {
+		return -1
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if s.playbackMarkTurnID != turnID || s.playbackMarkRateHz <= 0 || s.playbackMarkStart.IsZero() {
+		return -1
+	}
+	audioDurationMS := int((s.playbackMarkBytesPCM * 1000) / int64(s.playbackMarkRateHz*2))
+	elapsedMS := int(time.Since(s.playbackMarkStart).Milliseconds())
+	playedMS := elapsedMS
+	if audioDurationMS < playedMS {
+		playedMS = audioDurationMS
+	}
+	playedMS -= int(livePlaybackMarkSafetyMargin.Milliseconds())
+	if playedMS < 0 {
+		playedMS = 0
+	}
+	// Monotonic best-effort.
+	if playedMS < s.playbackMarkLastSent {
+		playedMS = s.playbackMarkLastSent
+	}
+	return playedMS
+}
+
+func (s *liveModeSession) playbackMarkLoop(ctx context.Context, turnID string) {
+	if s == nil || strings.TrimSpace(turnID) == "" {
+		return
+	}
+	ticker := time.NewTicker(livePlaybackMarkInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			playedMS := s.snapshotPlayedMS(turnID)
+			if playedMS < 0 {
+				continue
+			}
+			s.liveMu.Lock()
+			if s.playbackMarkTurnID != turnID {
+				s.liveMu.Unlock()
+				return
+			}
+			if playedMS <= s.playbackMarkLastSent {
+				s.liveMu.Unlock()
+				continue
+			}
+			s.playbackMarkLastSent = playedMS
+			s.liveMu.Unlock()
+
+			_ = s.sendJSON(types.LivePlaybackMarkFrame{
+				Type:     "playback_mark",
+				TurnID:   turnID,
+				PlayedMS: playedMS,
+			})
+		}
+	}
 }
 
 func decodeLiveEventType(data []byte) (string, error) {

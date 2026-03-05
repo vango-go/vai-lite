@@ -10,6 +10,17 @@ type LiveServerEvent interface {
 	LiveServerEventType() string
 }
 
+// LivePlaybackMarkFrame reports incremental assistant audio playback progress for a turn.
+// Clients should send this periodically while audio is playing (e.g. every 250ms).
+// played_ms is turn-relative and must be monotonic.
+type LivePlaybackMarkFrame struct {
+	Type     string `json:"type"` // "playback_mark"
+	TurnID   string `json:"turn_id,omitempty"`
+	PlayedMS int    `json:"played_ms"`
+}
+
+func (f LivePlaybackMarkFrame) LiveClientFrameType() string { return "playback_mark" }
+
 // LiveStartFrame configures a live session.
 type LiveStartFrame struct {
 	Type       string     `json:"type"` // "start"
@@ -128,6 +139,16 @@ type LiveAudioUnavailableEvent struct {
 }
 
 func (e LiveAudioUnavailableEvent) LiveServerEventType() string { return "audio_unavailable" }
+
+// LiveAudioResetEvent instructs the client to immediately drop any buffered assistant audio for a turn.
+// This is used for barge-in interruption and similar hard-stop conditions.
+type LiveAudioResetEvent struct {
+	Type   string `json:"type"` // "audio_reset"
+	TurnID string `json:"turn_id,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func (e LiveAudioResetEvent) LiveServerEventType() string { return "audio_reset" }
 
 // LiveTurnCancelledEvent indicates a turn was cancelled during the grace period.
 type LiveTurnCancelledEvent struct {

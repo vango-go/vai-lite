@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"github.com/vango-go/vai-lite/pkg/core"
@@ -80,6 +82,12 @@ type liveInboundPlaybackStateFrame struct {
 	State  string `json:"state"`
 }
 
+type liveInboundPlaybackMarkFrame struct {
+	Type     string `json:"type"`
+	TurnID   string `json:"turn_id"`
+	PlayedMS int    `json:"played_ms"`
+}
+
 type liveToolResultPayload struct {
 	Content []types.ContentBlock
 	IsError bool
@@ -112,16 +120,25 @@ type livePendingTurnResult struct {
 }
 
 type liveTurnRuntime struct {
-	id                string
-	lifecycle         liveTurnLifecycle
-	speechEndedAt     time.Time
-	graceDeadline     time.Time
-	nonTalkToolCalled bool
-	playbackFinished  bool
-	audioStarted      bool
-	pendingResult     *livePendingTurnResult
-	runCancel         context.CancelFunc
-	baseUserPCM       []byte
+	id                 string
+	lifecycle          liveTurnLifecycle
+	speechEndedAt      time.Time
+	graceDeadline      time.Time
+	nonTalkToolCalled  bool
+	playbackFinished   bool
+	audioStarted       bool
+	playedMS           int
+	interruptRequested bool
+	interruptPlayedMS  int
+	interruptFrozen    bool
+	suppressOutgoing   bool
+	talkCallID         string
+	talkFullText       strings.Builder
+	talkTimestamps     []tts.WordTimestampsBatch
+	pendingResult      *livePendingTurnResult
+	runCancel          context.CancelFunc
+	baseUserPCM        []byte
+	baseHistory        []types.Message
 }
 
 type liveTalkTTS struct {
@@ -142,6 +159,7 @@ type liveTTSSession interface {
 	Flush() error
 	Close() error
 	Audio() <-chan []byte
+	Timestamps() <-chan tts.WordTimestampsBatch
 	Err() error
 }
 
@@ -182,7 +200,10 @@ var newLiveTTSSessionFunc = func(ctx context.Context, pipeline *voice.Pipeline, 
 	if pipeline == nil {
 		return nil, errors.New("voice pipeline is not configured")
 	}
-	ttsCtx, err := pipeline.NewStreamingTTSContext(ctx, voiceCfg, ttsModel)
+	ttsCtx, err := pipeline.NewStreamingTTSContextWithExtraOptions(ctx, voiceCfg, ttsModel, tts.StreamingContextOptions{
+		AddTimestamps:           true,
+		UseNormalizedTimestamps: true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -277,16 +298,17 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = startFrame
 
 	session := &liveSession{
-		ctx:           ctx,
-		cancel:        cancel,
-		logger:        h.Logger,
-		reqID:         reqID,
-		conn:          conn,
-		sendCh:        make(chan any, 256),
-		state:         liveStateRunning,
-		toolWaiters:   make(map[string]chan liveToolResultPayload),
-		runTemplate:   runReq,
-		controllerCfg: sessionCfg,
+		ctx:            ctx,
+		cancel:         cancel,
+		logger:         h.Logger,
+		reqID:          reqID,
+		conn:           conn,
+		prioritySendCh: make(chan any, 16),
+		sendCh:         make(chan any, 256),
+		state:          liveStateRunning,
+		toolWaiters:    make(map[string]chan liveToolResultPayload),
+		runTemplate:    runReq,
+		controllerCfg:  sessionCfg,
 	}
 	session.serverRegistry = sessionCfg.ServerRegistry
 	session.toolExec = &liveToolExecutor{session: session}
@@ -569,8 +591,9 @@ type liveSession struct {
 	logger *slog.Logger
 	reqID  string
 
-	conn   *websocket.Conn
-	sendCh chan any
+	conn           *websocket.Conn
+	prioritySendCh chan any
+	sendCh         chan any
 
 	wg sync.WaitGroup
 
@@ -608,12 +631,44 @@ func (s *liveSession) send(event any) bool {
 	}
 }
 
+func (s *liveSession) sendPriority(event any) bool {
+	// Tests and some non-live call paths may not initialize prioritySendCh.
+	// Fall back to the normal send channel so callers don't block forever.
+	if s == nil || s.prioritySendCh == nil {
+		return s.send(event)
+	}
+	select {
+	case s.prioritySendCh <- event:
+		return true
+	case <-s.ctx.Done():
+		return false
+	}
+}
+
 func (s *liveSession) writerLoop() {
 	defer s.wg.Done()
 	for {
+		// Drain priority events first to minimize latency for hard-stop/control messages.
 		select {
 		case <-s.ctx.Done():
 			return
+		case event := <-s.prioritySendCh:
+			if err := s.conn.WriteJSON(event); err != nil {
+				s.cancel()
+				return
+			}
+			continue
+		default:
+		}
+
+		select {
+		case <-s.ctx.Done():
+			return
+		case event := <-s.prioritySendCh:
+			if err := s.conn.WriteJSON(event); err != nil {
+				s.cancel()
+				return
+			}
 		case event, ok := <-s.sendCh:
 			if !ok {
 				return
@@ -680,6 +735,8 @@ func (s *liveSession) handleControlFrame(data []byte) error {
 		return s.handleToolResultFrame(data)
 	case "playback_state":
 		return s.handlePlaybackStateFrame(data)
+	case "playback_mark":
+		return s.handlePlaybackMarkFrame(data)
 	case "stop":
 		var frame liveInboundStopFrame
 		if err := json.Unmarshal(data, &frame); err != nil {
@@ -713,6 +770,31 @@ func (s *liveSession) handlePlaybackStateFrame(data []byte) error {
 		return nil
 	}
 	s.activeTurn.playbackFinished = true
+	return nil
+}
+
+func (s *liveSession) handlePlaybackMarkFrame(data []byte) error {
+	var frame liveInboundPlaybackMarkFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		return fmt.Errorf("invalid playback_mark frame")
+	}
+	turnID := strings.TrimSpace(frame.TurnID)
+	if turnID == "" {
+		// Keep wire compatibility: ignore empty turn_id.
+		return nil
+	}
+	if frame.PlayedMS < 0 {
+		return fmt.Errorf("playback_mark.played_ms must be >= 0")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTurn == nil || s.activeTurn.id != turnID {
+		return nil
+	}
+	if frame.PlayedMS > s.activeTurn.playedMS {
+		s.activeTurn.playedMS = frame.PlayedMS
+	}
 	return nil
 }
 
@@ -800,29 +882,50 @@ func (s *liveSession) sttLoop() {
 			cancelRun    context.CancelFunc
 			cancelTurnID string
 			emitCancel   bool
+			emitReset    bool
 		)
 		s.mu.Lock()
 		s.sttSawText = true
 		s.lastSpeechAt = now
-		if active := s.activeTurn; active != nil && s.isGraceCancelableLocked(active, now) {
-			active.lifecycle = liveTurnLifecycleCancelled
-			active.pendingResult = nil
-			active.playbackFinished = false
-			s.aggregatePrefix = append([]byte(nil), active.baseUserPCM...)
-			cancelRun = active.runCancel
-			active.runCancel = nil
-			cancelTurnID = active.id
-			emitCancel = true
+		if active := s.activeTurn; active != nil && !active.interruptRequested {
+			playing := active.audioStarted && !active.playbackFinished
+			if s.isGraceCancelableLocked(active, now) {
+				active.lifecycle = liveTurnLifecycleCancelled
+				active.pendingResult = nil
+				active.playbackFinished = false
+				s.aggregatePrefix = append([]byte(nil), active.baseUserPCM...)
+				cancelRun = active.runCancel
+				active.runCancel = nil
+				cancelTurnID = active.id
+				emitCancel = true
+			} else if playing {
+				// Interrupt (barge-in) outside grace-cancel rules.
+				active.interruptRequested = true
+				active.interruptPlayedMS = active.playedMS
+				active.interruptFrozen = true
+				active.suppressOutgoing = true
+				cancelRun = active.runCancel
+				active.runCancel = nil
+				cancelTurnID = active.id
+				emitReset = true
+			}
 		}
 		s.mu.Unlock()
 		if cancelRun != nil {
 			cancelRun()
 		}
 		if emitCancel {
-			s.send(types.LiveTurnCancelledEvent{
+			s.sendPriority(types.LiveTurnCancelledEvent{
 				Type:   "turn_cancelled",
 				TurnID: cancelTurnID,
 				Reason: "grace_period",
+			})
+		}
+		if emitReset {
+			s.sendPriority(types.LiveAudioResetEvent{
+				Type:   "audio_reset",
+				TurnID: cancelTurnID,
+				Reason: "barge_in",
 			})
 		}
 	}
@@ -972,6 +1075,7 @@ func (s *liveSession) runTurn(committed liveCommittedUtterance) {
 	s.mu.Unlock()
 	runReq.Request.Messages = append(historyCopy, userMsg)
 	runReq.Request.Voice = nil
+	turn.baseHistory = append([]types.Message(nil), runReq.Request.Messages...)
 
 	controller := &runloop.Controller{
 		Provider:          s.controllerCfg.Provider,
@@ -993,26 +1097,50 @@ func (s *liveSession) runTurn(committed liveCommittedUtterance) {
 		turn.runCancel = nil
 	}
 	turnCancelled := s.activeTurn == turn && turn.lifecycle == liveTurnLifecycleCancelled
+	turnInterrupted := s.activeTurn == turn && turn.interruptRequested
 	s.mu.Unlock()
 
 	if err != nil {
 		if turnCancelled && errors.Is(err, context.Canceled) {
 			return
 		}
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			s.send(types.LiveErrorEvent{
-				Type:    "error",
-				Fatal:   false,
-				Message: "turn run failed: " + err.Error(),
-				Code:    "turn_failed",
-			})
+		if errors.Is(err, context.Canceled) && turnInterrupted {
+			// Continue below to finalize an interrupted turn with truncated talk_to_user content.
+		} else {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				s.send(types.LiveErrorEvent{
+					Type:    "error",
+					Fatal:   false,
+					Message: "turn run failed: " + err.Error(),
+					Code:    "turn_failed",
+				})
+			}
+			return
 		}
+	}
+	if result == nil && !turnInterrupted {
 		return
 	}
-	if result == nil {
+	if result != nil && len(result.Messages) == 0 && !turnInterrupted {
 		return
 	}
-	if len(result.Messages) == 0 {
+
+	// If this was an interruption-driven cancellation, synthesize a coherent pending history.
+	if turnInterrupted && (result == nil || errors.Is(err, context.Canceled)) {
+		stopReason := types.RunStopReasonCancelled
+		history := append([]types.Message(nil), turn.baseHistory...)
+		if result != nil && len(result.Messages) > 0 {
+			stopReason = result.StopReason
+			history = append([]types.Message(nil), result.Messages...)
+		}
+		history = ensureTalkToUserHistory(history, turn.talkCallID, turn.talkFullText.String())
+		if !s.setPendingTurnResult(turn.id, &livePendingTurnResult{
+			stopReason: stopReason,
+			history:    history,
+		}) {
+			return
+		}
+		s.finalizeTurn(turn.id)
 		return
 	}
 
@@ -1053,6 +1181,9 @@ func (s *liveSession) isGraceCancelableLocked(turn *liveTurnRuntime, now time.Ti
 	if turn.lifecycle != liveTurnLifecycleRunning && turn.lifecycle != liveTurnLifecycleAwaitingGrace {
 		return false
 	}
+	if turn.interruptRequested {
+		return false
+	}
 	if turn.nonTalkToolCalled || turn.playbackFinished {
 		return false
 	}
@@ -1083,6 +1214,9 @@ func (s *liveSession) shouldFinalizeTurnNow(turnID string) bool {
 	if turn.lifecycle == liveTurnLifecycleCancelled || turn.pendingResult == nil {
 		return false
 	}
+	if turn.interruptRequested {
+		return true
+	}
 	if turn.nonTalkToolCalled || !turn.audioStarted || turn.playbackFinished {
 		return true
 	}
@@ -1102,6 +1236,9 @@ func (s *liveSession) turnFinalizeStatus(turnID string) (finalize bool, cancelle
 	if turn.pendingResult == nil {
 		return false, false
 	}
+	if turn.interruptRequested {
+		return true, false
+	}
 	if turn.nonTalkToolCalled || !turn.audioStarted || turn.playbackFinished {
 		return true, false
 	}
@@ -1120,6 +1257,9 @@ func (s *liveSession) finalizeTurn(turnID string) {
 	if turn.lifecycle == liveTurnLifecycleCancelled || turn.lifecycle == liveTurnLifecycleFinalized || turn.pendingResult == nil {
 		s.mu.Unlock()
 		return
+	}
+	if turn.interruptRequested {
+		s.applyInterruptTruncationLocked(turn)
 	}
 	turn.lifecycle = liveTurnLifecycleFinalized
 	s.history = append([]types.Message(nil), turn.pendingResult.history...)
@@ -1150,6 +1290,285 @@ func (s *liveSession) markAudioStarted(turnID string) {
 		return
 	}
 	s.activeTurn.audioStarted = true
+}
+
+func (s *liveSession) isTurnSuppressed(turnID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTurn == nil || s.activeTurn.id != turnID {
+		return false
+	}
+	return s.activeTurn.suppressOutgoing
+}
+
+const liveInterruptMarker = "[user interrupt detected]"
+
+func (s *liveSession) applyInterruptTruncationLocked(turn *liveTurnRuntime) {
+	if turn == nil || turn.pendingResult == nil {
+		return
+	}
+	playedMS := turn.interruptPlayedMS
+	if playedMS <= 0 {
+		playedMS = turn.playedMS
+	}
+	fullText := turn.talkFullText.String()
+	prefix := truncateTalkToUserPrefix(fullText, turn.talkTimestamps, playedMS)
+
+	content := liveInterruptMarker
+	if strings.TrimSpace(prefix) != "" {
+		content = prefix + " " + liveInterruptMarker
+	}
+
+	if ok := setLastTalkToUserContent(turn.pendingResult.history, content); ok {
+		return
+	}
+	turn.pendingResult.history = ensureTalkToUserHistory(turn.pendingResult.history, turn.talkCallID, content)
+}
+
+func ensureTalkToUserHistory(history []types.Message, callID string, content string) []types.Message {
+	if ok := setLastTalkToUserContent(history, content); ok {
+		return history
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		callID = "talk_to_user"
+	}
+	assistant := types.Message{
+		Role: "assistant",
+		Content: []types.ContentBlock{
+			types.ToolUseBlock{
+				Type:  "tool_use",
+				ID:    callID,
+				Name:  "talk_to_user",
+				Input: map[string]any{"content": content},
+			},
+		},
+	}
+	toolResult := types.Message{
+		Role: "user",
+		Content: []types.ContentBlock{
+			types.ToolResultBlock{
+				Type:      "tool_result",
+				ToolUseID: callID,
+				Content: []types.ContentBlock{
+					types.TextBlock{Type: "text", Text: "delivered"},
+				},
+			},
+		},
+	}
+	return append(history, assistant, toolResult)
+}
+
+func setLastTalkToUserContent(history []types.Message, content string) bool {
+	for mi := len(history) - 1; mi >= 0; mi-- {
+		if !strings.EqualFold(strings.TrimSpace(history[mi].Role), "assistant") {
+			continue
+		}
+		blocks := history[mi].ContentBlocks()
+		for bi := len(blocks) - 1; bi >= 0; bi-- {
+			switch b := blocks[bi].(type) {
+			case types.ToolUseBlock:
+				if !strings.EqualFold(strings.TrimSpace(b.Name), "talk_to_user") {
+					continue
+				}
+				if b.Input == nil {
+					b.Input = make(map[string]any, 1)
+				}
+				b.Input["content"] = content
+				blocks[bi] = b
+				history[mi].Content = blocks
+				return true
+			case *types.ToolUseBlock:
+				if b == nil || !strings.EqualFold(strings.TrimSpace(b.Name), "talk_to_user") {
+					continue
+				}
+				if b.Input == nil {
+					b.Input = make(map[string]any, 1)
+				}
+				b.Input["content"] = content
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type liveTalkToken struct {
+	start int
+	end   int
+	norm  string
+}
+
+func truncateTalkToUserPrefix(fullText string, batches []tts.WordTimestampsBatch, playedMS int) string {
+	fullText = strings.TrimRight(fullText, " \n\t")
+	if fullText == "" || playedMS <= 0 {
+		return ""
+	}
+
+	type tsWord struct {
+		norm  string
+		endMS int
+	}
+	var ts []tsWord
+	for _, batch := range batches {
+		n := len(batch.Words)
+		if len(batch.EndSec) < n {
+			n = len(batch.EndSec)
+		}
+		for i := 0; i < n; i++ {
+			w := normalizeSpokenToken(batch.Words[i])
+			if w == "" {
+				continue
+			}
+			endMS := int(batch.EndSec[i] * 1000)
+			ts = append(ts, tsWord{norm: w, endMS: endMS})
+		}
+	}
+	if len(ts) == 0 {
+		return ""
+	}
+
+	lastIdx := -1
+	for i := range ts {
+		if ts[i].endMS <= playedMS {
+			lastIdx = i
+		}
+	}
+	if lastIdx < 0 {
+		return ""
+	}
+
+	tokens := tokenizeTalkText(fullText)
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	// Greedy sequential alignment from timestamps → text tokens.
+	mapping := make(map[int]int, lastIdx+1) // tsIndex -> tokenEndChar
+	ti := 0
+	for i := 0; i <= lastIdx && ti < len(tokens); i++ {
+		if ts[i].norm == "" {
+			continue
+		}
+		found := -1
+		limit := ti + 8
+		if limit > len(tokens) {
+			limit = len(tokens)
+		}
+		for j := ti; j < limit; j++ {
+			if tokens[j].norm == ts[i].norm {
+				found = j
+				break
+			}
+		}
+		if found == -1 {
+			continue
+		}
+		mapping[i] = tokens[found].end
+		ti = found + 1
+	}
+
+	cutPos := -1
+	for i := lastIdx; i >= 0; i-- {
+		if end, ok := mapping[i]; ok {
+			cutPos = end
+			break
+		}
+	}
+	if cutPos <= 0 {
+		return ""
+	}
+	if cutPos > len(fullText) {
+		cutPos = len(fullText)
+	}
+
+	// Include immediate trailing punctuation/quotes (if any) up to whitespace.
+	extended := cutPos
+	for extended < len(fullText) {
+		r, size := utf8.DecodeRuneInString(fullText[extended:])
+		if r == utf8.RuneError && size == 1 {
+			break
+		}
+		if unicode.IsSpace(r) {
+			break
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			break
+		}
+		extended += size
+	}
+	out := strings.TrimRight(fullText[:extended], " \n\t")
+	return out
+}
+
+func tokenizeTalkText(text string) []liveTalkToken {
+	var tokens []liveTalkToken
+	start := -1
+	prevWasWord := false
+
+	flush := func(end int) {
+		if start < 0 || end <= start {
+			start = -1
+			prevWasWord = false
+			return
+		}
+		raw := text[start:end]
+		norm := normalizeSpokenToken(raw)
+		if norm != "" {
+			tokens = append(tokens, liveTalkToken{start: start, end: end, norm: norm})
+		}
+		start = -1
+		prevWasWord = false
+	}
+
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r == utf8.RuneError && size == 1 {
+			flush(i)
+			i++
+			continue
+		}
+		isWord := unicode.IsLetter(r) || unicode.IsDigit(r)
+		if isWord {
+			if start < 0 {
+				start = i
+			}
+			prevWasWord = true
+			i += size
+			continue
+		}
+		// Allow internal apostrophes/hyphens when surrounded by word chars.
+		if (r == '\'' || r == '-') && start >= 0 && prevWasWord {
+			nextIndex := i + size
+			if nextIndex < len(text) {
+				nr, _ := utf8.DecodeRuneInString(text[nextIndex:])
+				if unicode.IsLetter(nr) || unicode.IsDigit(nr) {
+					i += size
+					prevWasWord = false
+					continue
+				}
+			}
+		}
+		flush(i)
+		i += size
+	}
+	flush(len(text))
+	return tokens
+}
+
+func normalizeSpokenToken(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '\'' || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func (s *liveSession) currentTurnID() string {
@@ -1239,12 +1658,22 @@ func (s *liveTalkTurnState) handleStreamEvent(event types.StreamEvent) error {
 			s.metaByIndex[ev.Index] = liveToolMeta{id: tool.ID, name: tool.Name}
 			if strings.EqualFold(strings.TrimSpace(tool.Name), "talk_to_user") {
 				s.decoderByIndex[ev.Index] = vai.NewToolArgStringDecoder(vai.ToolArgStringDecoderOptions{})
+				if s.session != nil {
+					s.session.mu.Lock()
+					if s.session.activeTurn != nil && s.session.activeTurn.id == s.turnID && s.session.activeTurn.talkCallID == "" {
+						s.session.activeTurn.talkCallID = tool.ID
+					}
+					s.session.mu.Unlock()
+				}
 			}
 		}
 	case types.ContentBlockDeltaEvent:
 		switch delta := ev.Delta.(type) {
 		case types.TextDelta:
 			if delta.Text == "" {
+				return nil
+			}
+			if s.session != nil && s.session.isTurnSuppressed(s.turnID) {
 				return nil
 			}
 			s.session.send(types.LiveAssistantTextDeltaEvent{
@@ -1264,6 +1693,21 @@ func (s *liveTalkTurnState) handleStreamEvent(event types.StreamEvent) error {
 			}
 			update := decoder.Push(delta.PartialJSON)
 			if !update.Found || update.Delta == "" {
+				return nil
+			}
+			if s.session != nil {
+				s.session.mu.Lock()
+				if s.session.activeTurn != nil && s.session.activeTurn.id == s.turnID {
+					if s.session.activeTurn.talkCallID == "" {
+						s.session.activeTurn.talkCallID = meta.id
+					}
+					if !s.session.activeTurn.interruptFrozen {
+						s.session.activeTurn.talkFullText.WriteString(update.Delta)
+					}
+				}
+				s.session.mu.Unlock()
+			}
+			if s.session != nil && s.session.isTurnSuppressed(s.turnID) {
 				return nil
 			}
 			s.session.send(types.LiveTalkToUserTextDeltaEvent{
@@ -1327,7 +1771,24 @@ func (s *liveTalkTurnState) ensureTTS() error {
 	s.ttsDone = make(chan struct{})
 	s.ttsProgressCh = make(chan struct{}, 1)
 	go s.forwardTTSAudio()
+	go s.collectTTSTimestamps()
 	return nil
+}
+
+func (s *liveTalkTurnState) collectTTSTimestamps() {
+	if s == nil || s.tts == nil || s.session == nil {
+		return
+	}
+	for batch := range s.tts.Timestamps() {
+		if len(batch.Words) == 0 || len(batch.EndSec) == 0 {
+			continue
+		}
+		s.session.mu.Lock()
+		if s.session.activeTurn != nil && s.session.activeTurn.id == s.turnID {
+			s.session.activeTurn.talkTimestamps = append(s.session.activeTurn.talkTimestamps, batch)
+		}
+		s.session.mu.Unlock()
+	}
 }
 
 func (s *liveTalkTurnState) forwardTTSAudio() {
@@ -1339,26 +1800,64 @@ func (s *liveTalkTurnState) forwardTTSAudio() {
 	if s.session.runTemplate != nil && s.session.runTemplate.Request.Voice != nil && s.session.runTemplate.Request.Voice.Output != nil && s.session.runTemplate.Request.Voice.Output.SampleRate > 0 {
 		sampleRate = s.session.runTemplate.Request.Voice.Output.SampleRate
 	}
+
+	// Keep audio chunks relatively small so client playback writes do not block the
+	// websocket reader for long stretches. This is critical for barge-in: the
+	// client must be able to receive `audio_reset` promptly while audio is playing.
+	//
+	// Target <= ~80ms of PCM per websocket event.
+	maxChunkBytes := (sampleRate * 2 * 80) / 1000
+	if maxChunkBytes < 320 {
+		maxChunkBytes = 320
+	}
+
 	var pending []byte
+	sendPCM := func(pcm []byte, isFinal bool) {
+		if len(pcm) == 0 {
+			return
+		}
+		for off := 0; off < len(pcm); {
+			if s.session != nil && s.session.isTurnSuppressed(s.turnID) {
+				return
+			}
+			end := off + maxChunkBytes
+			if end > len(pcm) {
+				end = len(pcm)
+			}
+			part := pcm[off:end]
+			off = end
+			finalPart := isFinal && off >= len(pcm)
+
+			s.session.send(types.LiveAudioChunkEvent{
+				Type:         "audio_chunk",
+				TurnID:       s.turnID,
+				Format:       liveOutputFormat,
+				SampleRateHz: sampleRate,
+				Audio:        base64.StdEncoding.EncodeToString(part),
+				IsFinal:      finalPart,
+			})
+			s.session.markAudioStarted(s.turnID)
+			s.signalTTSProgress()
+		}
+	}
 	flushPending := func(isFinal bool) {
 		if len(pending) == 0 {
 			return
 		}
-		s.session.send(types.LiveAudioChunkEvent{
-			Type:         "audio_chunk",
-			TurnID:       s.turnID,
-			Format:       liveOutputFormat,
-			SampleRateHz: sampleRate,
-			Audio:        base64.StdEncoding.EncodeToString(pending),
-			IsFinal:      isFinal,
-		})
-		s.session.markAudioStarted(s.turnID)
-		s.signalTTSProgress()
+		if s.session != nil && s.session.isTurnSuppressed(s.turnID) {
+			pending = nil
+			return
+		}
+		sendPCM(pending, isFinal)
 		pending = nil
 	}
 	for chunk := range s.tts.Audio() {
 		if len(chunk) == 0 {
 			continue
+		}
+		if s.session != nil && s.session.isTurnSuppressed(s.turnID) {
+			_ = s.tts.Close()
+			return
 		}
 		flushPending(false)
 		pending = append(pending[:0], chunk...)
@@ -1378,6 +1877,10 @@ func (s *liveTalkTurnState) signalTTSProgress() {
 
 func (s *liveTalkTurnState) finish() {
 	if s.tts == nil {
+		return
+	}
+	if s.session != nil && s.session.isTurnSuppressed(s.turnID) {
+		_ = s.tts.Close()
 		return
 	}
 

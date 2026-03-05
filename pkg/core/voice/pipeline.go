@@ -245,6 +245,14 @@ func getFormatFromMediaType(mediaType string) string {
 // NewStreamingTTSContext creates a streaming TTS context for incremental synthesis.
 // Text can be sent incrementally via SendText(), and audio is streamed back via Audio().
 func (p *Pipeline) NewStreamingTTSContext(ctx context.Context, cfg *types.VoiceConfig, ttsModel string) (*tts.StreamingContext, error) {
+	return p.NewStreamingTTSContextWithExtraOptions(ctx, cfg, ttsModel, tts.StreamingContextOptions{})
+}
+
+// NewStreamingTTSContextWithExtraOptions creates a streaming TTS context for incremental synthesis,
+// allowing callers to opt into provider-specific capabilities such as timestamps.
+//
+// Fields set on extra options override the derived options when applicable (e.g. AddTimestamps).
+func (p *Pipeline) NewStreamingTTSContextWithExtraOptions(ctx context.Context, cfg *types.VoiceConfig, ttsModel string, extra tts.StreamingContextOptions) (*tts.StreamingContext, error) {
 	if cfg == nil || cfg.Output == nil {
 		return nil, fmt.Errorf("voice output config required")
 	}
@@ -262,6 +270,13 @@ func (p *Pipeline) NewStreamingTTSContext(ctx context.Context, cfg *types.VoiceC
 			}
 			return 24000
 		}(),
+	}
+
+	// Provider capability flags (explicit opt-in).
+	opts.AddTimestamps = extra.AddTimestamps
+	opts.UseNormalizedTimestamps = extra.UseNormalizedTimestamps
+	if extra.MaxBufferDelayMs > 0 {
+		opts.MaxBufferDelayMs = extra.MaxBufferDelayMs
 	}
 
 	return p.ttsProvider.NewStreamingContext(ctx, opts)

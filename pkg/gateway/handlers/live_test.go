@@ -15,6 +15,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/types"
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
+	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 )
 
@@ -96,6 +97,12 @@ func (f *fakeLiveTTSSession) Audio() <-chan []byte {
 		return ch
 	}
 	return f.audioCh
+}
+
+func (f *fakeLiveTTSSession) Timestamps() <-chan tts.WordTimestampsBatch {
+	ch := make(chan tts.WordTimestampsBatch)
+	close(ch)
+	return ch
 }
 
 func (f *fakeLiveTTSSession) Err() error { return nil }
@@ -810,6 +817,65 @@ done:
 	}
 }
 
+func TestLiveTalkTurnStateForwardTTSAudio_SplitsLargeChunksAndFinalOnlyOnce(t *testing.T) {
+	audioCh := make(chan []byte, 4)
+	tts := &fakeLiveTTSSession{audioCh: audioCh}
+	session := &liveSession{
+		ctx:    context.Background(),
+		sendCh: make(chan any, 64),
+		controllerCfg: &liveSessionConfig{
+			OutputSampleRateHz: 16000,
+		},
+	}
+	state := &liveTalkTurnState{
+		session: session,
+		tts:     tts,
+		ttsDone: make(chan struct{}),
+	}
+
+	go state.forwardTTSAudio()
+
+	// 16000 Hz * 2 bytes/sample * 500ms = 16000 bytes. This should split into multiple events.
+	audioCh <- make([]byte, 16000)
+	close(audioCh)
+
+	select {
+	case <-state.ttsDone:
+	case <-time.After(time.Second):
+		t.Fatal("forwardTTSAudio did not finish")
+	}
+
+	var events []types.LiveAudioChunkEvent
+	for {
+		select {
+		case raw := <-session.sendCh:
+			ev, ok := raw.(types.LiveAudioChunkEvent)
+			if !ok {
+				t.Fatalf("unexpected event type %T", raw)
+			}
+			events = append(events, ev)
+		default:
+			goto done
+		}
+	}
+done:
+	if len(events) < 2 {
+		t.Fatalf("len(audio events)=%d, want >=2", len(events))
+	}
+	finalCount := 0
+	for i, ev := range events {
+		if ev.IsFinal {
+			finalCount++
+			if i != len(events)-1 {
+				t.Fatalf("is_final set on non-terminal chunk at index %d", i)
+			}
+		}
+	}
+	if finalCount != 1 {
+		t.Fatalf("final chunk count=%d, want 1", finalCount)
+	}
+}
+
 func TestLiveSession_STTGraceCancelsRunningTurn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1067,4 +1133,206 @@ func TestLiveSession_STTGraceCancelsAwaitingGraceTurn(t *testing.T) {
 	cancel()
 	close(sttSession.transcripts)
 	<-done
+}
+
+func TestLiveSession_PlaybackMarkFrame_StoresMonotonicPlayedMS(t *testing.T) {
+	session := &liveSession{
+		ctx:    context.Background(),
+		sendCh: make(chan any, 4),
+		activeTurn: &liveTurnRuntime{
+			id:        "turn_1",
+			lifecycle: liveTurnLifecycleRunning,
+		},
+	}
+
+	if err := session.handlePlaybackMarkFrame([]byte(`{"type":"playback_mark","turn_id":"turn_1","played_ms":120}`)); err != nil {
+		t.Fatalf("handlePlaybackMarkFrame error: %v", err)
+	}
+	if err := session.handlePlaybackMarkFrame([]byte(`{"type":"playback_mark","turn_id":"turn_1","played_ms":80}`)); err != nil {
+		t.Fatalf("handlePlaybackMarkFrame error: %v", err)
+	}
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.activeTurn.playedMS != 120 {
+		t.Fatalf("playedMS=%d, want 120", session.activeTurn.playedMS)
+	}
+}
+
+func TestLiveSession_STTInterruptOutsideGrace_EmitsAudioReset(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sttSession := newFakeLiveSTTSession()
+	runCancelCalled := make(chan struct{}, 1)
+
+	session := &liveSession{
+		ctx:        ctx,
+		cancel:     cancel,
+		sendCh:     make(chan any, 8),
+		sttSession: sttSession,
+		activeTurn: &liveTurnRuntime{
+			id:               "turn_1",
+			lifecycle:        liveTurnLifecycleRunning,
+			graceDeadline:    time.Now().Add(-1 * time.Second),
+			audioStarted:     true,
+			playbackFinished: false,
+			playedMS:         1875,
+			runCancel: func() {
+				select {
+				case runCancelCalled <- struct{}{}:
+				default:
+				}
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	session.wg.Add(1)
+	go func() {
+		session.sttLoop()
+		close(done)
+	}()
+
+	sttSession.transcripts <- stt.TranscriptDelta{Text: "stop"}
+
+	select {
+	case <-runCancelCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected run cancel to be invoked on interrupt")
+	}
+
+	select {
+	case raw := <-session.sendCh:
+		ev, ok := raw.(types.LiveAudioResetEvent)
+		if !ok {
+			t.Fatalf("unexpected event type %T", raw)
+		}
+		if ev.TurnID != "turn_1" {
+			t.Fatalf("turn_id=%q, want turn_1", ev.TurnID)
+		}
+		if ev.Reason != "barge_in" {
+			t.Fatalf("reason=%q, want barge_in", ev.Reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected audio_reset event")
+	}
+
+	session.mu.Lock()
+	if session.activeTurn == nil || !session.activeTurn.interruptRequested {
+		session.mu.Unlock()
+		t.Fatal("interruptRequested not set")
+	}
+	if session.activeTurn.interruptPlayedMS != 1875 {
+		t.Fatalf("interruptPlayedMS=%d, want 1875", session.activeTurn.interruptPlayedMS)
+	}
+	if !session.activeTurn.suppressOutgoing {
+		t.Fatal("suppressOutgoing=false, want true")
+	}
+	if len(session.aggregatePrefix) != 0 {
+		t.Fatalf("aggregatePrefix length=%d, want 0", len(session.aggregatePrefix))
+	}
+	session.mu.Unlock()
+
+	cancel()
+	close(sttSession.transcripts)
+	<-done
+}
+
+func TestLiveSession_FinalizeTurn_TruncatesTalkToUserContentOnInterrupt(t *testing.T) {
+	session := &liveSession{
+		ctx:    context.Background(),
+		sendCh: make(chan any, 4),
+	}
+
+	full := "Once upon a time, there was a cat."
+	history := []types.Message{
+		{
+			Role: "assistant",
+			Content: []types.ContentBlock{
+				types.ToolUseBlock{
+					Type:  "tool_use",
+					ID:    "call_1",
+					Name:  "talk_to_user",
+					Input: map[string]any{"content": full},
+				},
+			},
+		},
+		{
+			Role: "user",
+			Content: []types.ContentBlock{
+				types.ToolResultBlock{
+					Type:      "tool_result",
+					ToolUseID: "call_1",
+					Content: []types.ContentBlock{
+						types.TextBlock{Type: "text", Text: "delivered"},
+					},
+				},
+			},
+		},
+	}
+
+	turn := &liveTurnRuntime{
+		id:                 "turn_1",
+		lifecycle:          liveTurnLifecycleAwaitingGrace,
+		interruptRequested: true,
+		interruptPlayedMS:  800,
+		talkCallID:         "call_1",
+		talkTimestamps: []tts.WordTimestampsBatch{
+			{
+				Words:  []string{"Once", "upon", "a", "time", "there", "was", "a", "cat"},
+				EndSec: []float64{0.20, 0.40, 0.55, 0.75, 1.00, 1.20, 1.35, 1.60},
+			},
+		},
+		pendingResult: &livePendingTurnResult{
+			stopReason: types.RunStopReasonCancelled,
+			history:    history,
+		},
+	}
+	turn.talkFullText.WriteString(full)
+
+	session.mu.Lock()
+	session.activeTurn = turn
+	session.mu.Unlock()
+
+	session.finalizeTurn("turn_1")
+
+	select {
+	case raw := <-session.sendCh:
+		ev, ok := raw.(types.LiveTurnCompleteEvent)
+		if !ok {
+			t.Fatalf("unexpected event type %T", raw)
+		}
+		if ev.TurnID != "turn_1" {
+			t.Fatalf("turn_id=%q, want turn_1", ev.TurnID)
+		}
+		// Find talk_to_user and assert truncation + marker.
+		found := ""
+		for i := len(ev.History) - 1; i >= 0; i-- {
+			if ev.History[i].Role != "assistant" {
+				continue
+			}
+			for _, b := range ev.History[i].ContentBlocks() {
+				if tb, ok := b.(types.ToolUseBlock); ok && strings.EqualFold(tb.Name, "talk_to_user") {
+					if tb.Input != nil {
+						if v, ok := tb.Input["content"].(string); ok {
+							found = v
+						}
+					}
+				}
+			}
+			if found != "" {
+				break
+			}
+		}
+		if found == "" {
+			t.Fatal("did not find talk_to_user content in history")
+		}
+		want := "Once upon a time, [user interrupt detected]"
+		if found != want {
+			t.Fatalf("talk_to_user.content=%q, want %q", found, want)
+		}
+	default:
+		t.Fatal("expected turn_complete event")
+	}
 }

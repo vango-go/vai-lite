@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -429,43 +431,71 @@ func TestReadLiveSessionStarted_RejectsNonPositiveOutputRate(t *testing.T) {
 }
 
 func TestHandleAudioChunk_NonFinalKeepsPlayerOpen(t *testing.T) {
-	oldClose := closePCMPlayerFunc
-	t.Cleanup(func() { closePCMPlayerFunc = oldClose })
+	oldNew := newLivePCMPlayerFunc
+	t.Cleanup(func() { newLivePCMPlayerFunc = oldNew })
 
-	closeCalls := 0
-	closePCMPlayerFunc = func(p *pcmPlayer) error {
-		closeCalls++
-		return nil
+	created := make(chan struct{}, 1)
+	newLivePCMPlayerFunc = func(sampleRate int) (*pcmPlayer, error) {
+		select {
+		case created <- struct{}{}:
+		default:
+		}
+		return &pcmPlayer{sampleRate: sampleRate}, nil
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	session := &liveModeSession{
-		player:                     &pcmPlayer{},
-		playerRate:                 24000,
+		ctx:                        ctx,
 		negotiatedOutputSampleRate: 24000,
 		errOut:                     io.Discard,
+		cancelledTurns:             make(map[string]struct{}),
+		audioResetTurns:            make(map[string]struct{}),
 	}
+	session.audioQueueCond = sync.NewCond(&session.audioQueueMu)
+	session.setActiveTurn("turn_1")
+
+	session.wg.Add(1)
+	go session.audioPlaybackLoop()
+
 	session.handleAudioChunk(types.LiveAudioChunkEvent{
 		Type:         "audio_chunk",
+		TurnID:       "turn_1",
 		Format:       "pcm_s16le",
 		SampleRateHz: 24000,
 		Audio:        base64.StdEncoding.EncodeToString([]byte{0x01, 0x02, 0x03, 0x04}),
 		IsFinal:      false,
 	})
 
-	if closeCalls != 0 {
-		t.Fatalf("closeCalls=%d, want 0", closeCalls)
+	select {
+	case <-created:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for player creation")
 	}
-	if session.player == nil {
-		t.Fatal("expected player to stay open")
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		session.audioMu.Lock()
+		playerOpen := session.player != nil
+		session.audioMu.Unlock()
+		if playerOpen && session.isTurnAudioOpen() {
+			session.closeAudioQueue()
+			session.wg.Wait()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if !session.turnAudioOpen {
-		t.Fatal("expected turnAudioOpen=true")
-	}
+	t.Fatal("expected player to be opened by playback loop")
 }
 
 func TestHandleAudioChunk_FinalClosesTurnPlayer(t *testing.T) {
 	oldClose := closePCMPlayerFunc
-	t.Cleanup(func() { closePCMPlayerFunc = oldClose })
+	oldNew := newLivePCMPlayerFunc
+	t.Cleanup(func() {
+		closePCMPlayerFunc = oldClose
+		newLivePCMPlayerFunc = oldNew
+	})
 
 	closeCalls := 0
 	closePCMPlayerFunc = func(p *pcmPlayer) error {
@@ -473,32 +503,48 @@ func TestHandleAudioChunk_FinalClosesTurnPlayer(t *testing.T) {
 		return nil
 	}
 
+	newLivePCMPlayerFunc = func(sampleRate int) (*pcmPlayer, error) {
+		return &pcmPlayer{sampleRate: sampleRate}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
 	session := &liveModeSession{
-		player:                     &pcmPlayer{},
-		playerRate:                 24000,
+		ctx:                        ctx,
 		negotiatedOutputSampleRate: 24000,
 		errOut:                     io.Discard,
+		cancelledTurns:             make(map[string]struct{}),
+		audioResetTurns:            make(map[string]struct{}),
 	}
+	session.audioQueueCond = sync.NewCond(&session.audioQueueMu)
+	session.setActiveTurn("turn_1")
+
+	session.wg.Add(1)
+	go session.audioPlaybackLoop()
+
 	session.handleAudioChunk(types.LiveAudioChunkEvent{
 		Type:         "audio_chunk",
+		TurnID:       "turn_1",
 		Format:       "pcm_s16le",
 		SampleRateHz: 24000,
 		Audio:        base64.StdEncoding.EncodeToString([]byte{0x01, 0x02}),
 		IsFinal:      true,
 	})
 
-	if closeCalls != 1 {
-		t.Fatalf("closeCalls=%d, want 1", closeCalls)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		session.audioMu.Lock()
+		playerCleared := session.player == nil && session.playerRate == 0
+		session.audioMu.Unlock()
+		if playerCleared && !session.isTurnAudioOpen() && closeCalls == 1 {
+			session.closeAudioQueue()
+			session.wg.Wait()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if session.player != nil {
-		t.Fatal("expected player to be cleared")
-	}
-	if session.playerRate != 0 {
-		t.Fatalf("playerRate=%d, want 0", session.playerRate)
-	}
-	if session.turnAudioOpen {
-		t.Fatal("expected turnAudioOpen=false")
-	}
+	t.Fatalf("expected final chunk to close player (closeCalls=%d)", closeCalls)
 }
 
 func TestHandleServerEvent_TurnCompleteFinalizesOpenTurnAudio(t *testing.T) {
@@ -512,12 +558,14 @@ func TestHandleServerEvent_TurnCompleteFinalizesOpenTurnAudio(t *testing.T) {
 	}
 
 	session := &liveModeSession{
-		player:        &pcmPlayer{},
-		playerRate:    24000,
-		turnAudioOpen: true,
-		out:           io.Discard,
-		errOut:        io.Discard,
+		out:    io.Discard,
+		errOut: io.Discard,
 	}
+	session.audioMu.Lock()
+	session.player = &pcmPlayer{}
+	session.playerRate = 24000
+	session.turnAudioOpen = true
+	session.audioMu.Unlock()
 	if err := session.handleServerEvent([]byte(`{"type":"turn_complete","stop_reason":"end_turn","history":[]}`)); err != nil {
 		t.Fatalf("handleServerEvent error: %v", err)
 	}
@@ -525,10 +573,13 @@ func TestHandleServerEvent_TurnCompleteFinalizesOpenTurnAudio(t *testing.T) {
 	if closeCalls != 1 {
 		t.Fatalf("closeCalls=%d, want 1", closeCalls)
 	}
-	if session.player != nil {
+	session.audioMu.Lock()
+	player := session.player
+	session.audioMu.Unlock()
+	if player != nil {
 		t.Fatal("expected player to be cleared")
 	}
-	if session.turnAudioOpen {
+	if session.isTurnAudioOpen() {
 		t.Fatal("expected turnAudioOpen=false")
 	}
 }
@@ -544,12 +595,14 @@ func TestHandleServerEvent_AudioUnavailableFinalizesOpenTurnAudio(t *testing.T) 
 	}
 
 	session := &liveModeSession{
-		player:        &pcmPlayer{},
-		playerRate:    24000,
-		turnAudioOpen: true,
-		out:           io.Discard,
-		errOut:        io.Discard,
+		out:    io.Discard,
+		errOut: io.Discard,
 	}
+	session.audioMu.Lock()
+	session.player = &pcmPlayer{}
+	session.playerRate = 24000
+	session.turnAudioOpen = true
+	session.audioMu.Unlock()
 	if err := session.handleServerEvent([]byte(`{"type":"audio_unavailable","reason":"tts_failed","message":"boom"}`)); err != nil {
 		t.Fatalf("handleServerEvent error: %v", err)
 	}
@@ -557,10 +610,13 @@ func TestHandleServerEvent_AudioUnavailableFinalizesOpenTurnAudio(t *testing.T) 
 	if closeCalls != 1 {
 		t.Fatalf("closeCalls=%d, want 1", closeCalls)
 	}
-	if session.player != nil {
+	session.audioMu.Lock()
+	player := session.player
+	session.audioMu.Unlock()
+	if player != nil {
 		t.Fatal("expected player to be cleared")
 	}
-	if session.turnAudioOpen {
+	if session.isTurnAudioOpen() {
 		t.Fatal("expected turnAudioOpen=false")
 	}
 }
@@ -576,12 +632,14 @@ func TestHandleServerEvent_UserTurnCommittedFinalizesOpenTurnAudio(t *testing.T)
 	}
 
 	session := &liveModeSession{
-		player:        &pcmPlayer{},
-		playerRate:    24000,
-		turnAudioOpen: true,
-		out:           io.Discard,
-		errOut:        io.Discard,
+		out:    io.Discard,
+		errOut: io.Discard,
 	}
+	session.audioMu.Lock()
+	session.player = &pcmPlayer{}
+	session.playerRate = 24000
+	session.turnAudioOpen = true
+	session.audioMu.Unlock()
 	if err := session.handleServerEvent([]byte(`{"type":"user_turn_committed","audio_bytes":1234}`)); err != nil {
 		t.Fatalf("handleServerEvent error: %v", err)
 	}
@@ -589,10 +647,13 @@ func TestHandleServerEvent_UserTurnCommittedFinalizesOpenTurnAudio(t *testing.T)
 	if closeCalls != 1 {
 		t.Fatalf("closeCalls=%d, want 1", closeCalls)
 	}
-	if session.player != nil {
+	session.audioMu.Lock()
+	player := session.player
+	session.audioMu.Unlock()
+	if player != nil {
 		t.Fatal("expected player to be cleared")
 	}
-	if session.turnAudioOpen {
+	if session.isTurnAudioOpen() {
 		t.Fatal("expected turnAudioOpen=false")
 	}
 }
@@ -609,13 +670,15 @@ func TestHandleServerEvent_TurnCancelledFinalizesAndIgnoresLateDeltas(t *testing
 
 	var out bytes.Buffer
 	session := &liveModeSession{
-		player:         &pcmPlayer{},
-		playerRate:     24000,
-		turnAudioOpen:  true,
 		out:            &out,
 		errOut:         io.Discard,
 		cancelledTurns: make(map[string]struct{}),
 	}
+	session.audioMu.Lock()
+	session.player = &pcmPlayer{}
+	session.playerRate = 24000
+	session.turnAudioOpen = true
+	session.audioMu.Unlock()
 	session.setActiveTurn("turn_1")
 
 	if err := session.handleServerEvent([]byte(`{"type":"turn_cancelled","turn_id":"turn_1","reason":"grace_period"}`)); err != nil {
@@ -624,7 +687,7 @@ func TestHandleServerEvent_TurnCancelledFinalizesAndIgnoresLateDeltas(t *testing
 	if closeCalls != 1 {
 		t.Fatalf("closeCalls=%d, want 1", closeCalls)
 	}
-	if session.turnAudioOpen {
+	if session.isTurnAudioOpen() {
 		t.Fatal("expected turnAudioOpen=false")
 	}
 
@@ -666,18 +729,23 @@ func TestFinalizeTurnAudio_SendsPlaybackStopped(t *testing.T) {
 	closePCMPlayerFunc = func(p *pcmPlayer) error { return nil }
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	received := make(chan []byte, 1)
+	received := make(chan []byte, 2)
+	serverErr := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			t.Fatalf("upgrade websocket: %v", err)
+			serverErr <- fmt.Errorf("upgrade websocket: %w", err)
+			return
 		}
 		defer conn.Close()
-		_, payload, err := conn.ReadMessage()
-		if err != nil {
-			t.Fatalf("read playback_state frame: %v", err)
+		for i := 0; i < 2; i++ {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				serverErr <- fmt.Errorf("read websocket frame: %w", err)
+				return
+			}
+			received <- payload
 		}
-		received <- payload
 	}))
 	defer server.Close()
 
@@ -689,17 +757,47 @@ func TestFinalizeTurnAudio_SendsPlaybackStopped(t *testing.T) {
 	defer conn.Close()
 
 	session := &liveModeSession{
-		conn:           conn,
-		player:         &pcmPlayer{},
-		turnAudioOpen:  true,
-		out:            io.Discard,
-		errOut:         io.Discard,
-		cancelledTurns: make(map[string]struct{}),
+		ctx:             context.Background(),
+		conn:            conn,
+		player:          &pcmPlayer{},
+		turnAudioOpen:   true,
+		out:             io.Discard,
+		errOut:          io.Discard,
+		cancelledTurns:  make(map[string]struct{}),
+		audioResetTurns: make(map[string]struct{}),
 	}
 	session.setAudioTurn("turn_42")
+	session.playbackMarkTurnID = "turn_42"
+	session.playbackMarkRateHz = 16000
+	session.playbackMarkStart = time.Now().Add(-500 * time.Millisecond)
+	session.playbackMarkBytesPCM = int64(16000 * 2) // 1s buffered
+	session.playbackMarkLastSent = -1
 	session.finalizeTurnAudio("test close", "stopped")
 
+	var mark types.LivePlaybackMarkFrame
 	select {
+	case err := <-serverErr:
+		t.Fatalf("server error: %v", err)
+	case payload := <-received:
+		if err := json.Unmarshal(payload, &mark); err != nil {
+			t.Fatalf("decode playback_mark frame: %v", err)
+		}
+		if mark.Type != "playback_mark" {
+			t.Fatalf("type=%q, want playback_mark", mark.Type)
+		}
+		if mark.TurnID != "turn_42" {
+			t.Fatalf("turn_id=%q, want turn_42", mark.TurnID)
+		}
+		if mark.PlayedMS < 0 {
+			t.Fatalf("played_ms=%d, want >= 0", mark.PlayedMS)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for playback_mark frame")
+	}
+
+	select {
+	case err := <-serverErr:
+		t.Fatalf("server error: %v", err)
 	case payload := <-received:
 		var frame types.LivePlaybackStateFrame
 		if err := json.Unmarshal(payload, &frame); err != nil {
@@ -717,4 +815,159 @@ func TestFinalizeTurnAudio_SendsPlaybackStopped(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for playback_state frame")
 	}
+}
+
+func TestHandleServerEvent_AudioResetKillsPlayerAndAllowsTurnComplete(t *testing.T) {
+	oldKill := killPCMPlayerFunc
+	oldClose := closePCMPlayerFunc
+	t.Cleanup(func() {
+		killPCMPlayerFunc = oldKill
+		closePCMPlayerFunc = oldClose
+	})
+
+	killCalls := 0
+	closeCalls := 0
+	killPCMPlayerFunc = func(p *pcmPlayer) error {
+		killCalls++
+		return nil
+	}
+	closePCMPlayerFunc = func(p *pcmPlayer) error {
+		closeCalls++
+		return nil
+	}
+
+	session := &liveModeSession{
+		ctx:             context.Background(),
+		out:             io.Discard,
+		errOut:          io.Discard,
+		cancelledTurns:  make(map[string]struct{}),
+		audioResetTurns: make(map[string]struct{}),
+	}
+	session.audioMu.Lock()
+	session.player = &pcmPlayer{}
+	session.playerRate = 24000
+	session.turnAudioOpen = true
+	session.audioMu.Unlock()
+	session.setActiveTurn("turn_1")
+	session.setAudioTurn("turn_1")
+
+	if err := session.handleServerEvent([]byte(`{"type":"audio_reset","turn_id":"turn_1","reason":"barge_in"}`)); err != nil {
+		t.Fatalf("handleServerEvent(audio_reset) error: %v", err)
+	}
+	if killCalls != 1 {
+		t.Fatalf("killCalls=%d, want 1", killCalls)
+	}
+	if closeCalls != 0 {
+		t.Fatalf("closeCalls=%d, want 0", closeCalls)
+	}
+	if session.isTurnAudioOpen() {
+		t.Fatal("expected turnAudioOpen=false after audio_reset")
+	}
+	session.audioMu.Lock()
+	player := session.player
+	session.audioMu.Unlock()
+	if player != nil {
+		t.Fatal("expected player to be cleared after audio_reset")
+	}
+
+	// Late audio chunks for the reset turn must be ignored.
+	if err := session.handleServerEvent([]byte(`{"type":"audio_chunk","turn_id":"turn_1","format":"pcm_s16le","sample_rate_hz":24000,"audio":"AQI=","is_final":false}`)); err != nil {
+		t.Fatalf("handleServerEvent(audio_chunk) error: %v", err)
+	}
+	if killCalls != 1 {
+		t.Fatalf("killCalls=%d, want 1 after late chunk", killCalls)
+	}
+
+	if err := session.handleServerEvent([]byte(`{"type":"turn_complete","turn_id":"turn_1","stop_reason":"cancelled","history":[{"role":"assistant","content":[{"type":"text","text":"ok"}]}]}`)); err != nil {
+		t.Fatalf("handleServerEvent(turn_complete) error: %v", err)
+	}
+	history := session.HistorySnapshot()
+	if len(history) != 1 || history[0].TextContent() != "ok" {
+		t.Fatalf("history not updated after turn_complete: %#v", history)
+	}
+}
+
+func TestPlaybackMarkLoop_SendsMonotonicMarks(t *testing.T) {
+	oldInterval := livePlaybackMarkInterval
+	oldMargin := livePlaybackMarkSafetyMargin
+	t.Cleanup(func() {
+		livePlaybackMarkInterval = oldInterval
+		livePlaybackMarkSafetyMargin = oldMargin
+	})
+	livePlaybackMarkInterval = 10 * time.Millisecond
+	livePlaybackMarkSafetyMargin = 0
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	received := make(chan []byte, 8)
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErr <- fmt.Errorf("upgrade websocket: %w", err)
+			return
+		}
+		defer conn.Close()
+		for {
+			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				serverErr <- fmt.Errorf("set read deadline: %w", err)
+				return
+			}
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				// Most likely the client closed the connection; treat as graceful.
+				return
+			}
+			received <- payload
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session := &liveModeSession{
+		ctx:             ctx,
+		conn:            conn,
+		out:             io.Discard,
+		errOut:          io.Discard,
+		cancelledTurns:  make(map[string]struct{}),
+		audioResetTurns: make(map[string]struct{}),
+	}
+
+	session.ensurePlaybackMarkLoop("turn_1", 16000)
+	session.addPlaybackBytes("turn_1", 16000, int64(16000*2)) // 1s of PCM buffered
+
+	var marks []types.LivePlaybackMarkFrame
+	for len(marks) < 2 {
+		select {
+		case err := <-serverErr:
+			t.Fatalf("server error: %v", err)
+		case payload := <-received:
+			var mark types.LivePlaybackMarkFrame
+			if err := json.Unmarshal(payload, &mark); err != nil {
+				t.Fatalf("decode playback_mark frame: %v", err)
+			}
+			if mark.Type != "playback_mark" {
+				t.Fatalf("type=%q, want playback_mark", mark.Type)
+			}
+			if mark.TurnID != "turn_1" {
+				t.Fatalf("turn_id=%q, want turn_1", mark.TurnID)
+			}
+			marks = append(marks, mark)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for playback_mark frames")
+		}
+	}
+	if marks[1].PlayedMS <= marks[0].PlayedMS {
+		t.Fatalf("played_ms not monotonic: %d then %d", marks[0].PlayedMS, marks[1].PlayedMS)
+	}
+
+	session.stopPlaybackMarkLoop("turn_1")
 }

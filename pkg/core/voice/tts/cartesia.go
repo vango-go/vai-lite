@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	cartesiaTTSBaseURL    = "https://api.cartesia.ai"
-	cartesiaTTSWSBase     = "wss://api.cartesia.ai/tts/websocket"
-	cartesiaTTSAPIVersion = "2025-04-16"
+	cartesiaTTSBaseURL      = "https://api.cartesia.ai"
+	cartesiaTTSWSBase       = "wss://api.cartesia.ai/tts/websocket"
+	cartesiaTTSAPIVersion   = "2025-04-16"
 	cartesiaTTSDefaultModel = "sonic-3"
 
 	// defaultMaxBufferDelayMs matches the Cartesia docs default.
@@ -266,10 +266,12 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 				Mode: "id",
 				ID:   voiceID,
 			},
-			OutputFormat:     outputFormat,
-			ContextID:        contextID,
-			Continue:         !isFinal,
-			MaxBufferDelayMs: maxBufferDelay,
+			OutputFormat:            outputFormat,
+			ContextID:               contextID,
+			Continue:                !isFinal,
+			MaxBufferDelayMs:        maxBufferDelay,
+			AddTimestamps:           opts.AddTimestamps,
+			UseNormalizedTimestamps: opts.UseNormalizedTimestamps,
 		}
 		if opts.Language != "" {
 			msg.Language = opts.Language
@@ -288,6 +290,7 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 	// Background goroutine: read WebSocket responses, decode audio, push to channel.
 	go func() {
 		defer sc.FinishAudio()
+		defer sc.FinishTimestamps()
 		defer closeConn()
 
 		for {
@@ -337,6 +340,31 @@ func (c *CartesiaProvider) NewStreamingContext(ctx context.Context, opts Streami
 					}
 				}
 
+			case "timestamps":
+				if msg.WordTimestamps == nil {
+					continue
+				}
+				wt := msg.WordTimestamps
+				if len(wt.Words) == 0 || len(wt.Start) == 0 || len(wt.End) == 0 {
+					continue
+				}
+				// Be tolerant of partial batches: truncate to shortest length.
+				n := len(wt.Words)
+				if len(wt.Start) < n {
+					n = len(wt.Start)
+				}
+				if len(wt.End) < n {
+					n = len(wt.End)
+				}
+				if n <= 0 {
+					continue
+				}
+				sc.PushTimestamps(WordTimestampsBatch{
+					Words:    append([]string(nil), wt.Words[:n]...),
+					StartSec: append([]float64(nil), wt.Start[:n]...),
+					EndSec:   append([]float64(nil), wt.End[:n]...),
+				})
+
 			case "flush_done":
 				// Acknowledgment — continue reading.
 				continue
@@ -378,14 +406,16 @@ type cartesiaHTTPRequest struct {
 }
 
 type cartesiaStreamingRequest struct {
-	ModelID          string              `json:"model_id"`
-	Transcript       string              `json:"transcript"`
-	Voice            cartesiaVoiceSpec   `json:"voice"`
-	OutputFormat     cartesiaOutputFormat `json:"output_format"`
-	ContextID        string              `json:"context_id"`
-	Continue         bool                `json:"continue"`
-	MaxBufferDelayMs int                 `json:"max_buffer_delay_ms,omitempty"`
-	Language         string              `json:"language,omitempty"`
+	ModelID                 string               `json:"model_id"`
+	Transcript              string               `json:"transcript"`
+	Voice                   cartesiaVoiceSpec    `json:"voice"`
+	OutputFormat            cartesiaOutputFormat `json:"output_format"`
+	ContextID               string               `json:"context_id"`
+	Continue                bool                 `json:"continue"`
+	MaxBufferDelayMs        int                  `json:"max_buffer_delay_ms,omitempty"`
+	Language                string               `json:"language,omitempty"`
+	AddTimestamps           bool                 `json:"add_timestamps,omitempty"`
+	UseNormalizedTimestamps bool                 `json:"use_normalized_timestamps,omitempty"`
 }
 
 type cartesiaVoiceSpec struct {
@@ -415,12 +445,19 @@ type cartesiaGenerationConfig struct {
 }
 
 type cartesiaWSResponse struct {
-	Type       string `json:"type"`
-	Data       string `json:"data,omitempty"`
-	Done       bool   `json:"done"`
-	StatusCode int    `json:"status_code"`
-	ContextID  string `json:"context_id,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Type           string                  `json:"type"`
+	Data           string                  `json:"data,omitempty"`
+	Done           bool                    `json:"done"`
+	StatusCode     int                     `json:"status_code"`
+	ContextID      string                  `json:"context_id,omitempty"`
+	Error          string                  `json:"error,omitempty"`
+	WordTimestamps *cartesiaWordTimestamps `json:"word_timestamps,omitempty"`
+}
+
+type cartesiaWordTimestamps struct {
+	Words []string  `json:"words"`
+	Start []float64 `json:"start"`
+	End   []float64 `json:"end"`
 }
 
 // ---------------------------------------------------------------------------
