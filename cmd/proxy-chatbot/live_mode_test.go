@@ -660,11 +660,20 @@ func TestHandleServerEvent_UserTurnCommittedFinalizesOpenTurnAudio(t *testing.T)
 
 func TestHandleServerEvent_TurnCancelledFinalizesAndIgnoresLateDeltas(t *testing.T) {
 	oldClose := closePCMPlayerFunc
-	t.Cleanup(func() { closePCMPlayerFunc = oldClose })
+	oldKill := killPCMPlayerFunc
+	t.Cleanup(func() {
+		closePCMPlayerFunc = oldClose
+		killPCMPlayerFunc = oldKill
+	})
 
 	closeCalls := 0
 	closePCMPlayerFunc = func(p *pcmPlayer) error {
 		closeCalls++
+		return nil
+	}
+	killCalls := 0
+	killPCMPlayerFunc = func(p *pcmPlayer) error {
+		killCalls++
 		return nil
 	}
 
@@ -684,8 +693,11 @@ func TestHandleServerEvent_TurnCancelledFinalizesAndIgnoresLateDeltas(t *testing
 	if err := session.handleServerEvent([]byte(`{"type":"turn_cancelled","turn_id":"turn_1","reason":"grace_period"}`)); err != nil {
 		t.Fatalf("handleServerEvent(turn_cancelled) error: %v", err)
 	}
-	if closeCalls != 1 {
-		t.Fatalf("closeCalls=%d, want 1", closeCalls)
+	if killCalls != 1 {
+		t.Fatalf("killCalls=%d, want 1", killCalls)
+	}
+	if closeCalls != 0 {
+		t.Fatalf("closeCalls=%d, want 0", closeCalls)
 	}
 	if session.isTurnAudioOpen() {
 		t.Fatal("expected turnAudioOpen=false")

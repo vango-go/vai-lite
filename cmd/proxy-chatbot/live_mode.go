@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,6 +37,22 @@ const (
 var (
 	livePlaybackMarkInterval     = 250 * time.Millisecond
 	livePlaybackMarkSafetyMargin = 100 * time.Millisecond
+)
+
+const (
+	liveMicSampleRateHz = 16000
+
+	// Local barge-in detection: we cut local playback quickly when the mic signal indicates
+	// the user is speaking over assistant audio. This avoids waiting for STT to emit text.
+	//
+	// We avoid naive RMS-only triggers by tracking an adaptive baseline while assistant audio is playing.
+	liveBargeInMinAboveMS     = 100
+	liveBargeInRefractory     = 500 * time.Millisecond
+	liveBargeInSuppressWindow = 750 * time.Millisecond
+
+	liveBargeInFixedRMS      = 800.0
+	liveBargeInBaselineAlpha = 0.08
+	liveBargeInBaselineMul   = 1.8
 )
 
 var liveProviderByokHeaders = map[string]string{
@@ -102,6 +119,13 @@ type liveModeSession struct {
 	audioQueueCond   *sync.Cond
 	audioQueue       []liveAudioPacket
 	audioQueueClosed bool
+
+	bargeMu            sync.Mutex
+	bargeTurnID        string
+	bargeBaselineRMS   float64
+	bargeAboveMS       int
+	bargeLastTriggered time.Time
+	bargeSuppressUntil time.Time
 
 	errMu sync.RWMutex
 	err   error
@@ -201,6 +225,7 @@ func startLiveMode(ctx context.Context, cfg chatConfig, state *chatRuntime, tool
 	session.playerRate = 0
 
 	recorder, recErr := newLivePCMRecorderFunc(func(chunk []byte) error {
+		session.maybeLocalBargeIn(chunk)
 		return session.sendBinary(chunk)
 	})
 	if recErr != nil {
@@ -661,7 +686,7 @@ func (s *liveModeSession) handleServerEvent(data []byte) error {
 		s.audioUnavailableWarned = false
 		s.outputMu.Unlock()
 		if s.isTurnAudioOpen() {
-			s.finalizeTurnAudio("live player close (turn_cancelled)", "stopped")
+			s.hardStopTurnAudio(ev.TurnID, "live player kill (turn_cancelled)")
 		}
 	case "audio_reset":
 		var ev types.LiveAudioResetEvent
@@ -897,6 +922,16 @@ func (s *liveModeSession) audioPlaybackLoop() {
 			continue
 		}
 
+		s.bargeMu.Lock()
+		suppressed := pkt.turnID != "" && pkt.turnID == s.bargeTurnID && !s.bargeSuppressUntil.IsZero() && time.Now().Before(s.bargeSuppressUntil)
+		s.bargeMu.Unlock()
+		if suppressed {
+			// Drop audio during the local suppression window. If the user is actually speaking,
+			// the server will send an authoritative audio_reset soon, and we should not resume.
+			// If it was a false positive, we allow a small gap and then continue.
+			continue
+		}
+
 		rate := pkt.rateHz
 		if rate <= 0 {
 			rate = s.negotiatedOutputSampleRate
@@ -941,6 +976,128 @@ func (s *liveModeSession) audioPlaybackLoop() {
 			s.finalizeTurnAudio("live player close (audio_chunk final)", "finished")
 		}
 	}
+}
+
+func (s *liveModeSession) maybeLocalBargeIn(pcm []byte) {
+	if s == nil || len(pcm) == 0 {
+		return
+	}
+	// Only barge-in when we're actually playing assistant audio.
+	if !s.isTurnAudioOpen() {
+		s.bargeMu.Lock()
+		s.bargeTurnID = ""
+		s.bargeBaselineRMS = 0
+		s.bargeAboveMS = 0
+		s.bargeMu.Unlock()
+		return
+	}
+
+	turnID := s.audioTurn()
+	if turnID == "" {
+		turnID = s.activeTurn()
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	if s.shouldIgnoreStreamingTurn(turnID) {
+		return
+	}
+
+	rms := rmsS16LE(pcm)
+	if rms <= 0 {
+		return
+	}
+	durMS := (len(pcm) * 1000) / (liveMicSampleRateHz * 2)
+	if durMS <= 0 {
+		durMS = 1
+	}
+
+	now := time.Now()
+	trigger := false
+
+	s.bargeMu.Lock()
+	if s.bargeTurnID != turnID {
+		s.bargeTurnID = turnID
+		s.bargeBaselineRMS = 0
+		s.bargeAboveMS = 0
+		s.bargeSuppressUntil = time.Time{}
+	}
+	baseline := s.bargeBaselineRMS
+	if baseline <= 0 {
+		baseline = rms
+	}
+	adaptive := baseline * liveBargeInBaselineMul
+	threshold := liveBargeInFixedRMS
+	if adaptive > threshold {
+		threshold = adaptive
+	}
+
+	if rms > threshold {
+		s.bargeAboveMS += durMS
+	} else {
+		s.bargeAboveMS = 0
+	}
+
+	// Update baseline after applying the threshold so user speech doesn't immediately raise the bar.
+	if s.bargeBaselineRMS <= 0 {
+		s.bargeBaselineRMS = rms
+	} else {
+		s.bargeBaselineRMS = (1.0-liveBargeInBaselineAlpha)*s.bargeBaselineRMS + liveBargeInBaselineAlpha*rms
+	}
+
+	if s.bargeAboveMS >= liveBargeInMinAboveMS && now.Sub(s.bargeLastTriggered) >= liveBargeInRefractory {
+		s.bargeLastTriggered = now
+		s.bargeAboveMS = 0
+		s.bargeSuppressUntil = now.Add(liveBargeInSuppressWindow)
+		trigger = true
+	}
+	s.bargeMu.Unlock()
+
+	if !trigger {
+		return
+	}
+
+	// Send a best-effort playback mark immediately so the server has the freshest played_ms snapshot.
+	if playedMS := s.snapshotPlayedMS(turnID); playedMS >= 0 {
+		_ = s.sendJSON(types.LivePlaybackMarkFrame{
+			Type:     "playback_mark",
+			TurnID:   turnID,
+			PlayedMS: playedMS,
+		})
+	}
+
+	// Hard cut local playback without telling the server playback is "stopped"/"finished"
+	// (that would break grace-cancel semantics).
+	s.audioMu.Lock()
+	if s.player != nil {
+		killPlayerWithDebug(s.player, "live player kill (local barge-in)")
+		s.player = nil
+	}
+	s.playerRate = 0
+	s.turnAudioOpen = false
+	s.audioMu.Unlock()
+}
+
+func rmsS16LE(pcm []byte) float64 {
+	// Expect little-endian signed 16-bit PCM mono.
+	if len(pcm) < 2 {
+		return 0
+	}
+	var sumSquares float64
+	count := 0
+	for i := 0; i+1 < len(pcm); i += 2 {
+		// Decode int16 without binary.Read overhead.
+		v := int16(uint16(pcm[i]) | (uint16(pcm[i+1]) << 8))
+		f := float64(v)
+		sumSquares += f * f
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	mean := sumSquares / float64(count)
+	return math.Sqrt(mean)
 }
 
 func (s *liveModeSession) handleToolCall(ev types.LiveToolCallEvent) {
