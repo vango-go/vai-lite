@@ -277,7 +277,7 @@ func TestLiveSession_SendHelpers(t *testing.T) {
 			t.Errorf("write session_started: %v", err)
 			return
 		}
-		for i := 0; i < 4; i++ {
+		for i := 0; i < 7; i++ {
 			mt, data, err := conn.ReadMessage()
 			if err != nil {
 				t.Errorf("read frame: %v", err)
@@ -325,6 +325,15 @@ func TestLiveSession_SendHelpers(t *testing.T) {
 	if err := session.SendToolResult("exec_1", []ContentBlock{Text("ok")}, false, nil); err != nil {
 		t.Fatalf("SendToolResult error: %v", err)
 	}
+	if err := session.AppendInputBlocks([]ContentBlock{Text("draft")}); err != nil {
+		t.Fatalf("AppendInputBlocks error: %v", err)
+	}
+	if err := session.CommitText("send"); err != nil {
+		t.Fatalf("CommitText error: %v", err)
+	}
+	if err := session.ClearPendingInput(); err != nil {
+		t.Fatalf("ClearPendingInput error: %v", err)
+	}
 
 	time.Sleep(50 * time.Millisecond)
 	obs.mu.Lock()
@@ -332,14 +341,14 @@ func TestLiveSession_SendHelpers(t *testing.T) {
 	if len(obs.binaries) != 1 || len(obs.binaries[0]) != 2 {
 		t.Fatalf("binaries=%v", obs.binaries)
 	}
-	if len(obs.textFrames) < 3 {
-		t.Fatalf("textFrames=%d, want >= 3", len(obs.textFrames))
+	if len(obs.textFrames) < 6 {
+		t.Fatalf("textFrames=%d, want >= 6", len(obs.textFrames))
 	}
 }
 
 func TestLiveSession_ProcessCallbacks(t *testing.T) {
 	session := &LiveSession{
-		events:    make(chan LiveEvent, 8),
+		events:    make(chan LiveEvent, 10),
 		procTools: make(chan liveProcessToolEvent, 2),
 		done:      make(chan struct{}),
 	}
@@ -349,6 +358,7 @@ func TestLiveSession_ProcessCallbacks(t *testing.T) {
 	session.events <- LiveAssistantTextDeltaEvent{Type: "assistant_text_delta", Text: "hello"}
 	session.events <- LiveAudioChunkEvent{Type: "audio_chunk", Format: "pcm_s16le", Audio: audioPayload}
 	session.events <- LiveAudioUnavailableEvent{Type: "audio_unavailable", Reason: "tts_failed", Message: "boom"}
+	session.events <- LiveInputStateEvent{Type: "input_state", Content: []ContentBlock{Text("draft")}}
 	session.events <- LiveUserTurnCommittedEvent{Type: "user_turn_committed", TurnID: "turn_1", AudioBytes: 42}
 	session.events <- LiveTurnCompleteEvent{Type: "turn_complete", TurnID: "turn_1", StopReason: "end_turn", History: []Message{{Role: "assistant", Content: "done"}}}
 	session.events <- LiveTurnCancelledEvent{Type: "turn_cancelled", TurnID: "turn_2", Reason: "cancelled"}
@@ -364,6 +374,7 @@ func TestLiveSession_ProcessCallbacks(t *testing.T) {
 		text          string
 		audio         []byte
 		unavailable   string
+		inputState    string
 		started       bool
 		userTurnID    string
 		turnComplete  string
@@ -390,6 +401,11 @@ func TestLiveSession_ProcessCallbacks(t *testing.T) {
 			},
 		},
 		OnSessionStarted: func(LiveSessionStartedEvent) { got.started = true },
+		OnInputState: func(content []ContentBlock) {
+			if len(content) > 0 {
+				got.inputState = content[0].(types.TextBlock).Text
+			}
+		},
 		OnUserTurnCommitted: func(turnID string, audioBytes int) {
 			got.userTurnID = turnID
 		},
@@ -415,6 +431,9 @@ func TestLiveSession_ProcessCallbacks(t *testing.T) {
 	if got.unavailable != "tts_failed:boom" {
 		t.Fatalf("unavailable=%q", got.unavailable)
 	}
+	if got.inputState != "draft" {
+		t.Fatalf("inputState=%q", got.inputState)
+	}
 	if got.userTurnID != "turn_1" {
 		t.Fatalf("userTurnID=%q", got.userTurnID)
 	}
@@ -432,6 +451,23 @@ func TestLiveSession_ProcessCallbacks(t *testing.T) {
 	}
 	if got.toolResult != "exec_1:local_tool:ok" {
 		t.Fatalf("toolResult=%q", got.toolResult)
+	}
+}
+
+func TestLiveSession_InputHelpersRejectEmpty(t *testing.T) {
+	session := &LiveSession{}
+
+	if err := session.AppendInputBlocks(nil); err == nil {
+		t.Fatal("AppendInputBlocks(nil) error=nil, want invalid request")
+	}
+	if err := session.CommitInputBlocks(nil); err == nil {
+		t.Fatal("CommitInputBlocks(nil) error=nil, want invalid request")
+	}
+	if err := session.AppendText(""); err == nil {
+		t.Fatal("AppendText(\"\") error=nil, want invalid request")
+	}
+	if err := session.CommitText("   "); err == nil {
+		t.Fatal("CommitText(blank) error=nil, want invalid request")
 	}
 }
 
@@ -515,6 +551,94 @@ func TestLiveServiceConnect_AutoToolExecution(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for tool_result")
+	}
+}
+
+func TestLiveServiceConnect_AutoToolExecutionInjectsServerToolExecutionContext(t *testing.T) {
+	resultCh := make(chan types.LiveToolResultFrame, 1)
+	server := newLiveTestServer(t, func(conn *websocket.Conn, r *http.Request) {
+		var start types.LiveStartFrame
+		if err := conn.ReadJSON(&start); err != nil {
+			t.Errorf("read start frame: %v", err)
+			return
+		}
+		if err := conn.WriteJSON(types.LiveSessionStartedEvent{
+			Type:               "session_started",
+			InputFormat:        "pcm_s16le",
+			InputSampleRateHz:  16000,
+			OutputFormat:       "pcm_s16le",
+			OutputSampleRateHz: 16000,
+			SilenceCommitMS:    900,
+		}); err != nil {
+			t.Errorf("write session_started: %v", err)
+			return
+		}
+		if err := conn.WriteJSON(types.LiveToolCallEvent{
+			Type:        "tool_call",
+			ExecutionID: "exec_1",
+			Name:        "local_tool",
+			Input:       map[string]any{"value": "x"},
+		}); err != nil {
+			t.Errorf("write tool_call: %v", err)
+			return
+		}
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read tool_result: %v", err)
+			return
+		}
+		frame, err := types.UnmarshalLiveClientFrame(payload)
+		if err != nil {
+			t.Errorf("unmarshal tool_result: %v", err)
+			return
+		}
+		resultCh <- frame.(types.LiveToolResultFrame)
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
+	})
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL))
+	session, err := client.Live.Connect(context.Background(), &LiveConnectRequest{
+		Request: MessageRequest{
+			Model: "openai/gpt-5",
+			Messages: []Message{{
+				Role: "assistant",
+				Content: []types.ContentBlock{
+					types.ImageBlock{
+						Type: "image",
+						Source: types.ImageSource{
+							Type:      "base64",
+							MediaType: "image/png",
+							Data:      "Zm9v",
+						},
+					},
+				},
+			}},
+		},
+	}, &LiveConnectOptions{
+		ToolHandlers: map[string]ToolHandler{
+			"local_tool": func(ctx context.Context, input json.RawMessage) (any, error) {
+				execCtx := serverToolExecutionContextFromContext(ctx)
+				if execCtx == nil || len(execCtx.Images) != 1 || execCtx.Images[0].ID != "img-01" {
+					t.Fatalf("execution context=%#v", execCtx)
+				}
+				return "from tool", nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+	defer session.Close()
+
+	<-session.Events()
+	select {
+	case result := <-resultCh:
+		if result.IsError {
+			t.Fatalf("expected success result: %#v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for tool result")
 	}
 }
 

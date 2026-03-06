@@ -87,9 +87,10 @@ type gemExtensions struct {
 	InlineMediaMaxBytes      int64
 	InlineMediaTotalMaxBytes int64
 
-	Grounding      map[string]any
-	SafetySettings []safetySettingExtension
-	SpeechConfig   *genai.SpeechConfig
+	Grounding        map[string]any
+	SafetySettings   []safetySettingExtension
+	SpeechConfig     *genai.SpeechConfig
+	ImageAspectRatio string
 }
 
 type requestBuild struct {
@@ -161,7 +162,7 @@ func (p *Provider) buildGenerateContentRequest(req *types.MessageRequest, opts b
 	}
 
 	if req.Output != nil {
-		if err := applyOutputConfig(cfg, req.Output); err != nil {
+		if err := applyOutputConfig(cfg, req.Output, ext); err != nil {
 			return nil, err
 		}
 	}
@@ -432,6 +433,18 @@ func parseGemExtensions(req *types.MessageRequest) (gemExtensions, error) {
 				sc.VoiceConfig = &genai.VoiceConfig{PrebuiltVoiceConfig: &genai.PrebuiltVoiceConfig{VoiceName: strings.TrimSpace(voice)}}
 			}
 			ext.SpeechConfig = sc
+		case "image_config":
+			cfgMap, ok := v.(map[string]any)
+			if !ok {
+				return ext, invalidExtType(k, "object")
+			}
+			if rawAspect, ok := cfgMap["aspect_ratio"]; ok {
+				aspect, ok := rawAspect.(string)
+				if !ok {
+					return ext, core.NewInvalidRequestErrorWithParam("gem.image_config.aspect_ratio must be string", "extensions.gem.image_config.aspect_ratio")
+				}
+				ext.ImageAspectRatio = strings.TrimSpace(aspect)
+			}
 		default:
 			// Unknown extension keys are ignored by design.
 		}
@@ -559,7 +572,7 @@ func textBlockText(block types.ContentBlock) (string, bool) {
 	}
 }
 
-func applyOutputConfig(cfg *genai.GenerateContentConfig, out *types.OutputConfig) error {
+func applyOutputConfig(cfg *genai.GenerateContentConfig, out *types.OutputConfig, ext gemExtensions) error {
 	if out == nil {
 		return nil
 	}
@@ -583,6 +596,10 @@ func applyOutputConfig(cfg *genai.GenerateContentConfig, out *types.OutputConfig
 	}
 	if out.Image != nil && strings.TrimSpace(out.Image.Size) != "" {
 		size := strings.ToUpper(strings.TrimSpace(out.Image.Size))
+		imageCfg := cfg.ImageConfig
+		if imageCfg == nil {
+			imageCfg = &genai.ImageConfig{}
+		}
 		switch size {
 		case "1024X1024", "1K":
 			size = "1K"
@@ -593,7 +610,16 @@ func applyOutputConfig(cfg *genai.GenerateContentConfig, out *types.OutputConfig
 		default:
 			return core.NewInvalidRequestErrorWithParam("unsupported output.image.size; supported values are 1K, 2K, 4K", "output.image.size")
 		}
-		cfg.ImageConfig = &genai.ImageConfig{ImageSize: size}
+		imageCfg.ImageSize = size
+		cfg.ImageConfig = imageCfg
+	}
+	if strings.TrimSpace(ext.ImageAspectRatio) != "" {
+		imageCfg := cfg.ImageConfig
+		if imageCfg == nil {
+			imageCfg = &genai.ImageConfig{}
+		}
+		imageCfg.AspectRatio = strings.TrimSpace(ext.ImageAspectRatio)
+		cfg.ImageConfig = imageCfg
 	}
 	return nil
 }

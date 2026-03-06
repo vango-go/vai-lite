@@ -297,6 +297,34 @@ func TestLocalVAIWebFetch_CustomConfig(t *testing.T) {
 	}
 }
 
+func TestVAIImage_UsesExpectedToolName(t *testing.T) {
+	t.Parallel()
+
+	tool := VAIImage(GemDev)
+	if tool.Tool.Type != types.ToolTypeFunction {
+		t.Errorf("expected type %q, got %q", types.ToolTypeFunction, tool.Tool.Type)
+	}
+	if tool.Tool.Name != "vai_image" {
+		t.Errorf("expected name %q, got %q", "vai_image", tool.Tool.Name)
+	}
+	if tool.Handler == nil {
+		t.Fatal("expected handler to be non-nil")
+	}
+}
+
+func TestVAIImage_UnsupportedProviderRejected(t *testing.T) {
+	t.Parallel()
+
+	tool := VAIImage(Tavily)
+	_, err := tool.Handler(context.Background(), json.RawMessage(`{"prompt":"go"}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "unsupported image provider") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestLocalVAIWebFetch_ProviderError(t *testing.T) {
 	provider := &mockFetchProvider{
 		err: context.DeadlineExceeded,

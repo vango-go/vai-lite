@@ -95,6 +95,12 @@ func LiveTurnCompleteFrom(event LiveEvent) (LiveTurnCompleteEvent, bool) {
 	return complete, ok
 }
 
+// LiveInputStateFrom extracts staged-input state events from live events.
+func LiveInputStateFrom(event LiveEvent) (LiveInputStateEvent, bool) {
+	state, ok := event.(LiveInputStateEvent)
+	return state, ok
+}
+
 // ToolUseStartFrom extracts tool-use start metadata from wrapped stream events.
 func ToolUseStartFrom(event RunStreamEvent) (index int, id, name string, ok bool) {
 	wrapped, ok := event.(StreamEventWrapper)

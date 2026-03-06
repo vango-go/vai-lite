@@ -27,6 +27,29 @@ type LivePlaybackMarkFrame struct {
 
 func (f LivePlaybackMarkFrame) LiveClientFrameType() string { return "playback_mark" }
 
+// LiveInputAppendFrame appends staged user content to the next live turn.
+type LiveInputAppendFrame struct {
+	Type    string         `json:"type"` // "input_append"
+	Content []ContentBlock `json:"content"`
+}
+
+func (f LiveInputAppendFrame) LiveClientFrameType() string { return "input_append" }
+
+// LiveInputCommitFrame commits staged and inline user content as an immediate live turn.
+type LiveInputCommitFrame struct {
+	Type    string         `json:"type"` // "input_commit"
+	Content []ContentBlock `json:"content,omitempty"`
+}
+
+func (f LiveInputCommitFrame) LiveClientFrameType() string { return "input_commit" }
+
+// LiveInputClearFrame clears any staged live user content that has not yet been committed.
+type LiveInputClearFrame struct {
+	Type string `json:"type"` // "input_clear"
+}
+
+func (f LiveInputClearFrame) LiveClientFrameType() string { return "input_clear" }
+
 // LiveStartFrame configures a live session.
 type LiveStartFrame struct {
 	Type       string     `json:"type"` // "start"
@@ -106,7 +129,8 @@ type LiveToolCallEvent struct {
 
 func (e LiveToolCallEvent) LiveServerEventType() string { return "tool_call" }
 
-// LiveUserTurnCommittedEvent indicates an utterance has been committed and sent as audio_stt.
+// LiveUserTurnCommittedEvent indicates a live user turn has been committed.
+// audio_bytes may be zero for immediate non-audio commits.
 type LiveUserTurnCommittedEvent struct {
 	Type       string `json:"type"` // "user_turn_committed"
 	TurnID     string `json:"turn_id,omitempty"`
@@ -114,6 +138,14 @@ type LiveUserTurnCommittedEvent struct {
 }
 
 func (e LiveUserTurnCommittedEvent) LiveServerEventType() string { return "user_turn_committed" }
+
+// LiveInputStateEvent reports the full staged live input buffer after mutation.
+type LiveInputStateEvent struct {
+	Type    string         `json:"type"` // "input_state"
+	Content []ContentBlock `json:"content"`
+}
+
+func (e LiveInputStateEvent) LiveServerEventType() string { return "input_state" }
 
 // LiveTurnCompleteEvent indicates a turn has completed and includes synced history.
 type LiveTurnCompleteEvent struct {
@@ -205,6 +237,44 @@ func UnmarshalLiveClientFrame(data []byte) (LiveClientFrame, error) {
 			IsError:     raw.IsError,
 			Error:       raw.Error,
 		}, nil
+	case "input_append":
+		var raw struct {
+			Type    string            `json:"type"`
+			Content []json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		content, err := unmarshalContentBlocks(raw.Content)
+		if err != nil {
+			return nil, err
+		}
+		return LiveInputAppendFrame{
+			Type:    raw.Type,
+			Content: content,
+		}, nil
+	case "input_commit":
+		var raw struct {
+			Type    string            `json:"type"`
+			Content []json.RawMessage `json:"content,omitempty"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		content, err := unmarshalContentBlocks(raw.Content)
+		if err != nil {
+			return nil, err
+		}
+		return LiveInputCommitFrame{
+			Type:    raw.Type,
+			Content: content,
+		}, nil
+	case "input_clear":
+		var frame LiveInputClearFrame
+		if err := json.Unmarshal(data, &frame); err != nil {
+			return nil, err
+		}
+		return frame, nil
 	case "stop":
 		var frame LiveStopFrame
 		if err := json.Unmarshal(data, &frame); err != nil {
@@ -271,6 +341,22 @@ func UnmarshalLiveServerEvent(data []byte) (LiveServerEvent, error) {
 			return nil, err
 		}
 		return event, nil
+	case "input_state":
+		var raw struct {
+			Type    string            `json:"type"`
+			Content []json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		content, err := unmarshalContentBlocks(raw.Content)
+		if err != nil {
+			return nil, err
+		}
+		return LiveInputStateEvent{
+			Type:    raw.Type,
+			Content: content,
+		}, nil
 	case "turn_complete":
 		var event LiveTurnCompleteEvent
 		if err := json.Unmarshal(data, &event); err != nil {

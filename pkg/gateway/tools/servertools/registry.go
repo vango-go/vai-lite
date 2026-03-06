@@ -13,6 +13,7 @@ import (
 const (
 	ToolWebSearch = "vai_web_search"
 	ToolWebFetch  = "vai_web_fetch"
+	ToolImage     = "vai_image"
 )
 
 type Executor interface {

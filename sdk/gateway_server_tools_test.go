@@ -100,6 +100,14 @@ func TestGatewayVAIWebTools_ProviderHeadersByTool(t *testing.T) {
 			input:       `{"url":"https://example.com"}`,
 			providerOpt: WithProviderKey("firecrawl", "fc-test"),
 		},
+		{
+			name:        "image_gemdev",
+			tool:        VAIImage(GemDev),
+			headerName:  "X-Provider-Key-Gemini",
+			headerValue: "gem-test",
+			input:       `{"prompt":"make a poster"}`,
+			providerOpt: WithProviderKey("gem-dev", "gem-test"),
+		},
 	}
 
 	for _, tc := range tests {
@@ -163,6 +171,115 @@ func TestGatewayVAIWebTools_MissingProviderKeyFailsBeforeNetwork(t *testing.T) {
 	}
 	if coreErr.Param != "X-Provider-Key-Tavily" {
 		t.Fatalf("param=%q", coreErr.Param)
+	}
+}
+
+func TestGatewayVAIImage_PostsExecuteRequestWithProviderHeader(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	var gotProviderKey string
+	var gotBody types.ServerToolExecuteRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotProviderKey = r.Header.Get("X-Provider-Key-Gemini")
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.ServerToolExecuteResponse{
+			Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL+"/gw"),
+		WithProviderKey("gem-dev", "gem-test"),
+		WithHTTPClient(server.Client()),
+	)
+
+	tool := VAIImage(GemDev)
+	result, err := tool.Handler(contextWithToolExecutionClient(context.Background(), client), json.RawMessage(`{"prompt":"latest album cover","size":"1K"}`))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+
+	if gotPath != "/gw/v1/server-tools:execute" {
+		t.Fatalf("path=%q", gotPath)
+	}
+	if gotProviderKey != "gem-test" {
+		t.Fatalf("X-Provider-Key-Gemini=%q", gotProviderKey)
+	}
+	if gotBody.Tool != "vai_image" {
+		t.Fatalf("tool=%q", gotBody.Tool)
+	}
+	if gotBody.Input["prompt"] != "latest album cover" {
+		t.Fatalf("input.prompt=%v", gotBody.Input["prompt"])
+	}
+	if cfg, ok := gotBody.ServerToolConfig["vai_image"].(map[string]any); !ok || cfg["provider"] != "gem-dev" {
+		t.Fatalf("server_tool_config=%#v", gotBody.ServerToolConfig)
+	}
+
+	content, ok := result.([]types.ContentBlock)
+	if !ok {
+		t.Fatalf("result type=%T, want []types.ContentBlock", result)
+	}
+	if len(content) != 1 {
+		t.Fatalf("len(content)=%d", len(content))
+	}
+}
+
+func TestGatewayVAIImage_PostsExecutionContextImages(t *testing.T) {
+	t.Parallel()
+
+	var gotBody types.ServerToolExecuteRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.ServerToolExecuteResponse{
+			Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: "ok"}},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("gem-dev", "gem-test"),
+		WithHTTPClient(server.Client()),
+	)
+
+	ctx := contextWithToolExecutionClient(context.Background(), client)
+	ctx = contextWithServerToolExecutionContext(ctx, &types.ServerToolExecutionContext{
+		Images: []types.ServerToolExecutionImage{{
+			ID: "img-01",
+			Image: types.ImageBlock{
+				Type: "image",
+				Source: types.ImageSource{
+					Type:      "base64",
+					MediaType: "image/png",
+					Data:      "Zm9v",
+				},
+			},
+		}},
+	})
+
+	_, err := VAIImage(GemDev).Handler(ctx, json.RawMessage(`{"prompt":"edit it","images":[{"id":"img-01"}]}`))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if gotBody.ExecutionContext == nil {
+		t.Fatal("expected execution_context")
+	}
+	if len(gotBody.ExecutionContext.Images) != 1 {
+		t.Fatalf("len(execution_context.images)=%d", len(gotBody.ExecutionContext.Images))
+	}
+	if gotBody.ExecutionContext.Images[0].ID != "img-01" {
+		t.Fatalf("execution_context.images[0].id=%q", gotBody.ExecutionContext.Images[0].ID)
 	}
 }
 

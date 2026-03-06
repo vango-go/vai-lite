@@ -15,6 +15,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 	"github.com/vango-go/vai-lite/pkg/gateway/apierror"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
 type EmitFunc func(event types.RunStreamEvent) error
@@ -90,6 +91,7 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 	copy(history, workingReq.Messages)
 
 	result := &types.RunResult{Steps: make([]types.RunStep, 0, 4)}
+	var pendingPromotedImages []types.ContentBlock
 
 	snapshotHistory := func() []types.Message {
 		out := make([]types.Message, len(history))
@@ -130,9 +132,10 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 
 		stepStart := time.Now()
 
+		imageRefs := servertools.BuildImageRefRegistry(history)
 		turnReq := &types.MessageRequest{
 			Model:         workingReq.Model,
-			Messages:      history,
+			Messages:      servertools.InjectImageRefText(history, imageRefs),
 			MaxTokens:     workingReq.MaxTokens,
 			System:        workingReq.System,
 			Temperature:   workingReq.Temperature,
@@ -185,6 +188,10 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 
 		toolUses := resp.ToolUses()
 		if resp.StopReason != types.StopReasonToolUse || len(toolUses) == 0 {
+			if len(pendingPromotedImages) > 0 && !responseHasImage(resp.Content) {
+				resp.Content = append(append([]types.ContentBlock(nil), resp.Content...), pendingPromotedImages...)
+			}
+			pendingPromotedImages = nil
 			if req.Request.Voice != nil && req.Request.Voice.Output != nil {
 				if err := voice.AppendVoiceOutputToMessageResponse(ctx, c.VoicePipeline, req.Request.Voice, req.Request.TTSModel, resp); err != nil {
 					result.StopReason = types.RunStopReasonError
@@ -247,10 +254,17 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 			step.ToolCalls[i] = types.RunToolCall{ID: tu.ID, Name: tu.Name, Input: tu.Input}
 		}
 
-		execRes := c.executeTools(ctx, toolUses, runCfg, emit)
+		execRes := c.executeTools(ctx, toolUses, imageRefs, runCfg, emit)
 		step.ToolResults = make([]types.RunToolResult, len(execRes))
 		toolResultBlocks := make([]types.ContentBlock, len(execRes))
 		for i, ex := range execRes {
+			if ex.call.Name == servertools.ToolImage {
+				ex.result.Content = servertools.FinalizeImageToolResultContent(ex.result.Content, imageRefs)
+				execRes[i].result.Content = ex.result.Content
+				if !ex.result.IsError {
+					pendingPromotedImages = append(pendingPromotedImages, servertools.PromoteImageToolResultContent(ex.result.Content)...)
+				}
+			}
 			step.ToolResults[i] = ex.result
 			toolResultBlocks[i] = types.ToolResultBlock{Type: "tool_result", ToolUseID: ex.result.ToolUseID, Content: ex.result.Content, IsError: ex.result.IsError}
 		}
@@ -272,7 +286,7 @@ func (c *Controller) run(ctx context.Context, req *types.RunRequest, emit EmitFu
 	}
 }
 
-func (c *Controller) executeTools(ctx context.Context, uses []types.ToolUseBlock, cfg types.RunConfig, emit EmitFunc) []toolExecResult {
+func (c *Controller) executeTools(ctx context.Context, uses []types.ToolUseBlock, imageRefs *servertools.ImageRefRegistry, cfg types.RunConfig, emit EmitFunc) []toolExecResult {
 	results := make([]toolExecResult, len(uses))
 	runOne := func(i int, tu types.ToolUseBlock) {
 		if emit != nil {
@@ -286,6 +300,7 @@ func (c *Controller) executeTools(ctx context.Context, uses []types.ToolUseBlock
 			defer cancel()
 		}
 
+		toolCtx = servertools.ContextWithImageRefRegistry(toolCtx, imageRefs)
 		content, toolErr := c.Tools.Execute(toolCtx, tu.Name, tu.Input)
 		res := types.RunToolResult{ToolUseID: tu.ID}
 		if toolErr != nil {
@@ -326,6 +341,16 @@ func (c *Controller) executeTools(ctx context.Context, uses []types.ToolUseBlock
 		runOne(i, tu)
 	}
 	return results
+}
+
+func responseHasImage(blocks []types.ContentBlock) bool {
+	for i := range blocks {
+		switch blocks[i].(type) {
+		case types.ImageBlock, *types.ImageBlock:
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) streamTurn(ctx context.Context, req *types.MessageRequest, emit EmitFunc) (*types.MessageResponse, error) {

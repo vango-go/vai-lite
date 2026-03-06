@@ -25,7 +25,7 @@ const (
 	defaultLiveOutputRate = "auto"
 )
 
-const talkToUserSystemInstruction = `You are in voice mode. Note that the user's responses are transcribed via STT, you may need to use some judgement on potentiall misspellings.`
+const talkToUserSystemInstruction = `You are in voice mode. Note that the user's responses are transcribed via STT, you may need to use some judgement on potential misspellings.`
 
 type chatConfig struct {
 	BaseURL        string
@@ -276,6 +276,9 @@ func buildChatTools(cfg chatConfig) []vai.ToolWithHandler {
 		vai.VAIWebSearch(vai.Tavily),
 		vai.VAIWebFetch(vai.Tavily),
 	}
+	if imageProvider, ok := preferredImageToolProvider(cfg); ok {
+		tools = append(tools, vai.VAIImage(imageProvider))
+	}
 	if !cfg.VoiceEnabled {
 		type talkToUserInput struct {
 			Content string `json:"content" desc:"Exact text to speak to the user"`
@@ -287,11 +290,22 @@ func buildChatTools(cfg chatConfig) []vai.ToolWithHandler {
 	return tools
 }
 
+func preferredImageToolProvider(cfg chatConfig) (vai.VAIProvider, bool) {
+	if strings.TrimSpace(cfg.ProviderKeys["gem-dev"]) != "" {
+		return vai.GemDev, true
+	}
+	if strings.TrimSpace(cfg.ProviderKeys["gem-vert"]) != "" {
+		return vai.GemVert, true
+	}
+	return "", false
+}
+
 type chatRuntime struct {
 	currentModel  string
 	history       []vai.Message
 	recorder      *pcmRecorder // non-nil while recording mic audio
 	pendingPlayer *pcmPlayer   // prewarmed on /st, consumed by next /sp turn only
+	imageStore    *chatImageStore
 }
 
 var (
@@ -447,6 +461,11 @@ func handleSlashCommand(line string, state *chatRuntime, cfg chatConfig, out io.
 		state.currentModel = nextModel
 		fmt.Fprintf(out, "model switched: %s -> %s\n", prev, state.currentModel)
 		return true, nil
+	case strings.HasPrefix(line, "/download"):
+		if err := handleDownloadCommand(line, state, out, errOut); err != nil {
+			fmt.Fprintf(errOut, "download error: %v\n", err)
+		}
+		return true, nil
 	default:
 		return false, nil
 	}
@@ -475,29 +494,36 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 
 	client := vai.NewClient(buildClientOptions(cfg)...)
 	chatTools := buildChatTools(cfg)
+	toolNames := make([]string, 0, len(chatTools))
+	for _, tool := range chatTools {
+		if name := strings.TrimSpace(tool.Tool.Name); name != "" {
+			toolNames = append(toolNames, name)
+		}
+	}
 
 	fmt.Fprintf(out, "Proxy chatbot connected to %s using %s\n", cfg.BaseURL, cfg.Model)
 	if cfg.VoiceEnabled {
 		fmt.Fprintf(out, "Voice output enabled (voice=%s)\n", cfg.VoiceID)
-		fmt.Fprintln(out, "Tools enabled: vai_web_search, vai_web_fetch")
+		fmt.Fprintf(out, "Tools enabled: %s\n", strings.Join(toolNames, ", "))
 	} else {
-		fmt.Fprintln(out, "Tools enabled: talk_to_user, vai_web_search, vai_web_fetch")
+		fmt.Fprintf(out, "Tools enabled: %s\n", strings.Join(toolNames, ", "))
 	}
 	if cfg.VoiceEnabled {
-		fmt.Fprintln(out, "Type /exit or /quit to stop. /st to record, /sp to stop & send, /live to start live mode, /live off to exit live mode. /model to view model.")
+		fmt.Fprintln(out, "Type /exit or /quit to stop. /st to record, /sp to stop & send, /live to start live mode, /live off to exit live mode. /model to view model. /download {image_id} to save an image.")
 	} else {
-		fmt.Fprintln(out, "Type /exit or /quit to stop. Use /model to view and /model:{provider}/{model} to switch.")
+		fmt.Fprintln(out, "Type /exit or /quit to stop. Use /model to view and /model:{provider}/{model} to switch. /download {image_id} to save an image.")
 	}
 
 	scanner := bufio.NewScanner(in)
 	state := chatRuntime{
 		currentModel: cfg.Model,
 		history:      make([]vai.Message, 0, 32),
+		imageStore:   newChatImageStore(),
 	}
 	var liveSession *liveModeSession
 
 	for {
-		maybeCloseFinishedLiveSession(&state, &liveSession, errOut)
+		maybeCloseFinishedLiveSession(&state, &liveSession, out, errOut)
 		if state.recorder != nil {
 			fmt.Fprint(out, "[rec] > ")
 		} else if liveSession != nil {
@@ -512,6 +538,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 			if liveSession != nil {
 				_ = liveSession.Close()
 				syncHistoryFromLiveSession(&state, liveSession)
+				announceNewImages(out, refreshImageStoreFromHistory(&state))
 				liveSession = nil
 			}
 			cleanupAudioState(&state)
@@ -528,6 +555,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 			if liveSession != nil {
 				_ = liveSession.Close()
 				syncHistoryFromLiveSession(&state, liveSession)
+				announceNewImages(out, refreshImageStoreFromHistory(&state))
 				liveSession = nil
 			}
 			cleanupAudioState(&state)
@@ -565,6 +593,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 			}
 			_ = liveSession.Close()
 			syncHistoryFromLiveSession(&state, liveSession)
+			announceNewImages(out, refreshImageStoreFromHistory(&state))
 			liveSession = nil
 			fmt.Fprintln(out, "Live mode stopped.")
 			continue
@@ -576,7 +605,9 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 			} else if handled {
 				continue
 			}
-			fmt.Fprintln(errOut, "live mode is active — type /live off to return to typed turns")
+			if err := liveSession.CommitText(line); err != nil {
+				fmt.Fprintf(errOut, "live mode error: %v\n", err)
+			}
 			continue
 		}
 
@@ -654,7 +685,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 		}
 
 		turnCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-		stream, err := client.Messages.RunStream(turnCtx, req, vai.WithTools(chatTools...))
+		stream, err := client.Messages.RunStream(turnCtx, req, vai.WithTools(chatTools...), vai.WithBuildTurnMessages(buildProxyChatTurnMessages))
 		if err != nil {
 			cancel()
 			closePlayerWithDebug(turnPrewarmedPlayer, "prewarmed player cleanup")
@@ -711,6 +742,7 @@ func runChatbot(ctx context.Context, cfg chatConfig, in io.Reader, out io.Writer
 		cancel()
 
 		syncHistoryFromRunResult(&state, result, assistantText)
+		announceNewImages(out, refreshImageStoreFromHistory(&state))
 	}
 }
 

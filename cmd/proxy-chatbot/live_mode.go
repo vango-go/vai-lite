@@ -414,6 +414,23 @@ func (s *liveModeSession) sendBinary(data []byte) error {
 	return errors.New("live session is not connected")
 }
 
+func (s *liveModeSession) CommitText(text string) error {
+	if s == nil {
+		return errors.New("live session is not connected")
+	}
+	if s.session != nil {
+		return s.session.CommitText(text)
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return errors.New("text must not be empty")
+	}
+	return s.sendJSON(types.LiveInputCommitFrame{
+		Type:    "input_commit",
+		Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: trimmed}},
+	})
+}
+
 func (s *liveModeSession) Close() error {
 	if s == nil {
 		return nil
@@ -1010,13 +1027,14 @@ func isLiveModeOnCommand(line string) bool {
 	return trimmed == "/live"
 }
 
-func maybeCloseFinishedLiveSession(state *chatRuntime, session **liveModeSession, errOut io.Writer) {
+func maybeCloseFinishedLiveSession(state *chatRuntime, session **liveModeSession, out io.Writer, errOut io.Writer) {
 	if session == nil || *session == nil {
 		return
 	}
 	select {
 	case <-(*session).Done():
 		syncHistoryFromLiveSession(state, *session)
+		announceNewImages(out, refreshImageStoreFromHistory(state))
 		reportClosedLiveSession(*session, errOut)
 		*session = nil
 	default:

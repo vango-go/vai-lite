@@ -18,6 +18,26 @@ func TestUnmarshalLiveClientFrame(t *testing.T) {
 	if mark.TurnID != "turn_1" || mark.PlayedMS != 250 {
 		t.Fatalf("mark=%#v", mark)
 	}
+
+	frame, err = UnmarshalLiveClientFrame([]byte(`{"type":"input_append","content":[{"type":"text","text":"hello"}]}`))
+	if err != nil {
+		t.Fatalf("UnmarshalLiveClientFrame(input_append) error: %v", err)
+	}
+	appendFrame, ok := frame.(LiveInputAppendFrame)
+	if !ok {
+		t.Fatalf("frame=%T, want LiveInputAppendFrame", frame)
+	}
+	if len(appendFrame.Content) != 1 || appendFrame.Content[0].(TextBlock).Text != "hello" {
+		t.Fatalf("appendFrame=%#v", appendFrame)
+	}
+
+	frame, err = UnmarshalLiveClientFrame([]byte(`{"type":"input_clear"}`))
+	if err != nil {
+		t.Fatalf("UnmarshalLiveClientFrame(input_clear) error: %v", err)
+	}
+	if _, ok := frame.(LiveInputClearFrame); !ok {
+		t.Fatalf("frame=%T, want LiveInputClearFrame", frame)
+	}
 }
 
 func TestUnmarshalLiveClientFrame_RejectsUnknownType(t *testing.T) {
@@ -48,6 +68,18 @@ func TestUnmarshalLiveServerEvent(t *testing.T) {
 	}
 	if complete.TurnID != "turn_1" || len(complete.History) != 1 || complete.History[0].TextContent() != "done" {
 		t.Fatalf("complete=%#v", complete)
+	}
+
+	event, err = UnmarshalLiveServerEvent([]byte(`{"type":"input_state","content":[{"type":"text","text":"draft"}]}`))
+	if err != nil {
+		t.Fatalf("UnmarshalLiveServerEvent(input_state) error: %v", err)
+	}
+	state, ok := event.(LiveInputStateEvent)
+	if !ok {
+		t.Fatalf("event=%T, want LiveInputStateEvent", event)
+	}
+	if len(state.Content) != 1 || state.Content[0].(TextBlock).Text != "draft" {
+		t.Fatalf("state=%#v", state)
 	}
 }
 

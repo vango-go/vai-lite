@@ -17,6 +17,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/builtins"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
 type fakeExecutor struct {
@@ -93,6 +94,7 @@ type scriptedProvider struct {
 	calls   int
 	resps   []*types.MessageResponse
 	streams [][]streamItem
+	reqs    []*types.MessageRequest
 }
 
 type timeoutProvider struct{}
@@ -122,6 +124,11 @@ func (p *scriptedProvider) Capabilities() core.ProviderCapabilities {
 func (p *scriptedProvider) CreateMessage(ctx context.Context, req *types.MessageRequest) (*types.MessageResponse, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if req != nil {
+		copied := *req
+		copied.Messages = append([]types.Message(nil), req.Messages...)
+		p.reqs = append(p.reqs, &copied)
+	}
 	if p.calls >= len(p.resps) {
 		return nil, io.EOF
 	}
@@ -133,6 +140,11 @@ func (p *scriptedProvider) CreateMessage(ctx context.Context, req *types.Message
 func (p *scriptedProvider) StreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if req != nil {
+		copied := *req
+		copied.Messages = append([]types.Message(nil), req.Messages...)
+		p.reqs = append(p.reqs, &copied)
+	}
 	if p.calls >= len(p.streams) {
 		return nil, io.EOF
 	}
@@ -158,6 +170,12 @@ func (s *scriptedEventStream2) Next() (types.StreamEvent, error) {
 }
 
 func (s *scriptedEventStream2) Close() error { return nil }
+
+type toolExecutorFunc func(ctx context.Context, name string, input map[string]any) ([]types.ContentBlock, *types.Error)
+
+func (fn toolExecutorFunc) Execute(ctx context.Context, name string, input map[string]any) ([]types.ContentBlock, *types.Error) {
+	return fn(ctx, name, input)
+}
 
 func TestRunBlocking_NoToolCompletion(t *testing.T) {
 	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{{
@@ -277,6 +295,159 @@ func TestRunBlocking_ToolErrorAddsNonEmptyContent(t *testing.T) {
 	}
 	if text.Text != "tool exploded" {
 		t.Fatalf("text=%q, want tool exploded", text.Text)
+	}
+}
+
+func TestRunBlocking_InjectsImageRefsWithoutMutatingHistory(t *testing.T) {
+	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{{
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "m",
+		StopReason: types.StopReasonEndTurn,
+		Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "done"}},
+	}}}
+
+	originalImage := types.ImageBlock{
+		Type: "image",
+		Source: types.ImageSource{
+			Type:      "url",
+			URL:       "https://example.com/cat.png",
+			MediaType: "image/png",
+		},
+	}
+	userHistory := []types.Message{{
+		Role: "user",
+		Content: []types.ContentBlock{
+			types.TextBlock{Type: "text", Text: "tell me about this image"},
+			originalImage,
+		},
+	}}
+
+	controller := &Controller{
+		Provider: provider,
+		Tools: toolExecutorFunc(func(ctx context.Context, name string, input map[string]any) ([]types.ContentBlock, *types.Error) {
+			return nil, nil
+		}),
+	}
+	_, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{Model: "m", Messages: userHistory},
+		Run:     types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(provider.reqs) != 1 {
+		t.Fatalf("provider requests=%d, want 1", len(provider.reqs))
+	}
+	gotBlocks := provider.reqs[0].Messages[0].ContentBlocks()
+	if len(gotBlocks) != 3 {
+		t.Fatalf("provider blocks=%d, want 3", len(gotBlocks))
+	}
+	if tb, ok := gotBlocks[1].(types.TextBlock); !ok || tb.Text != "img-01" {
+		t.Fatalf("provider blocks[1]=%#v, want img-01 text block", gotBlocks[1])
+	}
+	originalBlocks := userHistory[0].ContentBlocks()
+	if len(originalBlocks) != 2 {
+		t.Fatalf("original history mutated: len=%d", len(originalBlocks))
+	}
+}
+
+func TestRunBlocking_PromotesImageToolResultsAndResolvesRefs(t *testing.T) {
+	provider := &scriptedProvider{name: "test", resps: []*types.MessageResponse{
+		{
+			Type:       "message",
+			Role:       "assistant",
+			Model:      "m",
+			StopReason: types.StopReasonToolUse,
+			Content: []types.ContentBlock{types.ToolUseBlock{
+				Type: "tool_use",
+				ID:   "call_1",
+				Name: servertools.ToolImage,
+				Input: map[string]any{
+					"prompt": "make it dramatic",
+					"images": []any{map[string]any{"id": "img-01"}},
+				},
+			}},
+		},
+		{
+			Type:       "message",
+			Role:       "assistant",
+			Model:      "m",
+			StopReason: types.StopReasonEndTurn,
+			Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "final"}},
+		},
+	}}
+
+	inputImage := types.ImageBlock{
+		Type: "image",
+		Source: types.ImageSource{
+			Type:      "url",
+			URL:       "https://example.com/input.png",
+			MediaType: "image/png",
+		},
+	}
+	generatedImage := types.ImageBlock{
+		Type: "image",
+		Source: types.ImageSource{
+			Type:      "base64",
+			MediaType: "image/png",
+			Data:      "aGVsbG8=",
+		},
+	}
+	controller := &Controller{
+		Provider: provider,
+		Tools: toolExecutorFunc(func(ctx context.Context, name string, input map[string]any) ([]types.ContentBlock, *types.Error) {
+			if name != servertools.ToolImage {
+				t.Fatalf("unexpected tool name %q", name)
+			}
+			reg := servertools.ImageRefRegistryFromContext(ctx)
+			if reg == nil {
+				t.Fatal("expected image ref registry in tool context")
+			}
+			if _, ok := reg.Lookup("img-01"); !ok {
+				t.Fatal("expected img-01 to resolve in tool context")
+			}
+			return []types.ContentBlock{
+				types.TextBlock{Type: "text", Text: `{"tool":"vai_image","provider":"gem-dev","model":"gemini-3.1-flash-image-preview","prompt":"make it dramatic","referenced_image_ids":["img-01"],"generated_image_ids":[]}`},
+				generatedImage,
+			}, nil
+		}),
+	}
+
+	result, err := controller.RunBlocking(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model: "m",
+			Messages: []types.Message{{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.TextBlock{Type: "text", Text: "edit this"},
+					inputImage,
+				},
+			}},
+		},
+		Run: types.RunConfig{MaxTurns: 8, MaxToolCalls: 20, TimeoutMS: 60000, ParallelTools: true, ToolTimeoutMS: 30000},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if result.Response == nil || result.Response.ImageContent() == nil {
+		t.Fatalf("expected promoted image in final response: %#v", result.Response)
+	}
+	if len(result.Messages) != 4 {
+		t.Fatalf("messages=%d, want 4", len(result.Messages))
+	}
+	toolMsgBlocks := result.Messages[2].ContentBlocks()
+	tr, ok := toolMsgBlocks[0].(types.ToolResultBlock)
+	if !ok {
+		t.Fatalf("tool message block=%T, want ToolResultBlock", toolMsgBlocks[0])
+	}
+	meta, ok := tr.Content[0].(types.TextBlock)
+	if !ok || !strings.Contains(meta.Text, `"generated_image_ids":["img-02"]`) {
+		t.Fatalf("tool metadata=%#v", tr.Content[0])
+	}
+	lastAssistant := result.Messages[3].ContentBlocks()
+	if !responseHasImage(lastAssistant) {
+		t.Fatalf("expected promoted image in assistant history: %#v", lastAssistant)
 	}
 }
 

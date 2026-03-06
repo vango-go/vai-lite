@@ -160,6 +160,9 @@ type (
 	// LiveUserTurnCommittedEvent indicates the gateway committed a live user turn.
 	LiveUserTurnCommittedEvent = types.LiveUserTurnCommittedEvent
 
+	// LiveInputStateEvent reports the full staged input buffer for a live session.
+	LiveInputStateEvent = types.LiveInputStateEvent
+
 	// LiveTurnCompleteEvent indicates a live turn completed and includes synced history.
 	LiveTurnCompleteEvent = types.LiveTurnCompleteEvent
 
@@ -180,6 +183,15 @@ type (
 
 	// LiveToolResultFrame sends a client tool result in live mode.
 	LiveToolResultFrame = types.LiveToolResultFrame
+
+	// LiveInputAppendFrame appends staged user content to the next live turn.
+	LiveInputAppendFrame = types.LiveInputAppendFrame
+
+	// LiveInputCommitFrame commits staged and inline user content as an immediate turn.
+	LiveInputCommitFrame = types.LiveInputCommitFrame
+
+	// LiveInputClearFrame clears staged user content in a live session.
+	LiveInputClearFrame = types.LiveInputClearFrame
 
 	// LivePlaybackMarkFrame reports playback progress in live mode.
 	LivePlaybackMarkFrame = types.LivePlaybackMarkFrame

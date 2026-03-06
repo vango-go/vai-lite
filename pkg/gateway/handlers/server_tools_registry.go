@@ -19,7 +19,7 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 	for i, name := range enabled {
 		name = strings.TrimSpace(name)
 		switch name {
-		case servertools.ToolWebSearch, servertools.ToolWebFetch:
+		case servertools.ToolWebSearch, servertools.ToolWebFetch, servertools.ToolImage:
 		default:
 			return nil, &core.Error{
 				Type:    core.ErrInvalidRequest,
@@ -178,6 +178,58 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 			}
 		}
 		executors = append(executors, servertools.NewWebFetchExecutor(fetchConfig, firecrawlClient, tavilyClient))
+	}
+
+	if _, ok := enabledSet[servertools.ToolImage]; ok {
+		imageConfig, err := servertools.DecodeImageConfig(rawConfig[servertools.ToolImage])
+		if err != nil {
+			if strings.Contains(err.Error(), "unsupported provider") {
+				return nil, &core.Error{
+					Type:    core.ErrInvalidRequest,
+					Message: err.Error(),
+					Param:   "server_tool_config.vai_image.provider",
+					Code:    "unsupported_tool_provider",
+				}
+			}
+			return nil, &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: err.Error(),
+				Param:   "server_tool_config.vai_image",
+				Code:    "run_validation_failed",
+			}
+		}
+		if imageConfig.Provider == "" {
+			hasGemKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyGemini)) != ""
+			hasVertexKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyVertexAI)) != ""
+			if hasGemKey == hasVertexKey {
+				msg := "server_tool_config.vai_image.provider is required"
+				if hasGemKey && hasVertexKey {
+					msg = "ambiguous image provider; set server_tool_config.vai_image.provider"
+				}
+				return nil, &core.Error{
+					Type:    core.ErrInvalidRequest,
+					Message: msg,
+					Param:   "server_tool_config.vai_image.provider",
+					Code:    "tool_provider_missing",
+				}
+			}
+			if hasGemKey {
+				imageConfig.Provider = servertools.ProviderGemDev
+			} else {
+				imageConfig.Provider = servertools.ProviderGemVert
+			}
+		}
+		imageHeader := servertools.ProviderHeaderName(imageConfig.Provider)
+		imageKey := strings.TrimSpace(r.Header.Get(imageHeader))
+		if imageKey == "" {
+			return nil, &core.Error{
+				Type:    core.ErrAuthentication,
+				Message: "missing server tool provider key header",
+				Param:   imageHeader,
+				Code:    "provider_key_missing",
+			}
+		}
+		executors = append(executors, servertools.NewImageExecutor(imageConfig, imageKey, toolHTTPClient))
 	}
 
 	return servertools.NewRegistry(executors...), nil

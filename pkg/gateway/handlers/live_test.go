@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,6 +118,11 @@ func dialLiveTestConn(t *testing.T, serverURL string, headers http.Header) *webs
 	return conn
 }
 
+func dialLiveTestConnResponse(serverURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
+	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/v1/live"
+	return websocket.DefaultDialer.Dial(wsURL, headers)
+}
+
 func readLiveEvent(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -176,6 +182,133 @@ func TestLiveHandler_BinaryFirstFrameReturnsFatalError(t *testing.T) {
 	}
 	if got, _ := event["fatal"].(bool); !got {
 		t.Fatalf("fatal=%v, want true", event["fatal"])
+	}
+}
+
+func TestLiveHandler_AllowsUpgradeWithoutOrigin(t *testing.T) {
+	h := LiveHandler{
+		Config: config.Config{
+			WSMaxSessionDuration:      time.Minute,
+			WSMaxSessionsPerPrincipal: 2,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/live", h)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	conn := dialLiveTestConn(t, server.URL, http.Header{})
+	defer conn.Close()
+}
+
+func TestLiveHandler_AllowsUpgradeForAllowlistedOrigin(t *testing.T) {
+	h := LiveHandler{
+		Config: config.Config{
+			CORSAllowedOrigins:        map[string]struct{}{"https://app.example.com": {}},
+			WSMaxSessionDuration:      time.Minute,
+			WSMaxSessionsPerPrincipal: 2,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/live", h)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	headers := http.Header{}
+	headers.Set("Origin", "https://app.example.com")
+
+	conn := dialLiveTestConn(t, server.URL, headers)
+	defer conn.Close()
+}
+
+func TestLiveHandler_RejectsUpgradeWhenOriginPresentAndAllowlistEmpty(t *testing.T) {
+	h := LiveHandler{
+		Config: config.Config{
+			WSMaxSessionDuration:      time.Minute,
+			WSMaxSessionsPerPrincipal: 2,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/live", h)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	headers := http.Header{}
+	headers.Set("Origin", "https://app.example.com")
+
+	conn, resp, err := dialLiveTestConnResponse(server.URL, headers)
+	if conn != nil {
+		conn.Close()
+		t.Fatal("expected origin rejection before websocket upgrade")
+	}
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if resp == nil {
+		t.Fatalf("expected http response, err=%v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read body: %v", readErr)
+	}
+	text := string(body)
+	if !strings.Contains(text, `"type":"permission_error"`) || !strings.Contains(text, `"code":"origin_not_allowed"`) || !strings.Contains(text, `"param":"Origin"`) {
+		t.Fatalf("body=%s", text)
+	}
+}
+
+func TestLiveHandler_RejectsUpgradeForNonAllowlistedOrigin(t *testing.T) {
+	h := LiveHandler{
+		Config: config.Config{
+			CORSAllowedOrigins:        map[string]struct{}{"https://allowed.example.com": {}},
+			WSMaxSessionDuration:      time.Minute,
+			WSMaxSessionsPerPrincipal: 2,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/live", h)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	headers := http.Header{}
+	headers.Set("Origin", "https://app.example.com")
+
+	conn, resp, err := dialLiveTestConnResponse(server.URL, headers)
+	if conn != nil {
+		conn.Close()
+		t.Fatal("expected origin rejection before websocket upgrade")
+	}
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if resp == nil {
+		t.Fatalf("expected http response, err=%v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read body: %v", readErr)
+	}
+	text := string(body)
+	if !strings.Contains(text, `"type":"permission_error"`) || !strings.Contains(text, `"code":"origin_not_allowed"`) || !strings.Contains(text, `"param":"Origin"`) {
+		t.Fatalf("body=%s", text)
 	}
 }
 
@@ -425,6 +558,240 @@ func TestLiveHandler_MissingOutputSampleRateDefaultsTo16K(t *testing.T) {
 	}
 	if got, _ := event["output_sample_rate_hz"].(float64); int(got) != 16000 {
 		t.Fatalf("output_sample_rate_hz=%v, want 16000", event["output_sample_rate_hz"])
+	}
+}
+
+func TestLiveSession_InputAppendAccumulatesAndClearResetsState(t *testing.T) {
+	session := &liveSession{
+		ctx:           context.Background(),
+		sendCh:        make(chan any, 8),
+		controllerCfg: &liveSessionConfig{ProviderName: "anthropic", PublicModel: "anthropic/test", ModelName: "test"},
+	}
+
+	if err := session.handleInputAppendFrame([]byte(`{"type":"input_append","content":[{"type":"text","text":"hello"}]}`)); err != nil {
+		t.Fatalf("handleInputAppendFrame error: %v", err)
+	}
+	if err := session.handleInputAppendFrame([]byte(`{"type":"input_append","content":[{"type":"document","filename":"a.txt","source":{"type":"base64","media_type":"text/plain","data":"YQ=="}}]}`)); err != nil {
+		t.Fatalf("handleInputAppendFrame second error: %v", err)
+	}
+
+	raw := <-session.sendCh
+	first, ok := raw.(types.LiveInputStateEvent)
+	if !ok {
+		t.Fatalf("first event=%T, want LiveInputStateEvent", raw)
+	}
+	if len(first.Content) != 1 || first.Content[0].(types.TextBlock).Text != "hello" {
+		t.Fatalf("first input_state=%#v", first)
+	}
+
+	raw = <-session.sendCh
+	second, ok := raw.(types.LiveInputStateEvent)
+	if !ok {
+		t.Fatalf("second event=%T, want LiveInputStateEvent", raw)
+	}
+	if len(second.Content) != 2 {
+		t.Fatalf("len(second.Content)=%d, want 2", len(second.Content))
+	}
+	if second.Content[0].(types.TextBlock).Text != "hello" {
+		t.Fatalf("first block=%#v", second.Content[0])
+	}
+	if _, ok := second.Content[1].(types.DocumentBlock); !ok {
+		t.Fatalf("second block=%T, want DocumentBlock", second.Content[1])
+	}
+
+	if err := session.handleInputClearFrame([]byte(`{"type":"input_clear"}`)); err != nil {
+		t.Fatalf("handleInputClearFrame error: %v", err)
+	}
+	raw = <-session.sendCh
+	cleared, ok := raw.(types.LiveInputStateEvent)
+	if !ok {
+		t.Fatalf("clear event=%T, want LiveInputStateEvent", raw)
+	}
+	if len(cleared.Content) != 0 {
+		t.Fatalf("cleared content=%#v, want empty", cleared.Content)
+	}
+	if len(session.pendingInput) != 0 {
+		t.Fatalf("pendingInput=%#v, want empty", session.pendingInput)
+	}
+}
+
+func TestLiveSession_InputCommitCreatesImmediateTurnAndKeepsBufferedAudio(t *testing.T) {
+	session := &liveSession{
+		ctx:              context.Background(),
+		sendCh:           make(chan any, 8),
+		commitCh:         make(chan liveCommittedTurn, 1),
+		controllerCfg:    &liveSessionConfig{ProviderName: "anthropic", PublicModel: "anthropic/test", ModelName: "test"},
+		currentUtterance: []byte{0x01, 0x02, 0x03},
+		sttSawText:       true,
+		lastSpeechAt:     time.Now(),
+	}
+	if err := session.handleInputAppendFrame([]byte(`{"type":"input_append","content":[{"type":"text","text":"draft"}]}`)); err != nil {
+		t.Fatalf("handleInputAppendFrame error: %v", err)
+	}
+	<-session.sendCh // initial input_state
+
+	if err := session.handleInputCommitFrame([]byte(`{"type":"input_commit","content":[{"type":"text","text":"send"}]}`)); err != nil {
+		t.Fatalf("handleInputCommitFrame error: %v", err)
+	}
+
+	raw := <-session.sendCh
+	state, ok := raw.(types.LiveInputStateEvent)
+	if !ok {
+		t.Fatalf("first commit event=%T, want LiveInputStateEvent", raw)
+	}
+	if len(state.Content) != 0 {
+		t.Fatalf("state.Content=%#v, want empty", state.Content)
+	}
+
+	raw = <-session.sendCh
+	committedEvent, ok := raw.(types.LiveUserTurnCommittedEvent)
+	if !ok {
+		t.Fatalf("second commit event=%T, want LiveUserTurnCommittedEvent", raw)
+	}
+	if committedEvent.AudioBytes != 0 {
+		t.Fatalf("audio_bytes=%d, want 0", committedEvent.AudioBytes)
+	}
+
+	commit := <-session.commitCh
+	if len(commit.PCM) != 0 {
+		t.Fatalf("commit.PCM=%v, want empty", commit.PCM)
+	}
+	if len(commit.Blocks) != 2 {
+		t.Fatalf("len(commit.Blocks)=%d, want 2", len(commit.Blocks))
+	}
+	if commit.Blocks[0].(types.TextBlock).Text != "draft" || commit.Blocks[1].(types.TextBlock).Text != "send" {
+		t.Fatalf("commit.Blocks=%#v", commit.Blocks)
+	}
+	if string(session.currentUtterance) != string([]byte{0x01, 0x02, 0x03}) {
+		t.Fatalf("currentUtterance=%v, want preserved buffered audio", session.currentUtterance)
+	}
+}
+
+func TestLiveSession_InputCommitGraceCancelsRunningTurn(t *testing.T) {
+	cancelCalled := make(chan struct{}, 1)
+	session := &liveSession{
+		ctx:      context.Background(),
+		sendCh:   make(chan any, 8),
+		commitCh: make(chan liveCommittedTurn, 1),
+		runBusy:  true,
+		pendingInput: []types.ContentBlock{
+			types.TextBlock{Type: "text", Text: "draft"},
+		},
+		controllerCfg: &liveSessionConfig{ProviderName: "anthropic", PublicModel: "anthropic/test", ModelName: "test"},
+		activeTurn: &liveTurnRuntime{
+			id:            "turn_active",
+			lifecycle:     liveTurnLifecycleRunning,
+			graceDeadline: time.Now().Add(time.Second),
+			baseUserPCM:   []byte{0x09, 0x09},
+			runCancel: func() {
+				select {
+				case cancelCalled <- struct{}{}:
+				default:
+				}
+			},
+		},
+	}
+
+	if err := session.handleInputCommitFrame([]byte(`{"type":"input_commit"}`)); err != nil {
+		t.Fatalf("handleInputCommitFrame error: %v", err)
+	}
+
+	select {
+	case <-cancelCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected runCancel to be invoked")
+	}
+
+	raw := <-session.sendCh
+	cancelEvent, ok := raw.(types.LiveTurnCancelledEvent)
+	if !ok {
+		t.Fatalf("first event=%T, want LiveTurnCancelledEvent", raw)
+	}
+	if cancelEvent.Reason != "input_commit" {
+		t.Fatalf("reason=%q, want input_commit", cancelEvent.Reason)
+	}
+	raw = <-session.sendCh
+	if _, ok := raw.(types.LiveInputStateEvent); !ok {
+		t.Fatalf("second event=%T, want LiveInputStateEvent", raw)
+	}
+	raw = <-session.sendCh
+	turnCommitted, ok := raw.(types.LiveUserTurnCommittedEvent)
+	if !ok {
+		t.Fatalf("third event=%T, want LiveUserTurnCommittedEvent", raw)
+	}
+	if turnCommitted.AudioBytes != 0 {
+		t.Fatalf("audio_bytes=%d, want 0", turnCommitted.AudioBytes)
+	}
+	if got := len(session.aggregatePrefix); got != 0 {
+		t.Fatalf("aggregatePrefix len=%d, want 0", got)
+	}
+}
+
+func TestLiveSession_MaybeCommitUtteranceConsumesPendingInput(t *testing.T) {
+	session := &liveSession{
+		ctx:              context.Background(),
+		currentUtterance: []byte{0x01, 0x02},
+		lastSpeechAt:     time.Now().Add(-time.Second),
+		sttSawText:       true,
+		pendingInput: []types.ContentBlock{
+			types.TextBlock{Type: "text", Text: "caption"},
+		},
+	}
+
+	commit, ok := session.maybeCommitUtterance()
+	if !ok {
+		t.Fatal("maybeCommitUtterance ok=false, want true")
+	}
+	if !commit.InputStateChanged {
+		t.Fatal("InputStateChanged=false, want true")
+	}
+	if len(commit.Blocks) != 1 || commit.Blocks[0].(types.TextBlock).Text != "caption" {
+		t.Fatalf("commit.Blocks=%#v", commit.Blocks)
+	}
+	if len(session.pendingInput) != 0 {
+		t.Fatalf("pendingInput=%#v, want empty", session.pendingInput)
+	}
+}
+
+func TestBuildLiveUserBlocks_PrependsPendingBlocksBeforeAudioSTT(t *testing.T) {
+	blocks := buildLiveUserBlocks(liveCommittedTurn{
+		PCM: []byte{0x01, 0x02},
+		Blocks: []types.ContentBlock{
+			types.TextBlock{Type: "text", Text: "caption"},
+		},
+	})
+	if len(blocks) != 2 {
+		t.Fatalf("len(blocks)=%d, want 2", len(blocks))
+	}
+	if blocks[0].(types.TextBlock).Text != "caption" {
+		t.Fatalf("first block=%#v, want caption text", blocks[0])
+	}
+	if _, ok := blocks[1].(types.AudioSTTBlock); !ok {
+		t.Fatalf("second block=%T, want AudioSTTBlock", blocks[1])
+	}
+}
+
+func TestLiveSession_InputAppendRejectsUnsupportedBlocksWithoutMutation(t *testing.T) {
+	session := &liveSession{
+		ctx:           context.Background(),
+		sendCh:        make(chan any, 4),
+		controllerCfg: &liveSessionConfig{ProviderName: "anthropic", PublicModel: "anthropic/test", ModelName: "test"},
+		pendingInput: []types.ContentBlock{
+			types.TextBlock{Type: "text", Text: "keep"},
+		},
+	}
+
+	err := session.handleInputAppendFrame([]byte(`{"type":"input_append","content":[{"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"YQ=="}}]}`))
+	if err == nil || !strings.Contains(err.Error(), "unsupported type") {
+		t.Fatalf("error=%v, want unsupported-type error", err)
+	}
+	if len(session.pendingInput) != 1 || session.pendingInput[0].(types.TextBlock).Text != "keep" {
+		t.Fatalf("pendingInput=%#v, want unchanged", session.pendingInput)
+	}
+	select {
+	case raw := <-session.sendCh:
+		t.Fatalf("unexpected event after rejected append: %#v", raw)
+	default:
 	}
 }
 

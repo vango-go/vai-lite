@@ -1242,6 +1242,7 @@ Current behavior:
 - One WebSocket session handles live mic input, streaming STT, model turns, and streaming TTS output.
 - The first client text frame is `type:"start"` carrying a `run_request`.
 - The gateway responds with `type:"session_started"` describing the negotiated audio contract.
+- Live sessions also maintain a staged non-audio input buffer for text/image/video/document content.
 - Live mode uses normal assistant text as the spoken channel.
 - `talk_to_user` is deprecated in live mode and rejected if present as a client function tool or invoked during execution.
 - Client function tools still work over `tool_call` / `tool_result`.
@@ -1301,6 +1302,10 @@ Important SDK semantics:
 - `LiveSession.HistorySnapshot()` returns the latest authoritative history, updated only from `turn_complete.history`.
 - `LiveSession.Close()` sends a best-effort `{"type":"stop"}` before closing the socket.
 - `LiveSession.SendAudio(...)` sends binary PCM frames only.
+- `LiveSession.AppendInputBlocks(...)` and `CommitInputBlocks(...)` stage or commit canonical non-audio user content during a live session.
+- `LiveSession.AppendText(...)` and `CommitText(...)` are text conveniences over those block-based APIs.
+- `LiveSession.ClearPendingInput()` clears the staged input buffer explicitly.
+- Empty `AppendInputBlocks`, `CommitInputBlocks`, `AppendText`, and `CommitText` calls are rejected client-side.
 
 Mode switching is intentionally cheap:
 
@@ -1398,12 +1403,27 @@ Current client-to-server traffic is:
 - Binary WebSocket frames:
   - raw `pcm_s16le` mono audio at `16000 Hz`
 - JSON text frames:
+  - `input_append`
+  - `input_commit`
+  - `input_clear`
   - `tool_result`
   - `playback_mark`
   - `playback_state`
   - `stop`
 
 Current frame shapes:
+
+```json
+{"type":"input_append","content":[{"type":"text","text":"compare it against this screenshot"}]}
+```
+
+```json
+{"type":"input_commit","content":[{"type":"document","filename":"spec.pdf","source":{"type":"base64","media_type":"application/pdf","data":"<base64>"}}]}
+```
+
+```json
+{"type":"input_clear"}
+```
 
 ```json
 {"type":"tool_result","execution_id":"exec_1","content":[{"type":"text","text":"done"}]}
@@ -1423,12 +1443,22 @@ Current frame shapes:
 
 Notes:
 
+- `input_append` appends to the staged input buffer and does not interrupt the active turn.
+- `input_clear` empties the staged input buffer and does not interrupt the active turn.
+- `input_commit` consumes the staged buffer plus any inline `content` and enqueues an immediate live turn.
+- `input_commit` may interrupt the active turn; when it does, the gateway emits `turn_cancelled` or `audio_reset` with `reason:"input_commit"`.
+- Staged live input currently accepts canonical non-audio user blocks only: `text`, `image`, `video`, and `document`.
 - `playback_state.state` currently accepts only `finished` or `stopped`.
 - `playback_mark.played_ms` must be non-negative.
 - `tool_result.is_error` and `tool_result.error` are optional and map tool failures back into the live run.
 - The SDK exposes helpers for these frames via:
   - `LiveSession.SendFrame(...)`
   - `LiveSession.SendAudio(...)`
+  - `LiveSession.AppendInputBlocks(...)`
+  - `LiveSession.CommitInputBlocks(...)`
+  - `LiveSession.ClearPendingInput(...)`
+  - `LiveSession.AppendText(...)`
+  - `LiveSession.CommitText(...)`
   - `LiveSession.SendToolResult(...)`
   - `LiveSession.SendPlaybackMark(...)`
   - `LiveSession.SendPlaybackState(...)`
@@ -1441,6 +1471,7 @@ Current server-to-client events are:
 - `assistant_text_delta`
 - `audio_chunk`
 - `tool_call`
+- `input_state`
 - `user_turn_committed`
 - `turn_complete`
 - `audio_unavailable`
@@ -1460,6 +1491,10 @@ Representative shapes:
 
 ```json
 {"type":"tool_call","turn_id":"turn_1","execution_id":"exec_1","name":"lookup_account","input":{"id":"123"}}
+```
+
+```json
+{"type":"input_state","content":[{"type":"text","text":"draft note"}]}
 ```
 
 ```json
@@ -1490,7 +1525,9 @@ Notes:
 
 - `assistant_text_delta` is the text that is also being spoken to the user.
 - `audio_chunk.audio` is base64-encoded PCM payload.
+- `input_state.content` is the full staged input buffer after each append/clear/commit mutation.
 - `audio_unavailable` is terminal for audio for that turn, but text/history processing can still finish.
+- `user_turn_committed` now means “a live user turn was committed”; `audio_bytes` may be `0` for immediate non-audio commits.
 - `turn_complete.history` is the authoritative synced conversation history for the session.
 - `pkg/core/types.UnmarshalLiveServerEvent(...)` and `UnmarshalLiveClientFrame(...)` are the canonical typed JSON decoders for this protocol.
 
@@ -1509,6 +1546,7 @@ Current live callback surface:
   - `OnError`
 - live-only callbacks:
   - `OnSessionStarted`
+  - `OnInputState`
   - `OnUserTurnCommitted`
   - `OnTurnComplete`
   - `OnTurnCancelled`
@@ -1518,6 +1556,7 @@ Important processing semantics:
 
 - `assistant_text_delta` maps to `OnTextDelta`
 - `audio_chunk` maps to `OnAudioChunk` after base64 decode
+- `input_state` maps to `OnInputState`
 - `tool_call` is auto-executed when a matching handler is registered in `LiveConnectOptions`
 - unknown tools are answered with an error `tool_result` instead of hanging the session
 - `turn_complete` updates internal session history before `HistorySnapshot()` is exposed to callers
@@ -1541,11 +1580,21 @@ These helpers are intended for clients that want `RunStream`-like reuse across l
 Current live turn behavior in the gateway:
 
 - Mic audio is streamed continuously to Cartesia STT.
+- `input_append` stages canonical non-audio user blocks for the next committed live turn.
+- `input_clear` clears staged blocks that have not yet been committed.
 - The gateway commits a user utterance after `900ms` of silence following confirmed speech.
+- A speech-driven commit consumes the staged buffer atomically and builds the user message as:
+  - staged blocks first
+  - then a generated `audio_stt` block
+- `input_commit` consumes the staged buffer plus any inline `content` and creates an immediate user turn with `audio_bytes=0`.
+- `input_commit` leaves any still-buffered mic PCM untouched for a later speech-driven turn.
 - After commit, the gateway runs a server-side tool loop using the supplied `RunRequest`.
 - The assistant speaks by emitting normal assistant text, not by calling `talk_to_user`.
 - If the user resumes speaking within the `5s` grace window and the active turn has not progressed too far, the gateway cancels the turn and emits `turn_cancelled`.
 - If the user barges in while assistant audio is playing, the gateway emits `audio_reset`, cancels the active turn, and truncates saved assistant history to what was actually played as best it can using playback marks and timestamps.
+- If `input_commit` arrives while a turn is still active, the gateway uses the same interruption model:
+  - grace-cancelable or not-yet-audio turns become `turn_cancelled` with `reason:"input_commit"`
+  - actively playing turns become `audio_reset` with `reason:"input_commit"`
 - If a selected tool name matches a configured gateway server tool, the gateway executes it itself. Other function tools are sent back to the client via `tool_call`.
 
 On the client side, the demo now splits responsibilities this way:
@@ -1559,6 +1608,7 @@ Current implementation limits and defaults:
 
 - Input audio contract is fixed to `pcm_s16le` at `16000 Hz`.
 - Output audio format is fixed to `pcm_s16le`; sample rate is negotiated from the requested voice output sample rate.
+- In-session staged multimodal input is currently limited to canonical non-audio user blocks (`text`, `image`, `video`, `document`).
 - Live STT/TTS currently depends on Cartesia credentials supplied via `X-Provider-Key-Cartesia`.
 
 Gateway configuration relevant to live sessions currently comes from the general WebSocket settings in `pkg/gateway/config/config.go`:

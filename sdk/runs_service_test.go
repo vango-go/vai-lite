@@ -208,6 +208,97 @@ func TestRunsCreate_AttachesBothSearchHeadersWhenProviderOmitted(t *testing.T) {
 	}
 }
 
+func TestRunsCreate_AttachesImageProviderHeaderForExplicitProvider(t *testing.T) {
+	t.Parallel()
+
+	var gotGem string
+	var gotVertex string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotGem = r.Header.Get("X-Provider-Key-Gemini")
+		gotVertex = r.Header.Get("X-Provider-Key-VertexAI")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.RunResultEnvelope{
+			Result: &types.RunResult{
+				Steps:      []types.RunStep{},
+				StopReason: types.RunStopReasonEndTurn,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("anthropic", "sk-ant"),
+		WithProviderKey("gem-dev", "sk-gem"),
+		WithProviderKey("gem-vert", "sk-vertex"),
+		WithHTTPClient(server.Client()),
+	)
+
+	_, err := client.Runs.Create(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model:    "anthropic/claude-sonnet-4",
+			Messages: []types.Message{{Role: "user", Content: "hello"}},
+		},
+		ServerTools: []string{"vai_image"},
+		ServerToolConfig: map[string]any{
+			"vai_image": map[string]any{"provider": "gem-dev"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Runs.Create() error = %v", err)
+	}
+	if gotGem != "sk-gem" {
+		t.Fatalf("X-Provider-Key-Gemini=%q", gotGem)
+	}
+	if gotVertex != "" {
+		t.Fatalf("X-Provider-Key-VertexAI=%q, want empty", gotVertex)
+	}
+}
+
+func TestRunsCreate_AttachesBothImageHeadersWhenProviderOmitted(t *testing.T) {
+	t.Parallel()
+
+	var gotGem string
+	var gotVertex string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotGem = r.Header.Get("X-Provider-Key-Gemini")
+		gotVertex = r.Header.Get("X-Provider-Key-VertexAI")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.RunResultEnvelope{
+			Result: &types.RunResult{
+				Steps:      []types.RunStep{},
+				StopReason: types.RunStopReasonEndTurn,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("anthropic", "sk-ant"),
+		WithProviderKey("gem-dev", "sk-gem"),
+		WithProviderKey("gem-vert", "sk-vertex"),
+		WithHTTPClient(server.Client()),
+	)
+
+	_, err := client.Runs.Create(context.Background(), &types.RunRequest{
+		Request: types.MessageRequest{
+			Model:    "anthropic/claude-sonnet-4",
+			Messages: []types.Message{{Role: "user", Content: "hello"}},
+		},
+		ServerTools: []string{"vai_image"},
+	})
+	if err != nil {
+		t.Fatalf("Runs.Create() error = %v", err)
+	}
+	if gotGem != "sk-gem" {
+		t.Fatalf("X-Provider-Key-Gemini=%q", gotGem)
+	}
+	if gotVertex != "sk-vertex" {
+		t.Fatalf("X-Provider-Key-VertexAI=%q", gotVertex)
+	}
+}
+
 func TestRunsStream_ParsesEventCatalogAndNestedStreamEvents(t *testing.T) {
 	t.Parallel()
 

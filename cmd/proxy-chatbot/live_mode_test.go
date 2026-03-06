@@ -119,11 +119,12 @@ func TestMaybeCloseFinishedLiveSession(t *testing.T) {
 		err: errors.New("boom"),
 	}
 	state := &chatRuntime{}
+	var out bytes.Buffer
 	var errOut bytes.Buffer
 	close(session.done)
 
 	active := session
-	maybeCloseFinishedLiveSession(state, &active, &errOut)
+	maybeCloseFinishedLiveSession(state, &active, &out, &errOut)
 	if active != nil {
 		t.Fatalf("expected active session to be cleared")
 	}
@@ -149,9 +150,16 @@ func TestRunChatbot_LiveModeToggleCommands(t *testing.T) {
 	t.Cleanup(func() { startLiveModeFunc = oldStartLiveMode })
 
 	startCalls := 0
+	var committed []types.LiveClientFrame
 	startLiveModeFunc = func(ctx context.Context, cfg chatConfig, state *chatRuntime, tools []vai.ToolWithHandler, out io.Writer, errOut io.Writer) (*liveModeSession, error) {
 		startCalls++
-		return &liveModeSession{done: make(chan struct{})}, nil
+		return &liveModeSession{
+			done: make(chan struct{}),
+			sendFrame: func(frame types.LiveClientFrame) error {
+				committed = append(committed, frame)
+				return nil
+			},
+		}, nil
 	}
 
 	cfg := chatConfig{
@@ -170,7 +178,7 @@ func TestRunChatbot_LiveModeToggleCommands(t *testing.T) {
 
 	var out bytes.Buffer
 	var errOut bytes.Buffer
-	input := strings.NewReader("/live\n/live off\n/quit\n")
+	input := strings.NewReader("/live\nhello from text\n/live off\n/quit\n")
 
 	if err := runChatbot(context.Background(), cfg, input, &out, &errOut); err != nil {
 		t.Fatalf("runChatbot error: %v", err)
@@ -186,6 +194,26 @@ func TestRunChatbot_LiveModeToggleCommands(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "bye") {
 		t.Fatalf("missing exit output: %q", out.String())
+	}
+	if strings.Contains(errOut.String(), "live mode is active") {
+		t.Fatalf("unexpected old live-mode rejection: %q", errOut.String())
+	}
+	if len(committed) != 1 {
+		t.Fatalf("len(committed)=%d, want 1", len(committed))
+	}
+	frame, ok := committed[0].(types.LiveInputCommitFrame)
+	if !ok {
+		t.Fatalf("frame=%T, want LiveInputCommitFrame", committed[0])
+	}
+	if len(frame.Content) != 1 {
+		t.Fatalf("len(frame.Content)=%d, want 1", len(frame.Content))
+	}
+	block, ok := frame.Content[0].(types.TextBlock)
+	if !ok {
+		t.Fatalf("block=%T, want TextBlock", frame.Content[0])
+	}
+	if block.Text != "hello from text" {
+		t.Fatalf("block.Text=%q, want %q", block.Text, "hello from text")
 	}
 }
 

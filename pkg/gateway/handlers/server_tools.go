@@ -10,6 +10,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/types"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	"github.com/vango-go/vai-lite/pkg/gateway/mw"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
 // ServerToolsHandler handles POST /v1/server-tools:execute.
@@ -49,10 +50,22 @@ func (h ServerToolsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, toolErr := registry.Execute(r.Context(), req.Tool, req.Input)
+	execCtx := r.Context()
+	if req.ExecutionContext != nil {
+		execCtx = servertools.ContextWithImageRefRegistry(execCtx, servertools.BuildImageRefRegistryFromExecutionContext(req.ExecutionContext))
+	}
+
+	content, toolErr := registry.Execute(execCtx, req.Tool, req.Input)
 	if toolErr != nil {
 		h.writeErr(w, reqID, typesToolErrToCore(toolErr, reqID))
 		return
+	}
+	if req.Tool == servertools.ToolImage {
+		reg := servertools.ImageRefRegistryFromContext(execCtx)
+		if reg == nil {
+			reg = servertools.NewImageRefRegistry()
+		}
+		content = servertools.FinalizeImageToolResultContent(content, reg)
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

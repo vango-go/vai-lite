@@ -59,6 +59,7 @@ type LiveCallbacks struct {
 	StreamCallbacks
 
 	OnSessionStarted    func(LiveSessionStartedEvent)
+	OnInputState        func(content []ContentBlock)
 	OnUserTurnCommitted func(turnID string, audioBytes int)
 	OnTurnComplete      func(turnID string, stopReason ServerRunStopReason, history []Message)
 	OnTurnCancelled     func(turnID, reason string)
@@ -69,6 +70,7 @@ type LiveCallbacks struct {
 type LiveSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	client *Client
 
 	conn        *websocket.Conn
 	sendFrameFn func(LiveClientFrame) error
@@ -149,6 +151,7 @@ func (s *LiveService) Connect(ctx context.Context, req *LiveConnectRequest, opts
 	session := &LiveSession{
 		ctx:          sessionCtx,
 		cancel:       cancel,
+		client:       s.client,
 		conn:         conn,
 		history:      cloneMessages(preparedReq.Request.Messages),
 		toolHandlers: handlers,
@@ -243,6 +246,49 @@ func (s *LiveSession) SendToolResult(executionID string, content []ContentBlock,
 	})
 }
 
+// AppendInputBlocks appends staged user content to the next live turn.
+func (s *LiveSession) AppendInputBlocks(blocks []ContentBlock) error {
+	if len(blocks) == 0 {
+		return core.NewInvalidRequestError("blocks must not be empty")
+	}
+	return s.SendFrame(LiveInputAppendFrame{
+		Type:    "input_append",
+		Content: cloneContentBlocks(blocks),
+	})
+}
+
+// CommitInputBlocks commits staged and inline user content as an immediate live turn.
+func (s *LiveSession) CommitInputBlocks(blocks []ContentBlock) error {
+	if len(blocks) == 0 {
+		return core.NewInvalidRequestError("blocks must not be empty")
+	}
+	return s.SendFrame(LiveInputCommitFrame{
+		Type:    "input_commit",
+		Content: cloneContentBlocks(blocks),
+	})
+}
+
+// ClearPendingInput clears any staged live user input that has not yet been committed.
+func (s *LiveSession) ClearPendingInput() error {
+	return s.SendFrame(LiveInputClearFrame{Type: "input_clear"})
+}
+
+// AppendText appends staged text content to the next live turn.
+func (s *LiveSession) AppendText(text string) error {
+	if strings.TrimSpace(text) == "" {
+		return core.NewInvalidRequestError("text must not be empty")
+	}
+	return s.AppendInputBlocks([]ContentBlock{Text(text)})
+}
+
+// CommitText commits text content as an immediate live turn.
+func (s *LiveSession) CommitText(text string) error {
+	if strings.TrimSpace(text) == "" {
+		return core.NewInvalidRequestError("text must not be empty")
+	}
+	return s.CommitInputBlocks([]ContentBlock{Text(text)})
+}
+
 // SendPlaybackMark sends a playback progress mark for a live turn.
 func (s *LiveSession) SendPlaybackMark(turnID string, playedMS int) error {
 	return s.SendFrame(LivePlaybackMarkFrame{
@@ -313,6 +359,10 @@ func (s *LiveSession) Process(callbacks LiveCallbacks) error {
 			case LiveAudioUnavailableEvent:
 				if callbacks.OnAudioUnavailable != nil {
 					callbacks.OnAudioUnavailable(e.Reason, e.Message)
+				}
+			case LiveInputStateEvent:
+				if callbacks.OnInputState != nil {
+					callbacks.OnInputState(cloneContentBlocks(e.Content))
 				}
 			case LiveUserTurnCommittedEvent:
 				if callbacks.OnUserTurnCommitted != nil {
@@ -468,6 +518,8 @@ func (s *LiveSession) executeToolCall(ev types.LiveToolCallEvent) {
 			toolCtx, cancel = context.WithTimeout(s.ctx, s.toolTimeout)
 		}
 		defer cancel()
+		toolCtx = contextWithToolExecutionClient(toolCtx, s.client)
+		toolCtx = contextWithServerToolExecutionContext(toolCtx, buildServerToolExecutionContext(s.HistorySnapshot()))
 
 		output, callErr := handler(toolCtx, inputJSON)
 		if callErr != nil {

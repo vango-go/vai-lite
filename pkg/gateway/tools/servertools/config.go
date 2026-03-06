@@ -11,15 +11,21 @@ const (
 	ProviderTavily    = "tavily"
 	ProviderExa       = "exa"
 	ProviderFirecrawl = "firecrawl"
+	ProviderGemDev    = "gem-dev"
+	ProviderGemVert   = "gem-vert"
 
 	DefaultSearchMaxResults = 5
 	HardSearchMaxResults    = 10
+
+	DefaultImageModel = "gemini-3.1-flash-image-preview"
 )
 
 const (
 	HeaderProviderKeyTavily    = "X-Provider-Key-Tavily"
 	HeaderProviderKeyExa       = "X-Provider-Key-Exa"
 	HeaderProviderKeyFirecrawl = "X-Provider-Key-Firecrawl"
+	HeaderProviderKeyGemini    = "X-Provider-Key-Gemini"
+	HeaderProviderKeyVertexAI  = "X-Provider-Key-VertexAI"
 )
 
 type WebSearchConfig struct {
@@ -36,6 +42,11 @@ type WebFetchConfig struct {
 	Format         string   `json:"format,omitempty"`
 	AllowedDomains []string `json:"allowed_domains,omitempty"`
 	BlockedDomains []string `json:"blocked_domains,omitempty"`
+}
+
+type ImageConfig struct {
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 func DecodeWebSearchConfig(raw any) (WebSearchConfig, error) {
@@ -76,6 +87,24 @@ func DecodeWebFetchConfig(raw any) (WebFetchConfig, error) {
 	return cfg, nil
 }
 
+func DecodeImageConfig(raw any) (ImageConfig, error) {
+	var cfg ImageConfig
+	if err := decodeConfigObject(raw, &cfg); err != nil {
+		return ImageConfig{}, err
+	}
+	cfg.Provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	switch cfg.Provider {
+	case "", ProviderGemDev, ProviderGemVert:
+	default:
+		return ImageConfig{}, fmt.Errorf("unsupported provider %q", cfg.Provider)
+	}
+	cfg.Model = strings.TrimSpace(cfg.Model)
+	if cfg.Model == "" {
+		cfg.Model = DefaultImageModel
+	}
+	return cfg, nil
+}
+
 func ProviderHeaderName(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case ProviderTavily:
@@ -84,6 +113,10 @@ func ProviderHeaderName(provider string) string {
 		return HeaderProviderKeyExa
 	case ProviderFirecrawl:
 		return HeaderProviderKeyFirecrawl
+	case ProviderGemDev:
+		return HeaderProviderKeyGemini
+	case ProviderGemVert:
+		return HeaderProviderKeyVertexAI
 	default:
 		return ""
 	}

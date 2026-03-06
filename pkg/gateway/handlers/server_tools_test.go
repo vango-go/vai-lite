@@ -126,6 +126,97 @@ func TestServerToolsHandler_ConfigForDisabledToolRejected(t *testing.T) {
 	}
 }
 
+func TestServerToolsHandler_ImageMissingProviderKey(t *testing.T) {
+	h := ServerToolsHandler{Config: baseRunsConfig()}
+	req := httptest.NewRequest(http.MethodPost, "/v1/server-tools:execute", bytes.NewReader([]byte(`{
+		"tool":"vai_image",
+		"input":{"prompt":"make a poster"},
+		"server_tool_config":{"vai_image":{"provider":"gem-dev"}}
+	}`)))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"param":"X-Provider-Key-Gemini"`) {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestServerToolsHandler_ImageAmbiguousProviderInference(t *testing.T) {
+	h := ServerToolsHandler{Config: baseRunsConfig()}
+	req := httptest.NewRequest(http.MethodPost, "/v1/server-tools:execute", bytes.NewReader([]byte(`{
+		"tool":"vai_image",
+		"input":{"prompt":"make a poster"}
+	}`)))
+	req.Header.Set("X-Provider-Key-Gemini", "gem-test")
+	req.Header.Set("X-Provider-Key-VertexAI", "vertex-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"tool_provider_missing"`) {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestServerToolsHandler_ImageExecutionContextResolvesImageIDs(t *testing.T) {
+	cfg := baseRunsConfig()
+	h := ServerToolsHandler{
+		Config: cfg,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			_, _ = io.ReadAll(req.Body)
+			return jsonResponse(http.StatusOK, `{
+				"candidates":[
+					{
+						"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"Zm9v"}}]},
+						"finishReason":"STOP"
+					}
+				],
+				"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}
+			}`), nil
+		})},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/server-tools:execute", bytes.NewReader([]byte(`{
+		"tool":"vai_image",
+		"input":{"prompt":"edit this","images":[{"id":"img-01"}]},
+		"execution_context":{
+			"images":[
+				{
+					"id":"img-01",
+					"image":{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YmFzZQ=="}}
+				}
+			]
+		}
+	}`)))
+	req.Header.Set("X-Provider-Key-Gemini", "gem-test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	resp, err := types.UnmarshalServerToolExecuteResponse(rr.Body.Bytes())
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Content) < 2 {
+		t.Fatalf("len(content)=%d, want at least 2", len(resp.Content))
+	}
+	tb, ok := resp.Content[0].(types.TextBlock)
+	if !ok {
+		t.Fatalf("content[0] type=%T, want types.TextBlock", resp.Content[0])
+	}
+	if !strings.Contains(tb.Text, `"referenced_image_ids":["img-01"]`) {
+		t.Fatalf("metadata=%s", tb.Text)
+	}
+	if !strings.Contains(tb.Text, `"generated_image_ids":["img-02"]`) {
+		t.Fatalf("metadata=%s", tb.Text)
+	}
+}
+
 func TestServerToolsHandler_SearchTavilySuccess(t *testing.T) {
 	cfg := baseRunsConfig()
 	cfg.TavilyBaseURL = "https://tavily.test"

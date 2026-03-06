@@ -148,7 +148,15 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RequestID:         reqID,
 		PublicModel:       runReq.Request.Model,
 	}
-	result, err := controller.RunBlocking(r.Context(), &workingReq)
+
+	ctx := r.Context()
+	if h.Config.HandlerTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, h.Config.HandlerTimeout)
+		defer cancel()
+	}
+
+	result, err := controller.RunBlocking(ctx, &workingReq)
 	if err != nil {
 		// /v1/runs run timeout is modeled as a successful terminal result.
 		if !(errors.Is(err, context.DeadlineExceeded) &&

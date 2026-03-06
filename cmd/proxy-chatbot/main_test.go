@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -617,6 +618,41 @@ func TestBuildStreamCallbacks_PrintsSingleLineToolStreamAndText(t *testing.T) {
 	}
 	if state.text.String() != "hello" {
 		t.Fatalf("state.text=%q, want %q", state.text.String(), "hello")
+	}
+}
+
+func TestBuildChatTools_IncludesImageToolWhenGeminiConfigured(t *testing.T) {
+	t.Parallel()
+
+	tools := buildChatTools(chatConfig{
+		ProviderKeys: map[string]string{
+			"tavily":  "tvly-test",
+			"gem-dev": "gem-test",
+		},
+	})
+
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Tool.Name)
+	}
+	if !slices.Contains(names, "vai_image") {
+		t.Fatalf("tool names=%v, want vai_image", names)
+	}
+}
+
+func TestBuildChatTools_OmitsImageToolWithoutGeminiKey(t *testing.T) {
+	t.Parallel()
+
+	tools := buildChatTools(chatConfig{
+		ProviderKeys: map[string]string{
+			"tavily": "tvly-test",
+		},
+	})
+
+	for _, tool := range tools {
+		if tool.Tool.Name == "vai_image" {
+			t.Fatalf("unexpected vai_image tool in %+v", tools)
+		}
 	}
 }
 

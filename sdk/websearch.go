@@ -18,11 +18,14 @@ const (
 	Tavily    VAIProvider = "tavily"
 	Exa       VAIProvider = "exa"
 	Firecrawl VAIProvider = "firecrawl"
+	GemDev    VAIProvider = "gem-dev"
+	GemVert   VAIProvider = "gem-vert"
 )
 
 const (
 	vaiWebSearchToolName = "vai_web_search"
 	vaiWebFetchToolName  = "vai_web_fetch"
+	vaiImageToolName     = "vai_image"
 )
 
 // --- Gateway-Native VAI Web Search / Fetch ---
@@ -34,6 +37,16 @@ type gatewaySearchInput struct {
 
 type gatewayFetchInput struct {
 	URL string `json:"url" desc:"The URL of the web page to fetch"`
+}
+
+type gatewayImageInput struct {
+	Prompt string `json:"prompt" desc:"Prompt describing the image to generate or the edits to apply"`
+	Images []struct {
+		ID          string `json:"id" desc:"Conversation image ID, such as img-01"`
+		Description string `json:"description,omitempty" desc:"Optional guidance for how to use this input image"`
+	} `json:"images,omitempty" desc:"Optional prior images to use as references or edit inputs"`
+	AspectRatio string `json:"aspect_ratio,omitempty" desc:"Optional output aspect ratio, such as 1:1, 4:3, 16:9, or 21:9"`
+	Size        string `json:"size,omitempty" desc:"Optional output size: 1K, 2K, or 4K"`
 }
 
 // VAIWebSearch creates a gateway-native web search function tool.
@@ -100,6 +113,38 @@ func VAIWebFetch(provider VAIProvider) ToolWithHandler {
 	}
 }
 
+// VAIImage creates a gateway-native Gemini image generation/editing function tool.
+//
+// This tool executes via the VAI gateway (/v1/server-tools:execute), not locally.
+// Requires proxy mode (`WithBaseURL(...)`) and a provider key configured via
+// `WithProviderKey("gem-dev", ...)` or `WithProviderKey("gem-vert", ...)`.
+func VAIImage(provider VAIProvider) ToolWithHandler {
+	providerName := normalizeVAIProvider(provider)
+
+	return ToolWithHandler{
+		Tool: types.Tool{
+			Type:        types.ToolTypeFunction,
+			Name:        vaiImageToolName,
+			Description: "Generate or edit images with Gemini. Use prompt-only for new images, or pass prior image IDs to create edits and variations.",
+			InputSchema: GenerateJSONSchema(reflect.TypeOf(gatewayImageInput{})),
+		},
+		Handler: func(ctx context.Context, rawInput json.RawMessage) (any, error) {
+			if err := validateGatewayImageProvider(providerName); err != nil {
+				return nil, err
+			}
+			input, err := decodeToolInputObject(rawInput)
+			if err != nil {
+				return nil, err
+			}
+			client := toolExecutionClientFromContext(ctx)
+			if client == nil {
+				return nil, core.NewInvalidRequestError("gateway-native VAI tools require Messages.Run or Messages.RunStream")
+			}
+			return client.executeGatewayServerTool(ctx, vaiImageToolName, providerName, input)
+		},
+	}
+}
+
 func normalizeVAIProvider(provider VAIProvider) string {
 	return strings.ToLower(strings.TrimSpace(string(provider)))
 }
@@ -140,6 +185,27 @@ func validateGatewayFetchProvider(provider string) error {
 		return &core.Error{
 			Type:    core.ErrInvalidRequest,
 			Message: fmt.Sprintf("unsupported web fetch provider %q", provider),
+			Param:   "provider",
+			Code:    "unsupported_tool_provider",
+		}
+	}
+}
+
+func validateGatewayImageProvider(provider string) error {
+	switch provider {
+	case string(GemDev), string(GemVert):
+		return nil
+	case "":
+		return &core.Error{
+			Type:    core.ErrInvalidRequest,
+			Message: "provider is required",
+			Param:   "provider",
+			Code:    "tool_provider_missing",
+		}
+	default:
+		return &core.Error{
+			Type:    core.ErrInvalidRequest,
+			Message: fmt.Sprintf("unsupported image provider %q", provider),
 			Param:   "provider",
 			Code:    "unsupported_tool_provider",
 		}

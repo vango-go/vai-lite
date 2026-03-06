@@ -161,6 +161,15 @@ func (c *Client) attachServerToolProviderHeaders(headers http.Header, req *types
 			c.setProviderHeader(headers, "firecrawl")
 		}
 	}
+
+	if _, ok := toolEnabled["vai_image"]; ok {
+		if provider, hasProvider := extractServerToolProvider(req.ServerToolConfig, "vai_image"); hasProvider {
+			c.setProviderHeader(headers, provider)
+		} else {
+			c.setProviderHeader(headers, "gem-dev")
+			c.setProviderHeader(headers, "gem-vert")
+		}
+	}
 }
 
 func (c *Client) setProviderHeader(headers http.Header, provider string) {

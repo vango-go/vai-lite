@@ -89,16 +89,33 @@ type liveInboundPlaybackMarkFrame struct {
 	PlayedMS int    `json:"played_ms"`
 }
 
+type liveInboundInputAppendFrame struct {
+	Type    string            `json:"type"`
+	Content []json.RawMessage `json:"content"`
+}
+
+type liveInboundInputCommitFrame struct {
+	Type    string            `json:"type"`
+	Content []json.RawMessage `json:"content,omitempty"`
+}
+
+type liveInboundInputClearFrame struct {
+	Type string `json:"type"`
+}
+
 type liveToolResultPayload struct {
 	Content []types.ContentBlock
 	IsError bool
 	Error   *types.Error
 }
 
-type liveCommittedUtterance struct {
-	TurnID      string
-	PCM         []byte
-	SpeechEnded time.Time
+type liveCommittedTurn struct {
+	TurnID              string
+	PCM                 []byte
+	SpeechEnded         time.Time
+	Blocks              []types.ContentBlock
+	InputStateChanged   bool
+	CommittedAudioBytes int
 }
 
 type liveTurnLifecycle string
@@ -164,6 +181,24 @@ var liveWSUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+}
+
+func liveOriginAllowed(cfg config.Config, r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	_, ok := cfg.CORSAllowedOrigins[origin]
+	return ok
+}
+
+func liveOriginCheck(cfg config.Config) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		return liveOriginAllowed(cfg, r)
+	}
 }
 
 var newLiveVoicePipelineFunc = func(cartesiaKey string, httpClient *http.Client) *voice.Pipeline {
@@ -244,6 +279,16 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}, 529)
 		return
 	}
+	if !liveOriginAllowed(h.Config, r) {
+		writeCoreErrorJSON(w, reqID, &core.Error{
+			Type:      core.ErrPermission,
+			Message:   "origin is not allowed",
+			Param:     "Origin",
+			Code:      "origin_not_allowed",
+			RequestID: reqID,
+		}, http.StatusForbidden)
+		return
+	}
 
 	var wsPermit *ratelimit.Permit
 	if h.Limiter != nil && h.Config.WSMaxSessionsPerPrincipal > 0 {
@@ -262,7 +307,10 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer wsPermit.Release()
 	}
 
-	conn, err := liveWSUpgrader.Upgrade(w, r, nil)
+	upgrader := liveWSUpgrader
+	upgrader.CheckOrigin = liveOriginCheck(h.Config)
+
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
@@ -295,6 +343,7 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	session := &liveSession{
 		ctx:            ctx,
 		cancel:         cancel,
+		gatewayConfig:  h.Config,
 		logger:         h.Logger,
 		reqID:          reqID,
 		conn:           conn,
@@ -338,7 +387,7 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session.commitCh = make(chan liveCommittedUtterance, 8)
+	session.commitCh = make(chan liveCommittedTurn, 8)
 	session.wg.Add(4)
 	go session.readerLoop()
 	go session.sttLoop()
@@ -357,6 +406,7 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type liveSessionConfig struct {
+	ProviderName       string
 	PublicModel        string
 	ModelName          string
 	Provider           core.Provider
@@ -547,6 +597,7 @@ func (h LiveHandler) readAndValidateLiveStart(ctx context.Context, r *http.Reque
 	runReq.Request.Model = modelName
 
 	return &start, runReq, &liveSessionConfig{
+		ProviderName:       providerName,
 		PublicModel:        publicModel,
 		ModelName:          modelName,
 		Provider:           provider,
@@ -583,6 +634,8 @@ type liveSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	gatewayConfig config.Config
+
 	logger *slog.Logger
 	reqID  string
 
@@ -597,13 +650,14 @@ type liveSession struct {
 	currentUtterance []byte
 	lastSpeechAt     time.Time
 	sttSawText       bool
+	pendingInput     []types.ContentBlock
 	runBusy          bool
 	activeTurn       *liveTurnRuntime
 	aggregatePrefix  []byte
 	history          []types.Message
 	toolWaiters      map[string]chan liveToolResultPayload
 
-	commitCh chan liveCommittedUtterance
+	commitCh chan liveCommittedTurn
 
 	runTemplate    *types.RunRequest
 	controllerCfg  *liveSessionConfig
@@ -732,6 +786,12 @@ func (s *liveSession) handleControlFrame(data []byte) error {
 		return s.handlePlaybackStateFrame(data)
 	case "playback_mark":
 		return s.handlePlaybackMarkFrame(data)
+	case "input_append":
+		return s.handleInputAppendFrame(data)
+	case "input_commit":
+		return s.handleInputCommitFrame(data)
+	case "input_clear":
+		return s.handleInputClearFrame(data)
 	case "stop":
 		var frame liveInboundStopFrame
 		if err := json.Unmarshal(data, &frame); err != nil {
@@ -790,6 +850,136 @@ func (s *liveSession) handlePlaybackMarkFrame(data []byte) error {
 	if frame.PlayedMS > s.activeTurn.playedMS {
 		s.activeTurn.playedMS = frame.PlayedMS
 	}
+	return nil
+}
+
+func (s *liveSession) handleInputAppendFrame(data []byte) error {
+	var frame liveInboundInputAppendFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		return fmt.Errorf("invalid input_append frame")
+	}
+	blocks, err := parseLiveInputBlocks(frame.Content)
+	if err != nil {
+		return err
+	}
+	if len(blocks) == 0 {
+		return fmt.Errorf("input_append.content must not be empty")
+	}
+	if err := s.validateLiveInputBlocks(blocks); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	combined := append(cloneLiveContentBlocks(s.pendingInput), cloneLiveContentBlocks(blocks)...)
+	s.mu.Unlock()
+	if err := s.validateLiveInputBlocks(combined); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.pendingInput = combined
+	state := cloneLiveContentBlocks(s.pendingInput)
+	s.mu.Unlock()
+	s.send(types.LiveInputStateEvent{
+		Type:    "input_state",
+		Content: state,
+	})
+	return nil
+}
+
+func (s *liveSession) handleInputCommitFrame(data []byte) error {
+	var frame liveInboundInputCommitFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		return fmt.Errorf("invalid input_commit frame")
+	}
+	inlineBlocks, err := parseLiveInputBlocks(frame.Content)
+	if err != nil {
+		return err
+	}
+	if len(inlineBlocks) > 0 {
+		if err := s.validateLiveInputBlocks(inlineBlocks); err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	staged := cloneLiveContentBlocks(s.pendingInput)
+	s.mu.Unlock()
+	combined := append(staged, cloneLiveContentBlocks(inlineBlocks)...)
+	if len(combined) == 0 {
+		return fmt.Errorf("input_commit requires staged or inline content")
+	}
+	if err := s.validateLiveInputBlocks(combined); err != nil {
+		return err
+	}
+
+	cancelRun, turnID, emitCancel, emitReset := s.interruptForInputCommit()
+	if cancelRun != nil {
+		cancelRun()
+	}
+	if emitCancel {
+		s.sendPriority(types.LiveTurnCancelledEvent{
+			Type:   "turn_cancelled",
+			TurnID: turnID,
+			Reason: "input_commit",
+		})
+	}
+	if emitReset {
+		s.sendPriority(types.LiveAudioResetEvent{
+			Type:   "audio_reset",
+			TurnID: turnID,
+			Reason: "input_commit",
+		})
+	}
+
+	s.mu.Lock()
+	combined = append(cloneLiveContentBlocks(s.pendingInput), cloneLiveContentBlocks(inlineBlocks)...)
+	if len(combined) == 0 {
+		s.mu.Unlock()
+		return fmt.Errorf("input_commit requires staged or inline content")
+	}
+	s.pendingInput = nil
+	s.mu.Unlock()
+
+	if !s.send(types.LiveInputStateEvent{
+		Type:    "input_state",
+		Content: []types.ContentBlock{},
+	}) {
+		return nil
+	}
+
+	commit := liveCommittedTurn{
+		TurnID:            fmt.Sprintf("turn_%d", s.turnCounter.Add(1)),
+		SpeechEnded:       time.Now(),
+		Blocks:            combined,
+		InputStateChanged: true,
+	}
+	if !s.send(types.LiveUserTurnCommittedEvent{
+		Type:       "user_turn_committed",
+		TurnID:     commit.TurnID,
+		AudioBytes: 0,
+	}) {
+		return nil
+	}
+	select {
+	case s.commitCh <- commit:
+	case <-s.ctx.Done():
+	}
+	return nil
+}
+
+func (s *liveSession) handleInputClearFrame(data []byte) error {
+	var frame liveInboundInputClearFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		return fmt.Errorf("invalid input_clear frame")
+	}
+	s.mu.Lock()
+	s.pendingInput = nil
+	s.mu.Unlock()
+	s.send(types.LiveInputStateEvent{
+		Type:    "input_state",
+		Content: []types.ContentBlock{},
+	})
 	return nil
 }
 
@@ -942,10 +1132,18 @@ func (s *liveSession) commitTickerLoop() {
 			if !ok {
 				continue
 			}
+			if commit.InputStateChanged {
+				if !s.send(types.LiveInputStateEvent{
+					Type:    "input_state",
+					Content: []types.ContentBlock{},
+				}) {
+					return
+				}
+			}
 			if !s.send(types.LiveUserTurnCommittedEvent{
 				Type:       "user_turn_committed",
 				TurnID:     commit.TurnID,
-				AudioBytes: len(commit.PCM),
+				AudioBytes: commit.CommittedAudioBytes,
 			}) {
 				return
 			}
@@ -958,8 +1156,8 @@ func (s *liveSession) commitTickerLoop() {
 	}
 }
 
-func (s *liveSession) maybeCommitUtterance() (liveCommittedUtterance, bool) {
-	var none liveCommittedUtterance
+func (s *liveSession) maybeCommitUtterance() (liveCommittedTurn, bool) {
+	var none liveCommittedTurn
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.runBusy {
@@ -996,11 +1194,17 @@ func (s *liveSession) maybeCommitUtterance() (liveCommittedUtterance, bool) {
 		committed = combined
 		s.aggregatePrefix = nil
 	}
+	blocks := cloneLiveContentBlocks(s.pendingInput)
+	pendingChanged := len(s.pendingInput) > 0
+	s.pendingInput = nil
 
-	return liveCommittedUtterance{
-		TurnID:      fmt.Sprintf("turn_%d", s.turnCounter.Add(1)),
-		PCM:         committed,
-		SpeechEnded: speechEnded,
+	return liveCommittedTurn{
+		TurnID:              fmt.Sprintf("turn_%d", s.turnCounter.Add(1)),
+		PCM:                 committed,
+		SpeechEnded:         speechEnded,
+		Blocks:              blocks,
+		InputStateChanged:   pendingChanged,
+		CommittedAudioBytes: len(committed),
 	}, true
 }
 
@@ -1019,17 +1223,21 @@ func (s *liveSession) turnWorker() {
 	}
 }
 
-func (s *liveSession) runTurn(committed liveCommittedUtterance) {
-	if len(committed.PCM) == 0 {
+func (s *liveSession) runTurn(committed liveCommittedTurn) {
+	if len(committed.PCM) == 0 && len(committed.Blocks) == 0 {
 		return
 	}
 
 	runCtx, runCancel := context.WithCancel(s.ctx)
+	speechEnded := committed.SpeechEnded
+	if speechEnded.IsZero() {
+		speechEnded = time.Now()
+	}
 	turn := &liveTurnRuntime{
 		id:            committed.TurnID,
 		lifecycle:     liveTurnLifecycleRunning,
-		speechEndedAt: committed.SpeechEnded,
-		graceDeadline: committed.SpeechEnded.Add(liveGracePeriod),
+		speechEndedAt: speechEnded,
+		graceDeadline: speechEnded.Add(liveGracePeriod),
 		runCancel:     runCancel,
 		baseUserPCM:   append([]byte(nil), committed.PCM...),
 	}
@@ -1048,19 +1256,10 @@ func (s *liveSession) runTurn(committed liveCommittedUtterance) {
 		s.mu.Unlock()
 	}()
 
-	wav := encodeWAVPCM16Mono(committed.PCM, liveInputSampleRateHz)
+	userBlocks := buildLiveUserBlocks(committed)
 	userMsg := types.Message{
-		Role: "user",
-		Content: []types.ContentBlock{
-			types.AudioSTTBlock{
-				Type: "audio_stt",
-				Source: types.AudioSource{
-					Type:      "base64",
-					MediaType: "audio/wav",
-					Data:      base64.StdEncoding.EncodeToString(wav),
-				},
-			},
-		},
+		Role:    "user",
+		Content: userBlocks,
 	}
 
 	runReq := cloneRunRequest(s.runTemplate)
@@ -1294,6 +1493,75 @@ func (s *liveSession) isTurnSuppressed(turnID string) bool {
 		return false
 	}
 	return s.activeTurn.suppressOutgoing
+}
+
+func (s *liveSession) validateLiveInputBlocks(blocks []types.ContentBlock) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	if err := validateLiveInputBlockShapes(blocks); err != nil {
+		return err
+	}
+	if s == nil || s.controllerCfg == nil {
+		return errors.New("live session is not initialized")
+	}
+
+	req := types.MessageRequest{
+		Model: s.controllerCfg.PublicModel,
+		Messages: []types.Message{{
+			Role:    "user",
+			Content: cloneLiveContentBlocks(blocks),
+		}},
+	}
+	if err := limits.ValidateMessageRequest(&req, s.gatewayConfig); err != nil {
+		return err
+	}
+	compatIssues := compat.ValidateMessageRequest(&req, s.controllerCfg.ProviderName, s.controllerCfg.PublicModel)
+	if len(compatIssues) == 0 {
+		return nil
+	}
+	return &core.Error{
+		Type:         core.ErrInvalidRequest,
+		Message:      fmt.Sprintf("Request is incompatible with provider %s and model %s", s.controllerCfg.ProviderName, s.controllerCfg.ModelName),
+		CompatIssues: compatIssues,
+	}
+}
+
+func (s *liveSession) interruptForInputCommit() (context.CancelFunc, string, bool, bool) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	active := s.activeTurn
+	if active == nil || active.interruptRequested {
+		return nil, "", false, false
+	}
+
+	cancelRun := active.runCancel
+	active.runCancel = nil
+	turnID := active.id
+	playing := active.audioStarted && !active.playbackFinished
+
+	if s.isGraceCancelableLocked(active, now) {
+		active.lifecycle = liveTurnLifecycleCancelled
+		active.pendingResult = nil
+		active.playbackFinished = false
+		return cancelRun, turnID, true, false
+	}
+	if playing {
+		active.interruptRequested = true
+		active.interruptPlayedMS = active.playedMS
+		active.interruptFrozen = true
+		active.suppressOutgoing = true
+		return cancelRun, turnID, false, true
+	}
+	if s.runBusy {
+		active.lifecycle = liveTurnLifecycleCancelled
+		active.pendingResult = nil
+		active.playbackFinished = false
+		return cancelRun, turnID, true, false
+	}
+	return nil, "", false, false
 }
 
 const liveInterruptMarker = "[user interrupt detected]"
@@ -2126,6 +2394,58 @@ func cloneRunRequest(src *types.RunRequest) *types.RunRequest {
 		dst.ServerToolConfig = cfg
 	}
 	return &dst
+}
+
+func buildLiveUserBlocks(committed liveCommittedTurn) []types.ContentBlock {
+	userBlocks := cloneLiveContentBlocks(committed.Blocks)
+	if len(committed.PCM) == 0 {
+		return userBlocks
+	}
+	wav := encodeWAVPCM16Mono(committed.PCM, liveInputSampleRateHz)
+	return append(userBlocks, types.AudioSTTBlock{
+		Type: "audio_stt",
+		Source: types.AudioSource{
+			Type:      "base64",
+			MediaType: "audio/wav",
+			Data:      base64.StdEncoding.EncodeToString(wav),
+		},
+	})
+}
+
+func parseLiveInputBlocks(rawBlocks []json.RawMessage) ([]types.ContentBlock, error) {
+	blocks := make([]types.ContentBlock, 0, len(rawBlocks))
+	for _, raw := range rawBlocks {
+		block, err := types.UnmarshalContentBlock(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid live input block: %w", err)
+		}
+		blocks = append(blocks, block)
+	}
+	return blocks, nil
+}
+
+func validateLiveInputBlockShapes(blocks []types.ContentBlock) error {
+	for i, block := range blocks {
+		switch block.(type) {
+		case types.TextBlock, *types.TextBlock,
+			types.ImageBlock, *types.ImageBlock,
+			types.VideoBlock, *types.VideoBlock,
+			types.DocumentBlock, *types.DocumentBlock:
+			continue
+		default:
+			return fmt.Errorf("live input block %d has unsupported type %q", i, block.BlockType())
+		}
+	}
+	return nil
+}
+
+func cloneLiveContentBlocks(in []types.ContentBlock) []types.ContentBlock {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]types.ContentBlock, len(in))
+	copy(out, in)
+	return out
 }
 
 func normalizeLiveRunRequestForStrict(raw json.RawMessage) (json.RawMessage, bool) {
