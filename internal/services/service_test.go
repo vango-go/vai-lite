@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stripe/stripe-go/v84"
+	"github.com/vango-go/vai-lite/pkg/core/types"
 	neon "github.com/vango-go/vango-neon"
 )
 
@@ -79,7 +80,7 @@ func orgRow(orgID string, allowBYOK, hostedUsage bool) pgx.Row {
 	return neon.NewRow(orgID, "Test Org", allowBYOK, hostedUsage, "oai-resp/gpt-5-mini")
 }
 
-func TestResolveHostedHeaders_PrefersExternalBYOKWhenOverrideAllowed(t *testing.T) {
+func TestResolveExecutionHeaders_GatewayAPIKeyPrefersExternalBYOK(t *testing.T) {
 	t.Parallel()
 
 	svc := &AppServices{
@@ -93,19 +94,19 @@ func TestResolveHostedHeaders_PrefersExternalBYOKWhenOverrideAllowed(t *testing.
 	headers := http.Header{}
 	headers.Set("X-Provider-Key-OpenAI", "sk-browser")
 
-	out, source, err := svc.ResolveHostedHeaders(context.Background(), "org_123", headers, false)
+	out, source, err := svc.ResolveExecutionHeaders(context.Background(), "org_123", headers, "", AccessCredentialGatewayAPIKey)
 	if err != nil {
-		t.Fatalf("ResolveHostedHeaders() error = %v", err)
+		t.Fatalf("ResolveExecutionHeaders() error = %v", err)
 	}
-	if source != KeySourceExternalBYOK {
-		t.Fatalf("ResolveHostedHeaders() source = %q, want %q", source, KeySourceExternalBYOK)
+	if source != KeySourceCustomerBYOKExternal {
+		t.Fatalf("ResolveExecutionHeaders() source = %q, want %q", source, KeySourceCustomerBYOKExternal)
 	}
 	if got := out.Get("X-Provider-Key-OpenAI"); got != "sk-browser" {
-		t.Fatalf("ResolveHostedHeaders() header = %q", got)
+		t.Fatalf("ResolveExecutionHeaders() header = %q", got)
 	}
 }
 
-func TestResolveHostedHeaders_ReturnsEmptyWithoutVaultOrBYOK(t *testing.T) {
+func TestResolveExecutionHeaders_GatewayAPIKeyUsesPlatformHostedWithoutProviderHeaders(t *testing.T) {
 	t.Parallel()
 
 	svc := &AppServices{
@@ -116,19 +117,51 @@ func TestResolveHostedHeaders_ReturnsEmptyWithoutVaultOrBYOK(t *testing.T) {
 		},
 	}
 
-	out, source, err := svc.ResolveHostedHeaders(context.Background(), "org_123", nil, false)
+	out, source, err := svc.ResolveExecutionHeaders(context.Background(), "org_123", nil, "", AccessCredentialGatewayAPIKey)
 	if err != nil {
-		t.Fatalf("ResolveHostedHeaders() error = %v", err)
+		t.Fatalf("ResolveExecutionHeaders() error = %v", err)
 	}
-	if source != "" {
-		t.Fatalf("ResolveHostedHeaders() source = %q, want empty", source)
+	if source != KeySourcePlatformHosted {
+		t.Fatalf("ResolveExecutionHeaders() source = %q, want %q", source, KeySourcePlatformHosted)
 	}
 	if out == nil {
-		t.Fatal("ResolveHostedHeaders() returned nil headers")
+		t.Fatal("ResolveExecutionHeaders() returned nil headers")
 	}
 }
 
-func TestReserveHostedUsageRejectsDepletedBalance(t *testing.T) {
+func TestResolveExecutionHeaders_UsesWorkspaceVaultKeysForSessionMode(t *testing.T) {
+	t.Parallel()
+
+	svc := &AppServices{
+		DB: &neon.TestDB{
+			QueryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return orgRow("org_123", true, true)
+			},
+			QueryFunc: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return neon.NewRows([]string{"provider", "object_name"}).AddRow("openai", "vault/openai").Build(), nil
+			},
+		},
+		vaultRead: func(_ context.Context, name string) (string, error) {
+			if name != "vault/openai" {
+				t.Fatalf("vaultRead name = %q", name)
+			}
+			return "sk-vault", nil
+		},
+	}
+
+	out, source, err := svc.ResolveExecutionHeaders(context.Background(), "org_123", nil, KeySourceCustomerBYOKVault, AccessCredentialSessionAuth)
+	if err != nil {
+		t.Fatalf("ResolveExecutionHeaders() error = %v", err)
+	}
+	if source != KeySourceCustomerBYOKVault {
+		t.Fatalf("ResolveExecutionHeaders() source = %q, want %q", source, KeySourceCustomerBYOKVault)
+	}
+	if got := out.Get("X-Provider-Key-OpenAI"); got != "sk-vault" {
+		t.Fatalf("vault header = %q", got)
+	}
+}
+
+func TestReservePlatformHostedUsageRejectsDepletedBalance(t *testing.T) {
 	t.Parallel()
 
 	svc := &AppServices{
@@ -137,11 +170,12 @@ func TestReserveHostedUsageRejectsDepletedBalance(t *testing.T) {
 				return neon.NewRow(int64(0))
 			},
 		},
+		Pricing: DefaultPricingCatalog(),
 	}
 
-	err := svc.ReserveHostedUsage(context.Background(), "org_123")
+	err := svc.ReservePlatformHostedUsage(context.Background(), "org_123", "oai-resp/gpt-5-mini")
 	if err == nil || !strings.Contains(err.Error(), "depleted") {
-		t.Fatalf("ReserveHostedUsage() error = %v, want depleted balance", err)
+		t.Fatalf("ReservePlatformHostedUsage() error = %v, want depleted balance", err)
 	}
 }
 
@@ -154,7 +188,7 @@ func TestRecordUsageBrowserBYOKDoesNotDebitWallet(t *testing.T) {
 		Pricing: DefaultPricingCatalog(),
 	}
 
-	err := svc.RecordUsage(context.Background(), "org_123", "conv_123", "msg_123", "chat_stream", "unknown/model", KeySourceBrowserBYOK, 100, 50, 150, map[string]any{
+	err := svc.RecordUsage(context.Background(), "org_123", "conv_123", "msg_123", "chat_stream", "unknown/model", KeySourceCustomerBYOKBrowser, AccessCredentialSessionAuth, types.Usage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150}, map[string]any{
 		"via": "test",
 	})
 	if err != nil {
@@ -166,12 +200,15 @@ func TestRecordUsageBrowserBYOKDoesNotDebitWallet(t *testing.T) {
 	if !strings.Contains(tx.execCalls[0].sql, "INSERT INTO usage_events") {
 		t.Fatalf("first exec sql = %q", tx.execCalls[0].sql)
 	}
-	if got := tx.execCalls[0].args[8]; got != false {
+	if got := tx.execCalls[0].args[9]; got != false {
 		t.Fatalf("billable arg = %#v, want false", got)
+	}
+	if got := tx.execCalls[0].args[6]; got != string(AccessCredentialSessionAuth) {
+		t.Fatalf("access credential arg = %#v", got)
 	}
 }
 
-func TestRecordUsageHostedDebitsWallet(t *testing.T) {
+func TestRecordUsagePlatformHostedDebitsWallet(t *testing.T) {
 	t.Parallel()
 
 	tx := &txRecorder{}
@@ -180,12 +217,12 @@ func TestRecordUsageHostedDebitsWallet(t *testing.T) {
 		Pricing: DefaultPricingCatalog(),
 	}
 
-	expectedCost, _, err := svc.Pricing.Estimate("oai-resp/gpt-5-mini", 1200, 200, 1400)
+	estimate, err := svc.Pricing.Estimate("oai-resp/gpt-5-mini", types.Usage{InputTokens: 1200, OutputTokens: 200, TotalTokens: 1400}, PricingContext{})
 	if err != nil {
 		t.Fatalf("Estimate() error = %v", err)
 	}
 
-	err = svc.RecordUsage(context.Background(), "org_123", "conv_123", "msg_123", "chat_stream", "oai-resp/gpt-5-mini", KeySourceHosted, 1200, 200, 1400, map[string]any{
+	err = svc.RecordUsage(context.Background(), "org_123", "conv_123", "msg_123", "chat_stream", "oai-resp/gpt-5-mini", KeySourcePlatformHosted, AccessCredentialGatewayAPIKey, types.Usage{InputTokens: 1200, OutputTokens: 200, TotalTokens: 1400}, map[string]any{
 		"via": "test",
 	})
 	if err != nil {
@@ -194,14 +231,17 @@ func TestRecordUsageHostedDebitsWallet(t *testing.T) {
 	if len(tx.execCalls) != 2 {
 		t.Fatalf("len(execCalls) = %d, want 2", len(tx.execCalls))
 	}
-	if got := tx.execCalls[0].args[8]; got != true {
+	if got := tx.execCalls[0].args[9]; got != true {
 		t.Fatalf("billable arg = %#v, want true", got)
+	}
+	if got := tx.execCalls[0].args[6]; got != string(AccessCredentialGatewayAPIKey) {
+		t.Fatalf("access credential arg = %#v", got)
 	}
 	if !strings.Contains(tx.execCalls[1].sql, "INSERT INTO wallet_ledger") {
 		t.Fatalf("second exec sql = %q", tx.execCalls[1].sql)
 	}
-	if got := tx.execCalls[1].args[2]; got != -expectedCost {
-		t.Fatalf("wallet debit = %#v, want %d", got, -expectedCost)
+	if got := tx.execCalls[1].args[2]; got != -estimate.BilledCents {
+		t.Fatalf("wallet debit = %#v, want %d", got, -estimate.BilledCents)
 	}
 }
 
@@ -240,7 +280,7 @@ func TestCreateTopupCheckoutRejectsInvalidAmount(t *testing.T) {
 	}
 }
 
-func TestRecordUsageHostedRejectsUnknownModel(t *testing.T) {
+func TestRecordUsagePlatformHostedRejectsUnknownModel(t *testing.T) {
 	t.Parallel()
 
 	svc := &AppServices{
@@ -248,13 +288,13 @@ func TestRecordUsageHostedRejectsUnknownModel(t *testing.T) {
 		Pricing: DefaultPricingCatalog(),
 	}
 
-	err := svc.RecordUsage(context.Background(), "org_123", "", "", "chat_stream", "unknown/model", KeySourceHosted, 10, 10, 20, nil)
+	err := svc.RecordUsage(context.Background(), "org_123", "", "", "chat_stream", "unknown/model", KeySourcePlatformHosted, AccessCredentialSessionAuth, types.Usage{InputTokens: 10, OutputTokens: 10, TotalTokens: 20}, nil)
 	if err == nil {
 		t.Fatal("RecordUsage() expected error for unknown hosted model")
 	}
 }
 
-func TestResolveHostedHeadersPassesThroughBYOKWhenHostedDisabled(t *testing.T) {
+func TestResolveExecutionHeaders_BrowserBYOKHonorsWorkspaceSetting(t *testing.T) {
 	t.Parallel()
 
 	svc := &AppServices{
@@ -268,15 +308,9 @@ func TestResolveHostedHeadersPassesThroughBYOKWhenHostedDisabled(t *testing.T) {
 	headers := http.Header{}
 	headers.Set("X-Provider-Key-Anthropic", "sk-ant")
 
-	out, source, err := svc.ResolveHostedHeaders(context.Background(), "org_123", headers, false)
-	if err != nil {
-		t.Fatalf("ResolveHostedHeaders() error = %v", err)
-	}
-	if source != KeySourceExternalBYOK {
-		t.Fatalf("ResolveHostedHeaders() source = %q", source)
-	}
-	if got := out.Get("X-Provider-Key-Anthropic"); got != "sk-ant" {
-		t.Fatalf("ResolveHostedHeaders() anthropic header = %q", got)
+	_, _, err := svc.ResolveExecutionHeaders(context.Background(), "org_123", headers, KeySourceCustomerBYOKBrowser, AccessCredentialSessionAuth)
+	if err == nil {
+		t.Fatal("ResolveExecutionHeaders() expected browser BYOK policy error")
 	}
 }
 
@@ -339,7 +373,7 @@ func TestNewDefaultsTopupOptionsAndModel(t *testing.T) {
 	}
 }
 
-func TestResolveHostedHeadersPropagatesOrgLookupError(t *testing.T) {
+func TestResolveExecutionHeadersPropagatesOrgLookupError(t *testing.T) {
 	t.Parallel()
 
 	svc := &AppServices{
@@ -350,8 +384,8 @@ func TestResolveHostedHeadersPropagatesOrgLookupError(t *testing.T) {
 		},
 	}
 
-	_, _, err := svc.ResolveHostedHeaders(context.Background(), "org_123", nil, false)
+	_, _, err := svc.ResolveExecutionHeaders(context.Background(), "org_123", nil, "", AccessCredentialGatewayAPIKey)
 	if err == nil {
-		t.Fatal("ResolveHostedHeaders() expected error")
+		t.Fatal("ResolveExecutionHeaders() expected error")
 	}
 }

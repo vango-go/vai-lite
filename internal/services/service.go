@@ -16,18 +16,26 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/stripe/stripe-go/v84"
 	"github.com/vango-go/vai-lite/pkg/core/types"
+	neon "github.com/vango-go/vango-neon"
 	s3store "github.com/vango-go/vango-s3"
 	wos "github.com/vango-go/vango-workos"
-	neon "github.com/vango-go/vango-neon"
 	wosvault "github.com/workos/workos-go/v6/pkg/vault"
 )
 
 type KeySource string
 
 const (
-	KeySourceHosted      KeySource = "hosted"
-	KeySourceBrowserBYOK KeySource = "browser_byok"
-	KeySourceExternalBYOK KeySource = "external_byok"
+	KeySourcePlatformHosted       KeySource = "platform_hosted"
+	KeySourceCustomerBYOKBrowser  KeySource = "customer_byok_browser"
+	KeySourceCustomerBYOKVault    KeySource = "customer_byok_vault"
+	KeySourceCustomerBYOKExternal KeySource = "customer_byok_external"
+)
+
+type AccessCredential string
+
+const (
+	AccessCredentialSessionAuth   AccessCredential = "session_auth"
+	AccessCredentialGatewayAPIKey AccessCredential = "gateway_api_key"
 )
 
 type UserIdentity struct {
@@ -48,6 +56,7 @@ type AppServices struct {
 	Vault         *wosvault.Client
 	BlobStore     s3store.Store
 	Pricing       *PricingCatalog
+	vaultRead     func(ctx context.Context, name string) (string, error)
 }
 
 const (
@@ -56,11 +65,11 @@ const (
 )
 
 type Organization struct {
-	ID                string
-	Name              string
-	AllowBYOKOverride bool
+	ID                 string
+	Name               string
+	AllowBYOKOverride  bool
 	HostedUsageEnabled bool
-	DefaultModel      string
+	DefaultModel       string
 }
 
 type Conversation struct {
@@ -96,12 +105,12 @@ type ConversationDetail struct {
 }
 
 type APIKeyRecord struct {
-	ID         string
-	Name       string
+	ID          string
+	Name        string
 	TokenPrefix string
-	CreatedAt  time.Time
-	LastUsedAt *time.Time
-	RevokedAt  *time.Time
+	CreatedAt   time.Time
+	LastUsedAt  *time.Time
+	RevokedAt   *time.Time
 }
 
 type CreatedAPIKey struct {
@@ -110,10 +119,10 @@ type CreatedAPIKey struct {
 }
 
 type ProviderSecretRecord struct {
-	ID          string
-	Provider    string
-	ObjectName  string
-	UpdatedAt   time.Time
+	ID         string
+	Provider   string
+	ObjectName string
+	UpdatedAt  time.Time
 }
 
 type WalletEntry struct {
@@ -125,21 +134,23 @@ type WalletEntry struct {
 }
 
 type UsageEntry struct {
-	ID                 string
-	Model              string
-	KeySource          KeySource
-	Billable           bool
-	InputTokens        int
-	OutputTokens       int
-	TotalTokens        int
-	EstimatedCostCents int64
-	CreatedAt          time.Time
+	ID                  string
+	Model               string
+	KeySource           KeySource
+	AccessCredential    AccessCredential
+	Billable            bool
+	InputTokens         int
+	OutputTokens        int
+	TotalTokens         int
+	EstimatedCostCents  int64
+	PricingSnapshotJSON string
+	CreatedAt           time.Time
 }
 
 type TopupIntent struct {
-	ID         string
+	ID          string
 	AmountCents int64
-	Status     string
+	Status      string
 	CheckoutURL string
 }
 
@@ -173,6 +184,16 @@ func New(db neon.DB, baseURL, defaultModel, stripeSecret, stripeWebhook string, 
 		Vault:         vaultClient,
 		BlobStore:     blobStore,
 		Pricing:       DefaultPricingCatalog(),
+		vaultRead: func(ctx context.Context, name string) (string, error) {
+			if vaultClient == nil {
+				return "", errors.New("WorkOS Vault is not configured")
+			}
+			obj, err := vaultClient.ReadObjectByName(ctx, wosvault.ReadObjectByNameOpts{Name: name})
+			if err != nil {
+				return "", err
+			}
+			return obj.Value, nil
+		},
 	}
 }
 
@@ -296,7 +317,7 @@ func (s *AppServices) CreateConversation(ctx context.Context, actor UserIdentity
 	}
 	model = defaultModelOr(model)
 	if keySource == "" {
-		keySource = KeySourceHosted
+		keySource = KeySourcePlatformHosted
 	}
 	if _, err := s.DB.Exec(ctx, `
 INSERT INTO conversations (id, org_id, created_by, title, model, key_source)
@@ -401,7 +422,7 @@ ORDER BY created_at`,
 func (s *AppServices) UpdateConversationSettings(ctx context.Context, actor UserIdentity, conversationID, model string, keySource KeySource) error {
 	model = defaultModelOr(model)
 	if keySource == "" {
-		keySource = KeySourceHosted
+		keySource = KeySourcePlatformHosted
 	}
 	tag, err := s.DB.Exec(ctx, `
 UPDATE conversations
@@ -426,7 +447,7 @@ func (s *AppServices) AddUserMessage(ctx context.Context, actor UserIdentity, co
 		return nil, errors.New("message body is required")
 	}
 	if keySource == "" {
-		keySource = KeySourceHosted
+		keySource = KeySourcePlatformHosted
 	}
 
 	msg := &ConversationMessage{
@@ -484,7 +505,7 @@ WHERE id = $3 AND org_id = $4`,
 
 func (s *AppServices) AddAssistantMessage(ctx context.Context, actor UserIdentity, conversationID, body string, keySource KeySource, usage types.Usage, toolTrace any) (*ConversationMessage, error) {
 	if keySource == "" {
-		keySource = KeySourceHosted
+		keySource = KeySourcePlatformHosted
 	}
 	usageJSON, err := json.Marshal(usage)
 	if err != nil {
@@ -829,30 +850,59 @@ WHERE id = $1`,
 	return err
 }
 
-func (s *AppServices) ResolveHostedHeaders(ctx context.Context, orgID string, requestHeaders http.Header, forceHosted bool) (http.Header, KeySource, error) {
+func (s *AppServices) ResolveExecutionHeaders(ctx context.Context, orgID string, requestHeaders http.Header, requestedMode KeySource, accessCredential AccessCredential) (http.Header, KeySource, error) {
 	headers := cloneHeaders(requestHeaders)
 	org, err := s.Org(ctx, orgID)
 	if err != nil {
 		return nil, "", err
 	}
 
-	existingBYOK := hasProviderKeyHeader(headers)
-	if !org.HostedUsageEnabled {
-		if existingBYOK {
-			return headers, KeySourceExternalBYOK, nil
+	switch accessCredential {
+	case AccessCredentialGatewayAPIKey:
+		if hasProviderKeyHeader(headers) {
+			return headers, KeySourceCustomerBYOKExternal, nil
 		}
-		return headers, "", nil
-	}
-	if existingBYOK && !forceHosted && org.AllowBYOKOverride {
-		return headers, KeySourceExternalBYOK, nil
-	}
-	if s.Vault == nil {
-		if existingBYOK {
-			return headers, KeySourceExternalBYOK, nil
+		if !org.HostedUsageEnabled {
+			return nil, "", errors.New("VAI-hosted access is disabled for this workspace")
 		}
-		return headers, "", nil
+		return stripProviderKeyHeaders(headers), KeySourcePlatformHosted, nil
+	case AccessCredentialSessionAuth, "":
+		switch requestedMode {
+		case KeySourceCustomerBYOKBrowser:
+			if !org.AllowBYOKOverride {
+				return nil, "", errors.New("browser BYOK is disabled for this workspace")
+			}
+			if !hasProviderKeyHeader(headers) {
+				return nil, "", errors.New("no browser BYOK header provided")
+			}
+			return headers, KeySourceCustomerBYOKBrowser, nil
+		case KeySourceCustomerBYOKVault:
+			headers = stripProviderKeyHeaders(headers)
+			applied, err := s.injectWorkspaceProviderHeaders(ctx, orgID, headers)
+			if err != nil {
+				return nil, "", err
+			}
+			if !applied {
+				return nil, "", errors.New("no workspace provider keys stored")
+			}
+			return headers, KeySourceCustomerBYOKVault, nil
+		case "", KeySourcePlatformHosted:
+			if !org.HostedUsageEnabled {
+				return nil, "", errors.New("VAI-hosted access is disabled for this workspace")
+			}
+			return stripProviderKeyHeaders(headers), KeySourcePlatformHosted, nil
+		default:
+			return nil, "", fmt.Errorf("unsupported execution mode %q", requestedMode)
+		}
+	default:
+		return nil, "", fmt.Errorf("unsupported access credential %q", accessCredential)
 	}
+}
 
+func (s *AppServices) injectWorkspaceProviderHeaders(ctx context.Context, orgID string, headers http.Header) (bool, error) {
+	if s.vaultRead == nil {
+		return false, errors.New("WorkOS Vault is not configured")
+	}
 	rows, err := s.DB.Query(ctx, `
 SELECT provider, object_name
 FROM provider_secrets
@@ -860,43 +910,35 @@ WHERE org_id = $1 AND deleted_at IS NULL`,
 		orgID,
 	)
 	if err != nil {
-		return nil, "", err
+		return false, err
 	}
 	defer rows.Close()
 
-	hostedApplied := false
+	applied := false
 	for rows.Next() {
 		var provider, objectName string
 		if err := rows.Scan(&provider, &objectName); err != nil {
-			return nil, "", err
+			return false, err
 		}
 		headerName := providerHeader(provider)
 		if headerName == "" {
 			continue
 		}
-		obj, err := s.Vault.ReadObjectByName(ctx, wosvault.ReadObjectByNameOpts{Name: objectName})
+		value, err := s.vaultRead(ctx, objectName)
 		if err != nil {
-			return nil, "", fmt.Errorf("read hosted provider secret for %s: %w", provider, err)
+			return false, fmt.Errorf("read workspace provider secret for %s: %w", provider, err)
 		}
-		if strings.TrimSpace(obj.Value) == "" {
+		value = strings.TrimSpace(value)
+		if value == "" {
 			continue
 		}
-		if forceHosted || !org.AllowBYOKOverride || headers.Get(headerName) == "" {
-			headers.Set(headerName, obj.Value)
-			hostedApplied = true
-		}
+		headers.Set(headerName, value)
+		applied = true
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", err
+		return false, err
 	}
-	switch {
-	case hostedApplied:
-		return headers, KeySourceHosted, nil
-	case existingBYOK:
-		return headers, KeySourceExternalBYOK, nil
-	default:
-		return headers, "", nil
-	}
+	return applied, nil
 }
 
 func (s *AppServices) CurrentBalance(ctx context.Context, orgID string) (int64, error) {
@@ -939,7 +981,7 @@ LIMIT 50`,
 
 func (s *AppServices) Usage(ctx context.Context, orgID string) ([]UsageEntry, error) {
 	rows, err := s.DB.Query(ctx, `
-SELECT id, model, key_source, billable, input_tokens, output_tokens, total_tokens, estimated_cost_cents, created_at
+SELECT id, model, key_source, access_credential, billable, input_tokens, output_tokens, total_tokens, estimated_cost_cents, pricing_snapshot::text, created_at
 FROM usage_events
 WHERE org_id = $1
 ORDER BY created_at DESC
@@ -954,7 +996,7 @@ LIMIT 100`,
 	var out []UsageEntry
 	for rows.Next() {
 		var entry UsageEntry
-		if err := rows.Scan(&entry.ID, &entry.Model, &entry.KeySource, &entry.Billable, &entry.InputTokens, &entry.OutputTokens, &entry.TotalTokens, &entry.EstimatedCostCents, &entry.CreatedAt); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.Model, &entry.KeySource, &entry.AccessCredential, &entry.Billable, &entry.InputTokens, &entry.OutputTokens, &entry.TotalTokens, &entry.EstimatedCostCents, &entry.PricingSnapshotJSON, &entry.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, entry)
@@ -962,30 +1004,40 @@ LIMIT 100`,
 	return out, rows.Err()
 }
 
-func (s *AppServices) ReserveHostedUsage(ctx context.Context, orgID string) error {
+func (s *AppServices) ReservePlatformHostedUsage(ctx context.Context, orgID, model string) error {
+	estimate, err := s.Pricing.Estimate(model, types.Usage{InputTokens: 1, TotalTokens: 1}, PricingContext{})
+	if err != nil {
+		return err
+	}
 	balance, err := s.CurrentBalance(ctx, orgID)
 	if err != nil {
 		return err
 	}
-	if balance <= 0 {
-		return errors.New("hosted credits depleted")
+	if balance < estimate.Snapshot.MinimumChargeCents {
+		return errors.New("VAI credits depleted")
 	}
 	return nil
 }
 
-func (s *AppServices) RecordUsage(ctx context.Context, orgID, conversationID, messageID, requestKind, model string, keySource KeySource, inputTokens, outputTokens, totalTokens int, metadata map[string]any) error {
+func (s *AppServices) RecordUsage(ctx context.Context, orgID, conversationID, messageID, requestKind, model string, keySource KeySource, accessCredential AccessCredential, usage types.Usage, metadata map[string]any) error {
 	provider := "unknown"
 	if idx := strings.Index(model, "/"); idx > 0 {
 		provider = model[:idx]
 	}
 
-	billable := keySource == KeySourceHosted
-	estimatedCost, version, err := s.Pricing.Estimate(model, inputTokens, outputTokens, totalTokens)
-	if err != nil {
-		if billable {
+	billable := keySource == KeySourcePlatformHosted
+	estimatedCost := int64(0)
+	version := ""
+	pricingSnapshotJSON := "{}"
+	if billable {
+		estimate, err := s.Pricing.Estimate(model, usage, PricingContextFromMetadata(metadata))
+		if err != nil {
 			return err
 		}
-		estimatedCost = 0
+		estimatedCost = estimate.BilledCents
+		version = estimate.Snapshot.CatalogVersion
+		pricingSnapshotJSON = estimate.Snapshot.JSON()
+	} else if s.Pricing != nil {
 		version = s.Pricing.Version
 	}
 	metaJSON, _ := json.Marshal(metadata)
@@ -993,9 +1045,9 @@ func (s *AppServices) RecordUsage(ctx context.Context, orgID, conversationID, me
 
 	return neon.WithTx(ctx, s.DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
-INSERT INTO usage_events (id, org_id, conversation_id, message_id, request_kind, key_source, provider, model, billable, input_tokens, output_tokens, total_tokens, estimated_cost_cents, pricing_version, metadata)
-VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)`,
-			usageID, orgID, conversationID, messageID, requestKind, string(keySource), provider, model, billable, inputTokens, outputTokens, totalTokens, estimatedCost, version, string(metaJSON),
+INSERT INTO usage_events (id, org_id, conversation_id, message_id, request_kind, key_source, access_credential, provider, model, billable, input_tokens, output_tokens, total_tokens, estimated_cost_cents, pricing_version, pricing_snapshot, metadata)
+VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17::jsonb)`,
+			usageID, orgID, conversationID, messageID, requestKind, string(keySource), string(accessCredential), provider, model, billable, usage.InputTokens, usage.OutputTokens, usage.TotalTokens, estimatedCost, version, pricingSnapshotJSON, string(metaJSON),
 		); err != nil {
 			return err
 		}
@@ -1005,7 +1057,7 @@ VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $1
 		_, err := tx.Exec(ctx, `
 INSERT INTO wallet_ledger (id, org_id, kind, amount_cents, currency, description, external_ref, metadata)
 VALUES ($1, $2, 'debit', $3, 'usd', $4, $5, $6::jsonb)`,
-			newID("wlt"), orgID, -estimatedCost, fmt.Sprintf("Hosted gateway usage for %s", model), usageID, string(metaJSON),
+			newID("wlt"), orgID, -estimatedCost, fmt.Sprintf("VAI-hosted usage for %s", model), usageID, string(metaJSON),
 		)
 		return err
 	})
@@ -1029,7 +1081,7 @@ func (s *AppServices) CreateTopupCheckout(ctx context.Context, actor UserIdentit
 			{
 				Quantity: stripe.Int64(1),
 				PriceData: &stripe.CheckoutSessionCreateLineItemPriceDataParams{
-					Currency: stripe.String(string(stripe.CurrencyUSD)),
+					Currency:   stripe.String(string(stripe.CurrencyUSD)),
 					UnitAmount: stripe.Int64(amountCents),
 					ProductData: &stripe.CheckoutSessionCreateLineItemPriceDataProductDataParams{
 						Name: stripe.String(fmt.Sprintf("$%.2f wallet top-up", float64(amountCents)/100)),
@@ -1287,6 +1339,15 @@ func hasProviderKeyHeader(headers http.Header) bool {
 		}
 	}
 	return false
+}
+
+func stripProviderKeyHeaders(headers http.Header) http.Header {
+	for key := range headers {
+		if strings.HasPrefix(http.CanonicalHeaderKey(key), "X-Provider-Key-") {
+			headers.Del(key)
+		}
+	}
+	return headers
 }
 
 func validateTopupAmount(amountCents int64) error {

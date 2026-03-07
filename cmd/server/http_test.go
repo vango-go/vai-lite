@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/vango-go/vai-lite/internal/services"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 )
 
@@ -99,5 +100,39 @@ func TestExtractRunResultFromSSE(t *testing.T) {
 	}
 	if got := result.Usage.TotalTokens; got != 125 {
 		t.Fatalf("Usage.TotalTokens = %d", got)
+	}
+}
+
+func TestPricingMetadataForGatewayRequestDetectsAudioAndImage(t *testing.T) {
+	t.Parallel()
+
+	req := &types.MessageRequest{
+		Model: "gem-dev/gemini-3.1-flash-image-preview",
+		Messages: []types.Message{
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.AudioSTTBlock{
+						Type: "audio_stt",
+						Source: types.AudioSource{
+							Type:      "base64",
+							MediaType: "audio/wav",
+							Data:      "AAAA",
+						},
+					},
+				},
+			},
+		},
+		Output: &types.OutputConfig{
+			Modalities: []string{"image"},
+		},
+	}
+
+	meta := pricingMetadataForGatewayRequest(req)
+	if got := meta["input_modality"]; got != string(services.PricingInputModalityAudio) {
+		t.Fatalf("input_modality = %#v, want %q", got, services.PricingInputModalityAudio)
+	}
+	if got := meta["output_modality"]; got != string(services.PricingOutputModalityImage) {
+		t.Fatalf("output_modality = %#v, want %q", got, services.PricingOutputModalityImage)
 	}
 }

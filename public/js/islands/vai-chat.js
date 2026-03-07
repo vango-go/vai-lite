@@ -201,17 +201,28 @@ function saveBYOK(provider, value) {
 function preferredKeySource(props) {
   try {
     const stored = localStorage.getItem(preferredKeySourceStorageKey(props.conversationId));
-    if (stored === "browser_byok" || stored === "hosted") {
+    if (
+      stored === "platform_hosted" ||
+      stored === "customer_byok_browser" ||
+      stored === "customer_byok_vault"
+    ) {
       return stored;
     }
   } catch {}
-  if (props.initialKeySource === "browser_byok") {
-    return "browser_byok";
+  if (
+    props.initialKeySource === "platform_hosted" ||
+    props.initialKeySource === "customer_byok_browser" ||
+    props.initialKeySource === "customer_byok_vault"
+  ) {
+    return props.initialKeySource;
   }
-  if (props.hasHostedProviders) {
-    return "hosted";
+  if (props.platformHostedEnabled) {
+    return "platform_hosted";
   }
-  return "browser_byok";
+  if (props.hasWorkspaceProviders) {
+    return "customer_byok_vault";
+  }
+  return "customer_byok_browser";
 }
 
 function persistPreferredKeySource(conversationId, value) {
@@ -227,17 +238,55 @@ function createElement(html) {
 }
 
 function canUseBrowserBYOK(state) {
-  return state.props.allowBYOKOverride || !state.props.hasHostedProviders;
+  return !!state.props.allowBrowserBYOK;
+}
+
+function canUseWorkspaceBYOK(state) {
+  return !!state.props.hasWorkspaceProviders;
+}
+
+function canUsePlatformHosted(state) {
+  return !!state.props.platformHostedEnabled;
+}
+
+function hostedModelAvailable(state) {
+  return Array.isArray(state.props.hostedModels)
+    ? state.props.hostedModels.some((item) => String(item?.id || "") === String(state.currentModel || ""))
+    : false;
+}
+
+function keySourceLabel(source) {
+  switch (String(source || "")) {
+    case "platform_hosted":
+      return "VAI credits";
+    case "customer_byok_vault":
+      return "Workspace key";
+    case "customer_byok_browser":
+      return "Browser key";
+    case "customer_byok_external":
+      return "External BYOK";
+    default:
+      return source || "unknown";
+  }
 }
 
 function effectiveKeySource(state) {
-  if (state.keySource === "browser_byok" && canUseBrowserBYOK(state)) {
-    return "browser_byok";
+  if (state.keySource === "customer_byok_browser" && canUseBrowserBYOK(state)) {
+    return "customer_byok_browser";
   }
-  if (state.props.hasHostedProviders) {
-    return "hosted";
+  if (state.keySource === "customer_byok_vault" && canUseWorkspaceBYOK(state)) {
+    return "customer_byok_vault";
   }
-  return "browser_byok";
+  if (state.keySource === "platform_hosted" && canUsePlatformHosted(state)) {
+    return "platform_hosted";
+  }
+  if (canUsePlatformHosted(state)) {
+    return "platform_hosted";
+  }
+  if (canUseWorkspaceBYOK(state)) {
+    return "customer_byok_vault";
+  }
+  return "customer_byok_browser";
 }
 
 function byokHeaders(state) {
@@ -358,7 +407,7 @@ function renderMessagesHTML(messages, streaming) {
     return `
       <section class="chat-empty">
         <h2>Start the conversation</h2>
-        <p>Use hosted workspace keys or switch to browser-local BYOK. Responses stream live and render markdown in this island.</p>
+        <p>Choose VAI credits, a workspace key, or browser-local BYOK. Responses stream live and render markdown in this island.</p>
       </section>
     `;
   }
@@ -383,7 +432,7 @@ function renderMessagesHTML(messages, streaming) {
         }">
           <header class="message-meta">
             <span class="message-role">${message.role === "assistant" ? "Assistant" : "You"}</span>
-            <span class="message-source">${escapeHTML(message.keySource || "")}</span>
+            <span class="message-source">${escapeHTML(keySourceLabel(message.keySource || ""))}</span>
             ${
               message.createdAt
                 ? `<time datetime="${escapeHTML(message.createdAt)}">${escapeHTML(
@@ -459,8 +508,8 @@ export function mount(el, props, api) {
           <div class="control-label">Key source</div>
           <div class="segmented" data-role="key-source"></div>
         </div>
-        <div class="control-group control-group-meta">
-          <div class="balance-chip">Wallet <strong data-role="balance"></strong></div>
+          <div class="control-group control-group-meta">
+          <div class="balance-chip">VAI credits <strong data-role="balance"></strong></div>
           <a class="ghost-link" data-role="settings-keys" href="#">Workspace keys</a>
           <a class="ghost-link" data-role="settings-billing" href="#">Billing</a>
         </div>
@@ -545,17 +594,20 @@ export function mount(el, props, api) {
     const current = effectiveKeySource(state);
     const canBrowser = canUseBrowserBYOK(state);
     refs.keySource.innerHTML = `
-      <button type="button" class="segment${current === "hosted" ? " segment-active" : ""}" data-key-source="hosted"${
-        state.props.hasHostedProviders ? "" : ' disabled="disabled"'
-      }>Hosted</button>
-      <button type="button" class="segment${current === "browser_byok" ? " segment-active" : ""}" data-key-source="browser_byok"${
+      <button type="button" class="segment${current === "platform_hosted" ? " segment-active" : ""}" data-key-source="platform_hosted"${
+        canUsePlatformHosted(state) ? "" : ' disabled="disabled"'
+      }>Use VAI credits</button>
+      <button type="button" class="segment${current === "customer_byok_vault" ? " segment-active" : ""}" data-key-source="customer_byok_vault"${
+        canUseWorkspaceBYOK(state) ? "" : ' disabled="disabled"'
+      }>Use workspace key</button>
+      <button type="button" class="segment${current === "customer_byok_browser" ? " segment-active" : ""}" data-key-source="customer_byok_browser"${
         canBrowser ? "" : ' disabled="disabled"'
-      }>Browser BYOK</button>
+      }>Use browser key</button>
     `;
   }
 
   function renderBYOKPanel() {
-    const show = effectiveKeySource(state) === "browser_byok";
+    const show = effectiveKeySource(state) === "customer_byok_browser";
     refs.byokPanel.hidden = !show;
     if (!show) {
       refs.byokPanel.innerHTML = "";
@@ -591,15 +643,21 @@ export function mount(el, props, api) {
   function renderComposerMeta() {
     const source = effectiveKeySource(state);
     const chips = [];
-    chips.push(`<span class="meta-chip">${source === "hosted" ? "Hosted workspace keys" : "Browser-local BYOK"}</span>`);
+    chips.push(`<span class="meta-chip">${escapeHTML(keySourceLabel(source))}</span>`);
     chips.push(`<span class="meta-chip">Model ${escapeHTML(state.currentModel)}</span>`);
     if (state.editMessageId) {
       chips.push(
         `<button type="button" class="ghost-action" data-action="cancel-edit">Cancel edit</button><span class="meta-chip meta-chip-warning">Editing earlier message</span>`,
       );
     }
-    if (source === "hosted" && Number(state.props.currentBalanceCents || 0) <= 0) {
-      chips.push(`<span class="meta-chip meta-chip-danger">Hosted credits depleted</span>`);
+    if (source === "platform_hosted" && !hostedModelAvailable(state)) {
+      chips.push(`<span class="meta-chip meta-chip-danger">Selected model is not available in VAI-hosted mode</span>`);
+    }
+    if (source === "platform_hosted" && Number(state.props.currentBalanceCents || 0) <= 0) {
+      chips.push(`<span class="meta-chip meta-chip-danger">VAI credits depleted</span>`);
+    }
+    if (source === "customer_byok_vault" && !canUseWorkspaceBYOK(state)) {
+      chips.push(`<span class="meta-chip meta-chip-warning">No workspace key stored</span>`);
     }
     refs.composerMeta.innerHTML = chips.join("");
   }
@@ -758,7 +816,7 @@ export function mount(el, props, api) {
       "Content-Type": "application/json",
       "X-CSRF-Token": String(state.props.csrfToken || ""),
     };
-    if (effectiveKeySource(state) === "browser_byok") {
+    if (effectiveKeySource(state) === "customer_byok_browser") {
       Object.assign(headers, byokHeaders(state));
     }
     return headers;
@@ -817,12 +875,20 @@ export function mount(el, props, api) {
     }
 
     const source = effectiveKeySource(state);
-    if (source === "browser_byok" && !hasAnyBYOK(state)) {
+    if (source === "customer_byok_browser" && !hasAnyBYOK(state)) {
       setStatus("Add at least one browser-local provider key before sending with BYOK.", "error");
       return;
     }
-    if (source === "hosted" && Number(state.props.currentBalanceCents || 0) <= 0) {
-      setStatus("Hosted wallet balance is depleted. Add credits or switch to browser-local BYOK.", "error");
+    if (source === "customer_byok_vault" && !canUseWorkspaceBYOK(state)) {
+      setStatus("Store a workspace provider key before using workspace-key mode.", "error");
+      return;
+    }
+    if (source === "platform_hosted" && !hostedModelAvailable(state)) {
+      setStatus("The selected model is not available in VAI-hosted mode. Switch modes or choose a hosted model.", "error");
+      return;
+    }
+    if (source === "platform_hosted" && Number(state.props.currentBalanceCents || 0) <= 0) {
+      setStatus("VAI credits are depleted. Add credits or switch to workspace/browser BYOK.", "error");
       return;
     }
 
@@ -834,7 +900,14 @@ export function mount(el, props, api) {
 
     state.busy = true;
     updateBusyControls();
-    setStatus(source === "hosted" ? "Streaming response with hosted workspace keys…" : "Streaming response with browser-local BYOK…", "neutral");
+    setStatus(
+      source === "platform_hosted"
+        ? "Streaming response with VAI-hosted access…"
+        : source === "customer_byok_vault"
+          ? "Streaming response with workspace BYOK…"
+          : "Streaming response with browser-local BYOK…",
+      "neutral",
+    );
 
     let assistantMessage = normalizeMessage({
       id: `pending_${Date.now()}`,
@@ -880,6 +953,7 @@ export function mount(el, props, api) {
     const payload = {
       conversation_id: String(state.props.conversationId),
       model: state.currentModel,
+      key_source: source,
       message: text,
       attachment_ids: state.pendingAttachments.map((attachment) => attachment.id),
       regenerate,
@@ -920,7 +994,7 @@ export function mount(el, props, api) {
     if (!button || button.disabled) {
       return;
     }
-    state.keySource = button.dataset.keySource || "hosted";
+    state.keySource = button.dataset.keySource || "platform_hosted";
     persistPreferredKeySource(state.props.conversationId, state.keySource);
     renderKeySourceControls();
     renderBYOKPanel();

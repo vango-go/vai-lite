@@ -16,17 +16,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stripe/stripe-go/v84"
+	stripewebhook "github.com/stripe/stripe-go/v84/webhook"
 	"github.com/vango-go/vai-lite/internal/services"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 	workos "github.com/vango-go/vango-workos"
-	"github.com/stripe/stripe-go/v84"
-	stripewebhook "github.com/stripe/stripe-go/v84/webhook"
 )
 
 type chatStreamInput struct {
 	ConversationID string   `json:"conversation_id"`
 	Message        string   `json:"message"`
 	Model          string   `json:"model"`
+	KeySource      string   `json:"key_source"`
 	AttachmentIDs  []string `json:"attachment_ids"`
 	Regenerate     bool     `json:"regenerate"`
 	EditMessageID  string   `json:"edit_message_id"`
@@ -104,7 +105,7 @@ func (s *betaServer) handleNewConversation(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	conv, err := s.services.CreateConversation(r.Context(), actor, "", s.cfg.DefaultModel, services.KeySourceHosted)
+	conv, err := s.services.CreateConversation(r.Context(), actor, "", s.cfg.DefaultModel, services.KeySourcePlatformHosted)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -269,20 +270,14 @@ func (s *betaServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolvedHeaders, keySource, err := s.services.ResolveHostedHeaders(r.Context(), actor.OrgID, r.Header, false)
+	requestedMode := services.KeySource(strings.TrimSpace(in.KeySource))
+	resolvedHeaders, keySource, err := s.services.ResolveExecutionHeaders(r.Context(), actor.OrgID, r.Header, requestedMode, services.AccessCredentialSessionAuth)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if keySource == "" {
-		writeJSONError(w, http.StatusUnauthorized, "no hosted provider keys or browser BYOK header provided")
-		return
-	}
-	if keySource == services.KeySourceExternalBYOK {
-		keySource = services.KeySourceBrowserBYOK
-	}
-	if keySource == services.KeySourceHosted {
-		if err := s.services.ReserveHostedUsage(r.Context(), actor.OrgID); err != nil {
+	if keySource == services.KeySourcePlatformHosted {
+		if err := s.services.ReservePlatformHostedUsage(r.Context(), actor.OrgID, firstNonEmpty(strings.TrimSpace(in.Model), org.DefaultModel)); err != nil {
 			writeJSONError(w, http.StatusPaymentRequired, err.Error())
 			return
 		}
@@ -363,7 +358,7 @@ func (s *betaServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.services.AddAssistantMessage(r.Context(), actor, in.ConversationID, result.Response.TextContent(), keySource, result.Usage, result.Steps); err != nil {
 		s.logger.Error("persist assistant message failed", "error", err)
 	}
-	if err := s.services.RecordUsage(r.Context(), actor.OrgID, in.ConversationID, "", "chat_stream", model, keySource, result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.TotalTokens, map[string]any{
+	if err := s.services.RecordUsage(r.Context(), actor.OrgID, in.ConversationID, "", "chat_stream", model, keySource, services.AccessCredentialSessionAuth, result.Usage, map[string]any{
 		"via": "chat_island",
 	}); err != nil {
 		s.logger.Error("record usage failed", "error", err)
@@ -461,17 +456,21 @@ func (s *betaServer) rawGatewayProxy() http.Handler {
 			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
 
-		resolvedHeaders, keySource, err := s.services.ResolveHostedHeaders(r.Context(), org.ID, r.Header, false)
+		if r.URL.Path == "/v1/models" {
+			req := r.Clone(r.Context())
+			req.Header = cloneForForward(r.Header)
+			s.gateway.ServeHTTP(w, req)
+			return
+		}
+
+		resolvedHeaders, keySource, err := s.services.ResolveExecutionHeaders(r.Context(), org.ID, r.Header, "", services.AccessCredentialGatewayAPIKey)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if keySource == "" && r.URL.Path != "/v1/models" {
-			writeJSONError(w, http.StatusUnauthorized, "no hosted provider keys or BYOK header provided")
-			return
-		}
-		if keySource == services.KeySourceHosted && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/runs:stream") {
-			if err := s.services.ReserveHostedUsage(r.Context(), org.ID); err != nil {
+		if keySource == services.KeySourcePlatformHosted && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/runs:stream") {
+			model := extractGatewayModel(r.URL.Path, body)
+			if err := s.services.ReservePlatformHostedUsage(r.Context(), org.ID, model); err != nil {
 				writeJSONError(w, http.StatusPaymentRequired, err.Error())
 				return
 			}
@@ -501,16 +500,16 @@ func (s *betaServer) recordRawGatewayUsage(ctx context.Context, orgID, path stri
 	}
 	switch path {
 	case "/v1/messages":
-		var req messageRequestEnvelope
+		var req types.MessageRequest
 		_ = json.Unmarshal(body, &req)
 		resp, err := types.UnmarshalMessageResponse(writer.Body())
 		if err != nil {
 			s.logger.Error("parse message response failed", "error", err)
 			return
 		}
-		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_messages", req.Model, keySource, resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.Usage.TotalTokens, map[string]any{"via": "raw_gateway"})
+		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_messages", req.Model, keySource, services.AccessCredentialGatewayAPIKey, resp.Usage, pricingMetadataForGatewayRequest(&req))
 	case "/v1/runs":
-		var req runRequestEnvelope
+		var req types.RunRequest
 		_ = json.Unmarshal(body, &req)
 		var env types.RunResultEnvelope
 		if err := json.Unmarshal(writer.Body(), &env); err != nil || env.Result == nil {
@@ -519,9 +518,9 @@ func (s *betaServer) recordRawGatewayUsage(ctx context.Context, orgID, path stri
 			}
 			return
 		}
-		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_runs", req.Request.Model, keySource, env.Result.Usage.InputTokens, env.Result.Usage.OutputTokens, env.Result.Usage.TotalTokens, map[string]any{"via": "raw_gateway"})
+		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_runs", req.Request.Model, keySource, services.AccessCredentialGatewayAPIKey, env.Result.Usage, pricingMetadataForGatewayRequest(&req.Request))
 	case "/v1/runs:stream":
-		var req runRequestEnvelope
+		var req types.RunRequest
 		_ = json.Unmarshal(body, &req)
 		result, err := extractRunResult(writer.Body())
 		if err != nil || result == nil {
@@ -530,8 +529,102 @@ func (s *betaServer) recordRawGatewayUsage(ctx context.Context, orgID, path stri
 			}
 			return
 		}
-		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_runs_stream", req.Request.Model, keySource, result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.TotalTokens, map[string]any{"via": "raw_gateway"})
+		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_runs_stream", req.Request.Model, keySource, services.AccessCredentialGatewayAPIKey, result.Usage, pricingMetadataForGatewayRequest(&req.Request))
 	}
+}
+
+func extractGatewayModel(path string, body []byte) string {
+	switch path {
+	case "/v1/messages":
+		var req messageRequestEnvelope
+		_ = json.Unmarshal(body, &req)
+		return strings.TrimSpace(req.Model)
+	case "/v1/runs", "/v1/runs:stream":
+		var req runRequestEnvelope
+		_ = json.Unmarshal(body, &req)
+		return strings.TrimSpace(req.Request.Model)
+	default:
+		return ""
+	}
+}
+
+func pricingMetadataForGatewayRequest(req *types.MessageRequest) map[string]any {
+	meta := map[string]any{
+		"via": "raw_gateway",
+	}
+	if req == nil {
+		return meta
+	}
+	if requestHasAudioInput(req) {
+		meta["input_modality"] = string(services.PricingInputModalityAudio)
+	}
+	if requestRequestsImageOutput(req) {
+		meta["output_modality"] = string(services.PricingOutputModalityImage)
+	}
+	return meta
+}
+
+func requestHasAudioInput(req *types.MessageRequest) bool {
+	if req == nil {
+		return false
+	}
+	if types.RequestHasAudioSTT(req) {
+		return true
+	}
+	switch system := req.System.(type) {
+	case []types.ContentBlock:
+		if contentBlocksHaveAudioInput(system) {
+			return true
+		}
+	}
+	for _, msg := range req.Messages {
+		if contentBlocksHaveAudioInput(msg.ContentBlocks()) {
+			return true
+		}
+	}
+	return false
+}
+
+func contentBlocksHaveAudioInput(blocks []types.ContentBlock) bool {
+	for _, block := range blocks {
+		switch b := block.(type) {
+		case types.AudioBlock, *types.AudioBlock, types.AudioSTTBlock, *types.AudioSTTBlock:
+			return true
+		case types.ToolResultBlock:
+			if contentBlocksHaveAudioInput(b.Content) {
+				return true
+			}
+		case *types.ToolResultBlock:
+			if b != nil && contentBlocksHaveAudioInput(b.Content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func requestRequestsImageOutput(req *types.MessageRequest) bool {
+	if req == nil {
+		return false
+	}
+	if req.Output != nil {
+		for _, modality := range req.Output.Modalities {
+			if strings.EqualFold(strings.TrimSpace(modality), "image") {
+				return true
+			}
+		}
+	}
+	model := strings.ToLower(strings.TrimSpace(req.Model))
+	return strings.Contains(model, "-image") || strings.Contains(model, "image-preview")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (s *betaServer) requireActorHTTP(w http.ResponseWriter, r *http.Request) (services.UserIdentity, bool) {
