@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/vango-go/vai-lite/internal/services"
 	"github.com/vango-go/vango"
 	. "github.com/vango-go/vango/el"
@@ -317,6 +319,26 @@ func (s *betaServer) billingPage(ctx vango.Ctx) *vango.VNode {
 				H1(Text("Wallet billing")),
 				P(Textf("Current balance: %s", centsLabel(balance))),
 				P(Text("Hosted requests debit the wallet only when organization-managed Vault keys are used. Browser BYOK requests remain non-billable.")),
+				s.postForm(ctx, "/actions/billing/topup",
+					Class("topup-card"),
+					Div(
+						Class("stack"),
+						Label(Text("Add credits (USD)")),
+						Input(
+							Type("number"),
+							Name("amount_usd"),
+							Placeholder("25.00"),
+							Attr("min", "1.00"),
+							Attr("max", "10000.00"),
+							Attr("step", "0.01"),
+							Attr("inputmode", "decimal"),
+							Attr("required", "required"),
+						),
+						P(Text("Enter any amount between $1.00 and $10,000.00.")),
+						Button(Type("submit"), Class("btn btn-primary"), Text("Checkout with Stripe")),
+					),
+				),
+				H2(Text("Suggested amounts")),
 				Div(
 					Class("topup-grid"),
 					RangeKeyed(s.cfg.TopupOptions,
@@ -326,7 +348,7 @@ func (s *betaServer) billingPage(ctx vango.Ctx) *vango.VNode {
 								Class("topup-card"),
 								Input(Type("hidden"), Name("amount_cents"), Value(fmt.Sprintf("%d", item))),
 								Strong(Text(centsLabel(item))),
-								P(Text("Stripe hosted checkout")),
+								P(Text("Quick add")),
 								Button(Type("submit"), Class("btn btn-primary"), Text("Add credits")),
 							)
 						},
@@ -387,6 +409,16 @@ func (s *betaServer) currentActorPage(ctx vango.Ctx) (services.UserIdentity, *se
 	}
 	org, err := s.services.Org(ctx.StdContext(), actor.OrgID)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, pgx.ErrNoRows) {
+			s.logger.Warn("using fallback org projection", "org_id", actor.OrgID, "error", err)
+			return actor, &services.Organization{
+				ID:                 actor.OrgID,
+				Name:               actor.Name + "'s workspace",
+				AllowBYOKOverride:  false,
+				HostedUsageEnabled: true,
+				DefaultModel:       s.cfg.DefaultModel,
+			}, true
+		}
 		s.logger.Error("load org failed", "error", err)
 		return services.UserIdentity{}, nil, false
 	}

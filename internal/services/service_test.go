@@ -232,11 +232,10 @@ func TestCreateTopupCheckoutRejectsInvalidAmount(t *testing.T) {
 
 	svc := &AppServices{
 		StripeClient: &stripe.Client{},
-		TopupOptions: []int64{1000, 2500},
 	}
 
-	_, err := svc.CreateTopupCheckout(context.Background(), UserIdentity{OrgID: "org_123", UserID: "user_123"}, 9999)
-	if err == nil || !strings.Contains(err.Error(), "invalid top-up amount") {
+	_, err := svc.CreateTopupCheckout(context.Background(), UserIdentity{OrgID: "org_123", UserID: "user_123"}, 99)
+	if err == nil || !strings.Contains(err.Error(), "at least") {
 		t.Fatalf("CreateTopupCheckout() error = %v", err)
 	}
 }
@@ -314,14 +313,17 @@ func TestMessageTitleShortensLongBodies(t *testing.T) {
 	}
 }
 
-func TestContainsAmount(t *testing.T) {
+func TestValidateTopupAmount(t *testing.T) {
 	t.Parallel()
 
-	if !containsAmount([]int64{1000, 2500}, 2500) {
-		t.Fatal("containsAmount() = false, want true")
+	if err := validateTopupAmount(MinTopupAmountCents); err != nil {
+		t.Fatalf("validateTopupAmount(min) error = %v", err)
 	}
-	if containsAmount([]int64{1000, 2500}, 5000) {
-		t.Fatal("containsAmount() = true, want false")
+	if err := validateTopupAmount(MinTopupAmountCents - 1); err == nil {
+		t.Fatal("validateTopupAmount() expected low amount error")
+	}
+	if err := validateTopupAmount(MaxTopupAmountCents + 1); err == nil {
+		t.Fatal("validateTopupAmount() expected high amount error")
 	}
 }
 

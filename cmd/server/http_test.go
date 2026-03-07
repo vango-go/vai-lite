@@ -19,6 +19,47 @@ func TestParseInt64Value(t *testing.T) {
 	}
 }
 
+func TestParseUSDCents(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want int64
+	}{
+		{name: "whole dollars", in: "25", want: 2500},
+		{name: "two decimals", in: "25.50", want: 2550},
+		{name: "one decimal", in: "25.5", want: 2550},
+		{name: "leading dollar", in: "$1.25", want: 125},
+		{name: "commas", in: "1,234.56", want: 123456},
+		{name: "fraction only", in: ".99", want: 99},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := parseUSDCents(tt.in)
+			if err != nil {
+				t.Fatalf("parseUSDCents(%q) error = %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseUSDCents(%q) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseUSDCentsRejectsInvalid(t *testing.T) {
+	t.Parallel()
+
+	for _, in := range []string{"", "-1.00", "12.345", "abc"} {
+		if _, err := parseUSDCents(in); err == nil {
+			t.Fatalf("parseUSDCents(%q) expected error", in)
+		}
+	}
+}
+
 func TestExtractRunResultFromSSE(t *testing.T) {
 	t.Parallel()
 

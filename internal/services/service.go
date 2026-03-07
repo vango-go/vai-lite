@@ -50,6 +50,11 @@ type AppServices struct {
 	Pricing       *PricingCatalog
 }
 
+const (
+	MinTopupAmountCents int64 = 100
+	MaxTopupAmountCents int64 = 1_000_000
+)
+
 type Organization struct {
 	ID                string
 	Name              string
@@ -1010,8 +1015,8 @@ func (s *AppServices) CreateTopupCheckout(ctx context.Context, actor UserIdentit
 	if s.StripeClient == nil {
 		return nil, errors.New("Stripe is not configured")
 	}
-	if !containsAmount(s.TopupOptions, amountCents) {
-		return nil, errors.New("invalid top-up amount")
+	if err := validateTopupAmount(amountCents); err != nil {
+		return nil, err
 	}
 	topupID := newID("topup")
 	successURL := s.BaseURL + "/settings/billing?topup=success"
@@ -1059,6 +1064,33 @@ VALUES ($1, $2, $3, $4, 'usd', $5, 'pending', $6::jsonb)`,
 }
 
 func (s *AppServices) ApplyStripeCheckoutCompleted(ctx context.Context, eventID, sessionID, topupID, orgID string, amountCents int64) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("stripe checkout session id is required")
+	}
+	if strings.TrimSpace(topupID) == "" || strings.TrimSpace(orgID) == "" {
+		row := s.DB.QueryRow(ctx, `
+SELECT id, org_id, amount_cents
+FROM stripe_topups
+WHERE checkout_session_id = $1`,
+			sessionID,
+		)
+		var dbTopupID string
+		var dbOrgID string
+		var dbAmountCents int64
+		if err := row.Scan(&dbTopupID, &dbOrgID, &dbAmountCents); err != nil {
+			return fmt.Errorf("resolve stripe top-up by session: %w", err)
+		}
+		if strings.TrimSpace(topupID) == "" {
+			topupID = dbTopupID
+		}
+		if strings.TrimSpace(orgID) == "" {
+			orgID = dbOrgID
+		}
+		if amountCents <= 0 {
+			amountCents = dbAmountCents
+		}
+	}
+
 	return neon.WithTx(ctx, s.DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 INSERT INTO processed_stripe_events (event_id, event_type)
@@ -1072,18 +1104,22 @@ ON CONFLICT (event_id) DO NOTHING`,
 		if tag.RowsAffected() == 0 {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `
+		updateTag, err := tx.Exec(ctx, `
 UPDATE stripe_topups
 SET status = 'completed', completed_at = now()
 WHERE id = $1 AND org_id = $2`,
 			topupID, orgID,
-		); err != nil {
+		)
+		if err != nil {
 			return err
+		}
+		if updateTag.RowsAffected() == 0 {
+			return errors.New("stripe top-up record not found for completion")
 		}
 		_, err = tx.Exec(ctx, `
 INSERT INTO wallet_ledger (id, org_id, kind, amount_cents, currency, description, external_ref, metadata)
 VALUES ($1, $2, 'topup', $3, 'usd', $4, $5, $6::jsonb)
-ON CONFLICT (org_id, external_ref) DO NOTHING`,
+ON CONFLICT (org_id, external_ref) WHERE external_ref IS NOT NULL DO NOTHING`,
 			newID("wlt"), orgID, amountCents, fmt.Sprintf("Stripe top-up via %s", sessionID), sessionID, fmt.Sprintf(`{"topup_id":%q}`, topupID),
 		)
 		return err
@@ -1253,13 +1289,15 @@ func hasProviderKeyHeader(headers http.Header) bool {
 	return false
 }
 
-func containsAmount(options []int64, target int64) bool {
-	for _, option := range options {
-		if option == target {
-			return true
-		}
+func validateTopupAmount(amountCents int64) error {
+	switch {
+	case amountCents < MinTopupAmountCents:
+		return fmt.Errorf("top-up amount must be at least %d cents", MinTopupAmountCents)
+	case amountCents > MaxTopupAmountCents:
+		return fmt.Errorf("top-up amount must be at most %d cents", MaxTopupAmountCents)
+	default:
+		return nil
 	}
-	return false
 }
 
 func hashToken(token string) string {

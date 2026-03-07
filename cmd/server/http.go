@@ -187,7 +187,7 @@ func (s *betaServer) handleBillingTopup(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	amountCents, err := parseInt64Value(r.FormValue("amount_cents"))
+	amountCents, err := parseBillingTopupAmount(r)
 	if err != nil {
 		http.Error(w, "invalid amount", http.StatusBadRequest)
 		return
@@ -373,16 +373,32 @@ func (s *betaServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 func (s *betaServer) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 	secret := strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET"))
 	if secret == "" {
+		s.logger.Warn("stripe webhook secret missing")
 		http.Error(w, "stripe webhook secret not configured", http.StatusInternalServerError)
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
+		s.logger.Warn("stripe webhook body read failed", "error", err)
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	event, err := stripewebhook.ConstructEvent(body, r.Header.Get("Stripe-Signature"), secret)
+	event, err := stripewebhook.ConstructEventWithOptions(
+		body,
+		r.Header.Get("Stripe-Signature"),
+		secret,
+		stripewebhook.ConstructEventOptions{
+			IgnoreAPIVersionMismatch: true,
+		},
+	)
 	if err != nil {
+		s.logger.Warn("stripe webhook signature verification failed",
+			"error", err,
+			"secret_suffix", secretSuffix(secret),
+			"secret_len", len(secret),
+			"signature_present", r.Header.Get("Stripe-Signature") != "",
+			"body_len", len(body),
+		)
 		http.Error(w, "invalid signature", http.StatusBadRequest)
 		return
 	}
@@ -396,6 +412,13 @@ func (s *betaServer) handleStripeWebhook(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
+	s.logger.Info("stripe checkout completed received",
+		"event_id", event.ID,
+		"session_id", session.ID,
+		"metadata_topup_id", session.Metadata["topup_id"],
+		"metadata_org_id", session.Metadata["org_id"],
+		"amount_total", session.AmountTotal,
+	)
 	amountCents := int64(0)
 	if session.AmountTotal > 0 {
 		amountCents = session.AmountTotal
@@ -735,6 +758,72 @@ func parseInt64Value(raw string) (int64, error) {
 	return strconv.ParseInt(raw, 10, 64)
 }
 
+func parseBillingTopupAmount(r *http.Request) (int64, error) {
+	if raw := strings.TrimSpace(r.FormValue("amount_usd")); raw != "" {
+		return parseUSDCents(raw)
+	}
+	return parseInt64Value(r.FormValue("amount_cents"))
+}
+
+func parseUSDCents(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "$")
+	raw = strings.ReplaceAll(raw, ",", "")
+	if raw == "" {
+		return 0, errors.New("empty value")
+	}
+	if strings.HasPrefix(raw, "+") {
+		raw = strings.TrimPrefix(raw, "+")
+	}
+	if strings.HasPrefix(raw, "-") {
+		return 0, errors.New("negative value")
+	}
+
+	parts := strings.Split(raw, ".")
+	if len(parts) > 2 {
+		return 0, errors.New("invalid money value")
+	}
+
+	dollarsPart := parts[0]
+	if dollarsPart == "" {
+		dollarsPart = "0"
+	}
+	for _, ch := range dollarsPart {
+		if ch < '0' || ch > '9' {
+			return 0, errors.New("invalid dollars")
+		}
+	}
+
+	centsPart := "00"
+	if len(parts) == 2 {
+		switch len(parts[1]) {
+		case 0:
+			centsPart = "00"
+		case 1:
+			centsPart = parts[1] + "0"
+		case 2:
+			centsPart = parts[1]
+		default:
+			return 0, errors.New("too many decimal places")
+		}
+		for _, ch := range centsPart {
+			if ch < '0' || ch > '9' {
+				return 0, errors.New("invalid cents")
+			}
+		}
+	}
+
+	dollars, err := strconv.ParseInt(dollarsPart, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	cents, err := strconv.ParseInt(centsPart, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return dollars*100 + cents, nil
+}
+
 func lastUserMessageID(messages []services.ConversationMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -742,4 +831,12 @@ func lastUserMessageID(messages []services.ConversationMessage) string {
 		}
 	}
 	return ""
+}
+
+func secretSuffix(secret string) string {
+	secret = strings.TrimSpace(secret)
+	if len(secret) <= 6 {
+		return secret
+	}
+	return secret[len(secret)-6:]
 }
