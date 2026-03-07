@@ -1,0 +1,5 @@
+./cbor.go
+./codec.go
+./json.go
+./registry.go
+./schema_id.go

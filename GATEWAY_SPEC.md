@@ -1734,23 +1734,30 @@ The Go SDK should support routing through the gateway instead of calling provide
 
 ## 16. TypeScript SDK Design
 
-### 16.1 Package layout
+The TypeScript SDK should be defined by the dedicated design document at
+[`TYPESCRIPT_SDK_DESIGN.md`](TYPESCRIPT_SDK_DESIGN.md).
 
-```
-@vango-ai/vai (core)
-├── client      — HTTP/SSE/WS transport
-├── types       — Request/response/event TypeScript types
-├── helpers     — Content constructors, stream extractors
-├── sse         — SSE parser
-├── errors      — Canonical error model
-├── auth        — Header construction
-└── live        — WS protocol client
+This spec keeps only the high-level contract summary:
 
-@vango-ai/vai-node-audio (optional)
-@vango-ai/vai-web-audio  (optional)
-```
+- v1 should be **proxy-first** and gateway-centric, not a direct-provider browser SDK.
+- The SDK should expose the same high-level product primitives as the Go SDK:
+  - `messages.create`
+  - `messages.stream`
+  - `messages.run`
+  - `messages.runStream`
+  - `messages.extract`
+  - `runs.create`
+  - `runs.stream`
+  - `models.list`
+  - `live.connect`
+- `messages.run` and `messages.runStream` should own client-side function tool execution.
+- `runs.*` should remain gateway-owned loop APIs.
+- `live.connect` should remain a separate WebSocket session surface, not a `runStream` flag.
+- Core types should stay close to the gateway wire model and preserve unknown events for forward compatibility.
+- The SDK should use `fetch` + custom SSE parsing, not `EventSource`.
+- The core package should stay runtime-portable across Node, browsers, Bun, Deno, and edge runtimes.
 
-### 16.2 Client configuration
+Illustrative shape:
 
 ```typescript
 const vai = new VAI({
@@ -1758,122 +1765,41 @@ const vai = new VAI({
   gatewayApiKey: "vai_sk_...",
   providerKeys: {
     anthropic: "sk-ant-...",
-    openai: "sk-...",
+    tavily: "tvly-...",
   },
-  defaultModel: "anthropic/claude-sonnet-4",
   timeoutMs: 60_000,
 });
-```
 
-### 16.3 Messages API
-
-**Non-streaming:**
-
-```typescript
 const response = await vai.messages.create({
   model: "anthropic/claude-sonnet-4",
   max_tokens: 1024,
   messages: [{ role: "user", content: "Hello" }],
 });
-```
 
-**Streaming:**
-
-```typescript
-const stream = await vai.messages.stream({
+const run = await vai.messages.run({
   model: "anthropic/claude-sonnet-4",
-  max_tokens: 1024,
-  messages: [{ role: "user", content: "Hello" }],
+  messages: [{ role: "user", content: "Search for the latest Go release" }],
+}, {
+  tools: [getWeather],
+  maxTurns: 8,
 });
 
-for await (const event of stream) {
-  if (event.type === "content_block_delta") {
-    process.stdout.write(event.delta.text);
-  }
-}
-
-const finalResponse = await stream.finalResponse();
-```
-
-### 16.4 Runs API
-
-**Blocking:**
-
-```typescript
-const result = await vai.runs.create({
+const stream = await vai.runs.stream({
   request: {
     model: "anthropic/claude-sonnet-4",
-    max_tokens: 4096,
-    messages: [{ role: "user", content: "Search for latest Go release" }],
+    messages: [{ role: "user", content: "Search for the latest Go release" }],
   },
-  run: { max_turns: 8, max_tool_calls: 20 },
-  server_tools: ["vai_web_search"],
-  server_tool_config: { vai_web_search: { provider: "tavily" } },
-});
-```
-
-**Streaming:**
-
-```typescript
-const stream = await vai.runs.stream({
-  request: { ... },
   run: { max_turns: 8 },
   server_tools: ["vai_web_search"],
   server_tool_config: { vai_web_search: { provider: "tavily" } },
 });
 
-for await (const event of stream) {
-  switch (event.type) {
-    case "stream_event":
-      // Handle wrapped provider events (text deltas, etc.)
-      break;
-    case "tool_call_start":
-      console.log(`Tool: ${event.name}(${JSON.stringify(event.input)})`);
-      break;
-    case "tool_result":
-      console.log(`Result: ${event.content[0].text}`);
-      break;
-    case "run_complete":
-      console.log(`Done: ${event.result.stop_reason}`);
-      break;
-  }
-}
-```
-
-### 16.5 Live audio client
-
-```typescript
 const session = await vai.live.connect({
-  model: "anthropic/claude-sonnet-4",
-  audioIn: { encoding: "pcm_s16le", sample_rate_hz: 16000, channels: 1 },
-  audioOut: { encoding: "pcm_s16le", sample_rate_hz: 24000, channels: 1 },
-  features: { send_playback_marks: true, want_partial_transcripts: true },
+  request: {
+    model: "anthropic/claude-sonnet-4",
+    messages: [],
+  },
 });
-
-session.sendAudioFrame(pcmBuffer);
-session.sendPlaybackMark({ assistant_audio_id: "a_42", played_ms: 1530, state: "playing" });
-
-for await (const event of session.events()) {
-  // Handle transcript_delta, assistant_audio_chunk, audio_reset, etc.
-}
-```
-
-### 16.6 Error model
-
-```typescript
-class VAIError extends Error {
-  type: string;        // "invalid_request_error", "rate_limit_error", etc.
-  param?: string;
-  code?: string;
-  requestId?: string;
-  retryAfter?: number;
-  providerError?: any;
-  httpStatus: number;
-}
-
-class VAITransportError extends Error {
-  // Network failures, timeouts
-}
 ```
 
 ---

@@ -1,0 +1,30 @@
+{
+  "module": "github.com/vango-go/vai-lite",
+  "routes": {
+    "dir": "app/routes",
+    "output": "app/routes/routes_gen.go",
+    "package": "routes"
+  },
+  "static": {
+    "dir": "public",
+    "prefix": "/"
+  },
+  "dev": {
+    "port": 8000,
+    "appPort": 8888,
+    "hotReload": true
+  },
+  "build": {
+    "output": "dist"
+  },
+  "neon": {
+    "enabled": true,
+    "branch_detection": true
+  },
+  "blob": {
+    "enabled": true,
+    "provider": "r2",
+    "tmp_cleanup_configured": false
+  },
+  "strict": "default"
+}

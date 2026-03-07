@@ -1,0 +1,4 @@
+./disk.go
+./doc.go
+./filename.go
+./upload.go

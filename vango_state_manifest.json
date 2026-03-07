@@ -1,0 +1,8 @@
+{
+  "manifestVersion": "1.0",
+  "anchorFormatVersion": "1.0",
+  "toolVersion": "1.0.0",
+  "buildSchema": "bs:v1:e3b0c44298fc",
+  "primitives": {},
+  "sessionKeys": {}
+}

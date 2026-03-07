@@ -1,0 +1,7 @@
+./anchor.go
+./bindings.go
+./hash.go
+./inspection.go
+./metadata.go
+./session_keys.go
+./setup_callsites.go

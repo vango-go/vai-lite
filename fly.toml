@@ -1,0 +1,40 @@
+app = "vai-lite-beta"
+primary_region = "den"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  release_command = "sh -c 'APP_MIGRATE_ONLY=1 /app/vai-lite-beta'"
+
+[env]
+  APP_ADDR = ":8080"
+  APP_BASE_URL = "https://vai-lite-beta.fly.dev"
+  VANGO_DEV = "0"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/healthz"
+
+  [[http_service.checks]]
+    interval = "20s"
+    timeout = "3s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/readyz"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "1.0",
+  "toolVersion": "1.0.0",
+  "buildSchema": "bs:v1:e3b0c44298fc",
+  "persistedPrimitives": null,
+  "sessionKeys": null,
+  "schemaHash": "sha256:fdc4e2ce2858eba87671a2e66d8ffd4097a2055746362cef162eafd45271131e"
+}
