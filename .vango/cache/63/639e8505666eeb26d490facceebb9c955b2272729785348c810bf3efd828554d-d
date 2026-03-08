@@ -1,0 +1,9 @@
+./auth.go
+./chat.go
+./chat_island.go
+./csrf.go
+./home.go
+./observability.go
+./settings.go
+./shared.go
+./vango_state_bindings_gen.go

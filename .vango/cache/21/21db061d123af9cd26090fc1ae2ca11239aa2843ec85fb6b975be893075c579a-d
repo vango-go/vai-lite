@@ -1,0 +1,3 @@
+./capability_check.go
+./relay.go
+./shell.go

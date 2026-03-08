@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -57,6 +59,7 @@ type AppServices struct {
 	BlobStore     s3store.Store
 	Pricing       *PricingCatalog
 	vaultRead     func(ctx context.Context, name string) (string, error)
+	platformKeys  map[string]string
 }
 
 const (
@@ -184,6 +187,7 @@ func New(db neon.DB, baseURL, defaultModel, stripeSecret, stripeWebhook string, 
 		Vault:         vaultClient,
 		BlobStore:     blobStore,
 		Pricing:       DefaultPricingCatalog(),
+		platformKeys:  loadPlatformProviderKeysFromEnv(),
 		vaultRead: func(ctx context.Context, name string) (string, error) {
 			if vaultClient == nil {
 				return "", errors.New("WorkOS Vault is not configured")
@@ -204,7 +208,55 @@ func defaultModelOr(model string) string {
 	return strings.TrimSpace(model)
 }
 
-func (s *AppServices) EnsureIdentity(ctx context.Context, identity *wos.Identity) (UserIdentity, error) {
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func debugQueryLogEnabled() bool {
+	return strings.TrimSpace(os.Getenv("APP_DEBUG_QUERIES")) == "1"
+}
+
+func logQueryDebug(op string, ctx context.Context, attrs ...any) func(error) {
+	if !debugQueryLogEnabled() {
+		return func(error) {}
+	}
+	start := time.Now()
+	deadlineRemaining := "none"
+	if deadline, ok := ctx.Deadline(); ok {
+		deadlineRemaining = time.Until(deadline).String()
+	}
+	base := []any{
+		"op", op,
+		"deadline_remaining_start", deadlineRemaining,
+	}
+	base = append(base, attrs...)
+	slog.Default().Info("services query start", base...)
+	return func(err error) {
+		endAttrs := []any{
+			"op", op,
+			"elapsed", time.Since(start),
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			endAttrs = append(endAttrs, "deadline_remaining_end", time.Until(deadline).String())
+		} else {
+			endAttrs = append(endAttrs, "deadline_remaining_end", "none")
+		}
+		endAttrs = append(endAttrs, attrs...)
+		if err != nil {
+			endAttrs = append(endAttrs, "error", err)
+			slog.Default().Warn("services query failed", endAttrs...)
+			return
+		}
+		slog.Default().Info("services query done", endAttrs...)
+	}
+}
+
+func ActorFromIdentity(identity *wos.Identity) (UserIdentity, error) {
 	if identity == nil || strings.TrimSpace(identity.UserID) == "" {
 		return UserIdentity{}, errors.New("missing authenticated identity")
 	}
@@ -216,11 +268,18 @@ func (s *AppServices) EnsureIdentity(ctx context.Context, identity *wos.Identity
 	if name == "" {
 		name = strings.TrimSpace(identity.Email)
 	}
-	user := UserIdentity{
+	return UserIdentity{
 		UserID: identity.UserID,
 		OrgID:  orgID,
 		Email:  strings.TrimSpace(identity.Email),
 		Name:   name,
+	}, nil
+}
+
+func (s *AppServices) EnsureIdentity(ctx context.Context, identity *wos.Identity) (UserIdentity, error) {
+	user, err := ActorFromIdentity(identity)
+	if err != nil {
+		return UserIdentity{}, err
 	}
 
 	if _, err := s.DB.Exec(ctx, `
@@ -272,6 +331,9 @@ SET role = EXCLUDED.role,
 }
 
 func (s *AppServices) Org(ctx context.Context, orgID string) (*Organization, error) {
+	var err error
+	done := logQueryDebug("Org", ctx, "org_id", orgID)
+	defer func() { done(err) }()
 	row := s.DB.QueryRow(ctx, `
 SELECT id, name, allow_byok_override, hosted_usage_enabled, default_model
 FROM app_orgs
@@ -279,13 +341,17 @@ WHERE id = $1`,
 		orgID,
 	)
 	var org Organization
-	if err := row.Scan(&org.ID, &org.Name, &org.AllowBYOKOverride, &org.HostedUsageEnabled, &org.DefaultModel); err != nil {
+	if err = row.Scan(&org.ID, &org.Name, &org.AllowBYOKOverride, &org.HostedUsageEnabled, &org.DefaultModel); err != nil {
 		return nil, err
 	}
 	return &org, nil
 }
 
 func (s *AppServices) ListConversations(ctx context.Context, orgID string) ([]Conversation, error) {
+	var err error
+	done := logQueryDebug("ListConversations", ctx, "org_id", orgID)
+	defer func() { done(err) }()
+
 	rows, err := s.DB.Query(ctx, `
 SELECT id, title, model, key_source, updated_at
 FROM conversations
@@ -301,12 +367,13 @@ ORDER BY updated_at DESC`,
 	var out []Conversation
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &c.KeySource, &c.UpdatedAt); err != nil {
+		if err = rows.Scan(&c.ID, &c.Title, &c.Model, &c.KeySource, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	err = rows.Err()
+	return out, err
 }
 
 func (s *AppServices) CreateConversation(ctx context.Context, actor UserIdentity, title, model string, keySource KeySource) (*Conversation, error) {
@@ -336,6 +403,10 @@ VALUES ($1, $2, $3, $4, $5, $6)`,
 }
 
 func (s *AppServices) Conversation(ctx context.Context, orgID, conversationID string) (*ConversationDetail, error) {
+	var err error
+	done := logQueryDebug("Conversation", ctx, "org_id", orgID, "conversation_id", conversationID)
+	defer func() { done(err) }()
+
 	row := s.DB.QueryRow(ctx, `
 SELECT id, title, model, key_source, updated_at
 FROM conversations
@@ -343,7 +414,7 @@ WHERE id = $1 AND org_id = $2`,
 		conversationID, orgID,
 	)
 	var detail ConversationDetail
-	if err := row.Scan(&detail.Conversation.ID, &detail.Conversation.Title, &detail.Conversation.Model, &detail.Conversation.KeySource, &detail.Conversation.UpdatedAt); err != nil {
+	if err = row.Scan(&detail.Conversation.ID, &detail.Conversation.Title, &detail.Conversation.Model, &detail.Conversation.KeySource, &detail.Conversation.UpdatedAt); err != nil {
 		return nil, err
 	}
 
@@ -363,14 +434,14 @@ ORDER BY created_at`,
 	byID := make(map[string]*ConversationMessage)
 	for rows.Next() {
 		var msg ConversationMessage
-		if err := rows.Scan(&msg.ID, &msg.Role, &msg.BodyText, &msg.KeySource, &msg.UsageJSON, &msg.ToolTrace, &msg.CreatedAt); err != nil {
+		if err = rows.Scan(&msg.ID, &msg.Role, &msg.BodyText, &msg.KeySource, &msg.UsageJSON, &msg.ToolTrace, &msg.CreatedAt); err != nil {
 			return nil, err
 		}
 		detail.Messages = append(detail.Messages, msg)
 		messageIDs = append(messageIDs, msg.ID)
 		byID[msg.ID] = &detail.Messages[len(detail.Messages)-1]
 	}
-	if err := rows.Err(); err != nil {
+	if err = rows.Err(); err != nil {
 		return nil, err
 	}
 	if len(messageIDs) == 0 {
@@ -397,7 +468,7 @@ ORDER BY created_at`,
 			sizeBytes   int64
 			rawBlob     string
 		)
-		if err := attachRows.Scan(&id, &messageID, &filename, &contentType, &sizeBytes, &rawBlob); err != nil {
+		if err = attachRows.Scan(&id, &messageID, &filename, &contentType, &sizeBytes, &rawBlob); err != nil {
 			return nil, err
 		}
 		msg := byID[messageID]
@@ -405,7 +476,7 @@ ORDER BY created_at`,
 			continue
 		}
 		var blob s3store.BlobRef
-		if err := json.Unmarshal([]byte(rawBlob), &blob); err != nil {
+		if err = json.Unmarshal([]byte(rawBlob), &blob); err != nil {
 			return nil, err
 		}
 		msg.Attachments = append(msg.Attachments, Attachment{
@@ -416,7 +487,8 @@ ORDER BY created_at`,
 			BlobRef:     blob,
 		})
 	}
-	return &detail, attachRows.Err()
+	err = attachRows.Err()
+	return &detail, err
 }
 
 func (s *AppServices) UpdateConversationSettings(ctx context.Context, actor UserIdentity, conversationID, model string, keySource KeySource) error {
@@ -707,25 +779,11 @@ WHERE id = $1 AND org_id = $2 AND revoked_at IS NULL`,
 	return nil
 }
 
-func (s *AppServices) ValidateAPIKey(ctx context.Context, token string) (*Organization, error) {
-	hash := hashToken(token)
-	row := s.DB.QueryRow(ctx, `
-SELECT o.id, o.name, o.allow_byok_override, o.hosted_usage_enabled, o.default_model, g.id
-FROM gateway_api_keys g
-JOIN app_orgs o ON o.id = g.org_id
-WHERE g.token_hash = $1 AND g.revoked_at IS NULL`,
-		hash,
-	)
-	var org Organization
-	var gatewayKeyID string
-	if err := row.Scan(&org.ID, &org.Name, &org.AllowBYOKOverride, &org.HostedUsageEnabled, &org.DefaultModel, &gatewayKeyID); err != nil {
-		return nil, err
-	}
-	_, _ = s.DB.Exec(ctx, `UPDATE gateway_api_keys SET last_used_at = now() WHERE id = $1`, gatewayKeyID)
-	return &org, nil
-}
-
 func (s *AppServices) ListProviderSecrets(ctx context.Context, orgID string) ([]ProviderSecretRecord, error) {
+	var err error
+	done := logQueryDebug("ListProviderSecrets", ctx, "org_id", orgID)
+	defer func() { done(err) }()
+
 	rows, err := s.DB.Query(ctx, `
 SELECT id, provider, object_name, updated_at
 FROM provider_secrets
@@ -741,12 +799,13 @@ ORDER BY provider`,
 	var out []ProviderSecretRecord
 	for rows.Next() {
 		var rec ProviderSecretRecord
-		if err := rows.Scan(&rec.ID, &rec.Provider, &rec.ObjectName, &rec.UpdatedAt); err != nil {
+		if err = rows.Scan(&rec.ID, &rec.Provider, &rec.ObjectName, &rec.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, rec)
 	}
-	return out, rows.Err()
+	err = rows.Err()
+	return out, err
 }
 
 func (s *AppServices) StoreProviderSecret(ctx context.Context, actor UserIdentity, provider, secretValue string) (*ProviderSecretRecord, error) {
@@ -865,7 +924,11 @@ func (s *AppServices) ResolveExecutionHeaders(ctx context.Context, orgID string,
 		if !org.HostedUsageEnabled {
 			return nil, "", errors.New("VAI-hosted access is disabled for this workspace")
 		}
-		return stripProviderKeyHeaders(headers), KeySourcePlatformHosted, nil
+		headers = stripProviderKeyHeaders(headers)
+		if applied := s.injectPlatformProviderHeaders(headers); !applied {
+			return nil, "", errors.New("VAI-hosted access is not configured with upstream provider keys")
+		}
+		return headers, KeySourcePlatformHosted, nil
 	case AccessCredentialSessionAuth, "":
 		switch requestedMode {
 		case KeySourceCustomerBYOKBrowser:
@@ -890,7 +953,11 @@ func (s *AppServices) ResolveExecutionHeaders(ctx context.Context, orgID string,
 			if !org.HostedUsageEnabled {
 				return nil, "", errors.New("VAI-hosted access is disabled for this workspace")
 			}
-			return stripProviderKeyHeaders(headers), KeySourcePlatformHosted, nil
+			headers = stripProviderKeyHeaders(headers)
+			if applied := s.injectPlatformProviderHeaders(headers); !applied {
+				return nil, "", errors.New("VAI-hosted access is not configured with upstream provider keys")
+			}
+			return headers, KeySourcePlatformHosted, nil
 		default:
 			return nil, "", fmt.Errorf("unsupported execution mode %q", requestedMode)
 		}
@@ -939,6 +1006,40 @@ WHERE org_id = $1 AND deleted_at IS NULL`,
 		return false, err
 	}
 	return applied, nil
+}
+
+func (s *AppServices) injectPlatformProviderHeaders(headers http.Header) bool {
+	applied := false
+	for provider, value := range s.platformKeys {
+		headerName := providerHeader(provider)
+		if headerName == "" {
+			continue
+		}
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		headers.Set(headerName, trimmed)
+		applied = true
+	}
+	return applied
+}
+
+func loadPlatformProviderKeysFromEnv() map[string]string {
+	return map[string]string{
+		"anthropic":  strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
+		"openai":     firstNonEmptyString(os.Getenv("OPENAI_API_KEY"), os.Getenv("OAI_RESP_API_KEY")),
+		"gem-dev":    firstNonEmptyString(os.Getenv("GEMINI_API_KEY"), os.Getenv("GOOGLE_API_KEY")),
+		"gem-vert":   strings.TrimSpace(os.Getenv("VERTEXAI_API_KEY")),
+		"groq":       strings.TrimSpace(os.Getenv("GROQ_API_KEY")),
+		"cerebras":   strings.TrimSpace(os.Getenv("CEREBRAS_API_KEY")),
+		"openrouter": strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")),
+		"cartesia":   strings.TrimSpace(os.Getenv("CARTESIA_API_KEY")),
+		"elevenlabs": strings.TrimSpace(os.Getenv("ELEVENLABS_API_KEY")),
+		"tavily":     strings.TrimSpace(os.Getenv("TAVILY_API_KEY")),
+		"exa":        strings.TrimSpace(os.Getenv("EXA_API_KEY")),
+		"firecrawl":  strings.TrimSpace(os.Getenv("FIRECRAWL_API_KEY")),
+	}
 }
 
 func (s *AppServices) CurrentBalance(ctx context.Context, orgID string) (int64, error) {
@@ -1276,6 +1377,10 @@ func canonicalProvider(provider string) string {
 	}
 }
 
+func CanonicalProvider(provider string) string {
+	return canonicalProvider(provider)
+}
+
 func providerHeader(provider string) string {
 	switch canonicalProvider(provider) {
 	case "anthropic":
@@ -1305,6 +1410,10 @@ func providerHeader(provider string) string {
 	default:
 		return ""
 	}
+}
+
+func ProviderHeader(provider string) string {
+	return providerHeader(provider)
 }
 
 func vaultObjectName(orgID, provider string) string {

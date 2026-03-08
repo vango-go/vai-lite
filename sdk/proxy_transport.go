@@ -115,7 +115,7 @@ func (c *Client) proxyCreateMessage(ctx context.Context, req *types.MessageReque
 	ctx, cancel := withDefaultGatewayTimeout(ctx)
 	defer cancel()
 
-	headers, err := c.buildGatewayHeaders(req, false)
+	headers, err := c.buildGatewayHeaders(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +150,7 @@ func (c *Client) proxyCreateMessage(ctx context.Context, req *types.MessageReque
 }
 
 func (c *Client) proxyStreamMessage(ctx context.Context, req *types.MessageRequest) (core.EventStream, error) {
-	headers, err := c.buildGatewayHeaders(req, true)
+	headers, err := c.buildGatewayHeaders(ctx, req, true)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (c *Client) postGatewayJSON(ctx context.Context, endpointPath string, paylo
 	return resp, endpoint, nil
 }
 
-func (c *Client) buildGatewayHeaders(req *types.MessageRequest, stream bool) (http.Header, error) {
+func (c *Client) buildGatewayHeaders(ctx context.Context, req *types.MessageRequest, stream bool) (http.Header, error) {
 	if !c.isProxyMode() {
 		return nil, core.NewInvalidRequestError("proxy mode is not enabled (set WithBaseURL)")
 	}
@@ -226,6 +226,9 @@ func (c *Client) buildGatewayHeaders(req *types.MessageRequest, stream bool) (ht
 	}
 	if c.gatewayAPIKey != "" {
 		headers.Set("Authorization", "Bearer "+c.gatewayAPIKey)
+	}
+	if sessionID := sessionIDFromContext(ctx); sessionID != "" {
+		headers.Set(gatewaySessionIDHeader, sessionID)
 	}
 
 	if byokHeader, ok := providerByokHeaders[strings.ToLower(providerName)]; ok {

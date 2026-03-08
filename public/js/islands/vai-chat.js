@@ -237,6 +237,28 @@ function createElement(html) {
   return template.content.firstElementChild;
 }
 
+function errorMessageFromValue(value, fallback = "Request failed") {
+  if (!value) {
+    return fallback;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value?.message === "string" && value.message.trim()) {
+    return value.message;
+  }
+  if (typeof value?.error === "string" && value.error.trim()) {
+    return value.error;
+  }
+  if (value?.error) {
+    return errorMessageFromValue(value.error, fallback);
+  }
+  if (typeof value?.detail === "string" && value.detail.trim()) {
+    return value.detail;
+  }
+  return fallback;
+}
+
 function canUseBrowserBYOK(state) {
   return !!state.props.allowBrowserBYOK;
 }
@@ -479,6 +501,7 @@ function topPendingAttachmentHTML(attachment, idx) {
 }
 
 export function mount(el, props, api) {
+  const pendingRequests = new Map();
   const state = {
     props: props || {},
     messages: Array.isArray(props?.messages) ? props.messages.map(normalizeMessage) : [],
@@ -494,7 +517,9 @@ export function mount(el, props, api) {
     busy: false,
     status: "",
     statusTone: "neutral",
-    abortController: null,
+    activeRunRequestId: "",
+    activeAssistantMessage: null,
+    requestSeq: 0,
   };
 
   const root = createElement(`
@@ -560,6 +585,68 @@ export function mount(el, props, api) {
   refs.settingsKeys.href = String(state.props.settingsKeysURL || "/settings/keys");
   refs.settingsBilling.href = String(state.props.settingsBillingURL || "/settings/billing");
 
+  function nextRequestId(prefix) {
+    state.requestSeq += 1;
+    return `${String(prefix || "req")}_${Date.now()}_${state.requestSeq}`;
+  }
+
+  function startRequest(type, payload) {
+    const requestId = nextRequestId(type);
+    const message = { type, requestId, ...payload };
+    const promise = new Promise((resolve, reject) => {
+      pendingRequests.set(requestId, { resolve, reject });
+    });
+    try {
+      api.send(message);
+    } catch (err) {
+      pendingRequests.delete(requestId);
+      throw err;
+    }
+    return { requestId, promise };
+  }
+
+  function resolveRequest(requestId, value) {
+    const pending = pendingRequests.get(requestId);
+    if (!pending) {
+      return;
+    }
+    pendingRequests.delete(requestId);
+    pending.resolve(value);
+  }
+
+  function rejectRequest(requestId, message) {
+    const pending = pendingRequests.get(requestId);
+    if (!pending) {
+      return;
+    }
+    pendingRequests.delete(requestId);
+    pending.reject(new Error(message || "Request failed"));
+  }
+
+  function activeAssistantFor(requestId) {
+    if (!requestId || state.activeRunRequestId !== requestId) {
+      return null;
+    }
+    return state.activeAssistantMessage;
+  }
+
+  function clearActiveRun(requestId) {
+    if (!requestId || state.activeRunRequestId !== requestId) {
+      return;
+    }
+    state.activeRunRequestId = "";
+    state.activeAssistantMessage = null;
+  }
+
+  function resetComposerAfterAcceptedRun() {
+    state.pendingAttachments = [];
+    state.draft = "";
+    state.editMessageId = "";
+    refs.textarea.value = "";
+    renderPendingAttachments();
+    renderComposerMeta();
+  }
+
   function setStatus(message, tone = "neutral") {
     state.status = String(message || "");
     state.statusTone = tone;
@@ -617,7 +704,7 @@ export function mount(el, props, api) {
       <header class="panel-header">
         <div>
           <h3>Browser-local provider keys</h3>
-          <p>Keys stay in this browser only. They are sent on requests from the chat island and never stored server-side.</p>
+          <p>Keys stay in this browser only. They are sent only with the active chat request and are never stored server-side.</p>
         </div>
       </header>
       <div class="byok-grid">
@@ -694,29 +781,32 @@ export function mount(el, props, api) {
     updateBusyControls();
   }
 
-  async function uploadFile(file) {
-    const intentResp = await fetch(String(state.props.uploadIntentURL), {
-      method: "POST",
-      credentials: "same-origin",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": String(state.props.csrfToken || ""),
-      },
-      body: JSON.stringify({
-        conversation_id: state.props.conversationId,
-        filename: file.name,
-        content_type: file.type,
-        size: file.size,
-      }),
-    });
-    if (!intentResp.ok) {
-      const err = await intentResp.json().catch(() => ({ error: "Upload intent failed" }));
-      throw new Error(err.error || "Upload intent failed");
+  function browserKeyPayload() {
+    const keys = {};
+    for (const [provider, value] of Object.entries(state.byok || {})) {
+      const trimmed = String(value || "").trim();
+      if (trimmed) {
+        keys[provider] = trimmed;
+      }
     }
-    const intent = await intentResp.json();
+    return keys;
+  }
+
+  async function uploadFile(file) {
+    const contentType = file.type || "application/octet-stream";
+    const { promise: intentPromise } = startRequest("upload_intent", {
+      filename: file.name,
+      contentType,
+      sizeBytes: file.size,
+    });
+    const intentResponse = await intentPromise;
+    const intent = intentResponse?.intent;
+    if (!intent?.upload_url || !intent?.intent_token) {
+      throw new Error("Upload intent failed");
+    }
 
     const putHeaders = new Headers(intent.headers || {});
-    putHeaders.set("Content-Type", intent.content_type || file.type || "application/octet-stream");
+    putHeaders.set("Content-Type", intent.content_type || contentType);
     const putResp = await fetch(intent.upload_url, {
       method: "PUT",
       headers: putHeaders,
@@ -726,26 +816,17 @@ export function mount(el, props, api) {
       throw new Error(`Upload failed (${putResp.status})`);
     }
 
-    const claimResp = await fetch(String(state.props.uploadClaimURL), {
-      method: "POST",
-      credentials: "same-origin",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": String(state.props.csrfToken || ""),
-      },
-      body: JSON.stringify({
-        conversation_id: state.props.conversationId,
-        filename: file.name,
-        content_type: file.type,
-        size: file.size,
-        intent_token: intent.intent_token,
-      }),
+    const { promise: claimPromise } = startRequest("upload_claim", {
+      filename: file.name,
+      contentType,
+      sizeBytes: file.size,
+      intentToken: intent.intent_token,
     });
-    if (!claimResp.ok) {
-      const err = await claimResp.json().catch(() => ({ error: "Upload claim failed" }));
-      throw new Error(err.error || "Upload claim failed");
+    const claimResponse = await claimPromise;
+    if (!claimResponse?.attachment) {
+      throw new Error("Upload claim failed");
     }
-    return claimResp.json();
+    return claimResponse.attachment;
   }
 
   async function handleFiles(files) {
@@ -768,91 +849,6 @@ export function mount(el, props, api) {
     }
   }
 
-  function applyStreamingEvent(event, assistantMessage) {
-    if (!assistantMessage || !event) {
-      return;
-    }
-
-    if (event.event === "tool_call_start" || event.event === "tool_result" || event.event === "step_complete") {
-      assistantMessage.toolTrace.push(event.data);
-      renderMessages();
-      return;
-    }
-
-    if (event.event === "run_complete" && event.data?.result?.response?.content) {
-      const text = event.data.result.response.content
-        .filter((block) => block?.type === "text")
-        .map((block) => block.text || "")
-        .join("");
-      if (text) {
-        assistantMessage.text = text;
-      }
-      assistantMessage.pending = false;
-      assistantMessage.toolTrace = Array.isArray(event.data.result.steps) ? event.data.result.steps : assistantMessage.toolTrace;
-      renderMessages();
-      return;
-    }
-
-    if (event.event !== "stream_event") {
-      return;
-    }
-    const inner = event.data?.event;
-    if (!inner) {
-      return;
-    }
-    if (inner.type === "content_block_delta" && inner.delta?.type === "text_delta") {
-      assistantMessage.text += inner.delta.text || "";
-      renderMessages();
-      return;
-    }
-    if (inner.type === "message_delta" && inner.delta?.stop_reason) {
-      assistantMessage.stopReason = inner.delta.stop_reason;
-      return;
-    }
-  }
-
-  function outgoingHeaders() {
-    const headers = {
-      "Content-Type": "application/json",
-      "X-CSRF-Token": String(state.props.csrfToken || ""),
-    };
-    if (effectiveKeySource(state) === "customer_byok_browser") {
-      Object.assign(headers, byokHeaders(state));
-    }
-    return headers;
-  }
-
-  async function streamRequest(payload, assistantMessage) {
-    state.abortController = new AbortController();
-    const response = await fetch(String(state.props.streamURL), {
-      method: "POST",
-      credentials: "same-origin",
-      headers: outgoingHeaders(),
-      body: JSON.stringify(payload),
-      signal: state.abortController.signal,
-    });
-
-    if (!response.ok || !response.body) {
-      let message = `Request failed (${response.status})`;
-      try {
-        const body = await response.json();
-        message = body.error || message;
-      } catch {}
-      throw new Error(message);
-    }
-
-    const parser = buildEventSourceParser((event) => applyStreamingEvent(event, assistantMessage));
-    const reader = response.body.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-      parser.push(value);
-    }
-    parser.finish();
-  }
-
   function trimMessagesAfter(messageId) {
     const index = state.messages.findIndex((message) => message.id === messageId);
     if (index >= 0) {
@@ -867,6 +863,81 @@ export function mount(el, props, api) {
       }
     }
     return null;
+  }
+
+  function handleServerMessage(message) {
+    const type = String(message?.type || "");
+    const requestId = String(message?.requestId || "");
+    const assistantMessage = activeAssistantFor(requestId);
+
+    switch (type) {
+      case "upload_intent_ready":
+      case "upload_claim_ready":
+        resolveRequest(requestId, message);
+        return;
+      case "upload_intent_error":
+      case "upload_claim_error":
+        rejectRequest(requestId, message?.error || "Upload request failed");
+        return;
+      case "chat_started":
+        if (requestId && state.activeRunRequestId === requestId) {
+          resetComposerAfterAcceptedRun();
+        }
+        return;
+      case "chat_delta":
+        if (!assistantMessage) {
+          return;
+        }
+        assistantMessage.text += String(message?.delta || "");
+        renderMessages();
+        return;
+      case "chat_tool":
+        if (!assistantMessage) {
+          return;
+        }
+        if (!Array.isArray(assistantMessage.toolTrace)) {
+          assistantMessage.toolTrace = [];
+        }
+        assistantMessage.toolTrace.push(message?.tool);
+        renderMessages();
+        return;
+      case "chat_complete":
+        if (assistantMessage) {
+          assistantMessage.pending = false;
+          assistantMessage.error = false;
+          if (typeof message?.assistant?.text === "string" && message.assistant.text.trim()) {
+            assistantMessage.text = message.assistant.text;
+          }
+          if (message?.assistant?.toolTrace !== undefined) {
+            assistantMessage.toolTrace = Array.isArray(message.assistant.toolTrace) ? message.assistant.toolTrace : message.assistant.toolTrace || [];
+          }
+        }
+        clearActiveRun(requestId);
+        renderMessages();
+        resolveRequest(requestId, { type: "chat_complete", assistant: message?.assistant || null });
+        return;
+      case "chat_stopped":
+        if (assistantMessage) {
+          assistantMessage.pending = false;
+          assistantMessage.error = false;
+        }
+        clearActiveRun(requestId);
+        renderMessages();
+        resolveRequest(requestId, { type: "chat_stopped" });
+        return;
+      case "chat_error":
+        if (assistantMessage) {
+          assistantMessage.pending = false;
+          assistantMessage.error = true;
+          assistantMessage.text = assistantMessage.text || `Stream failed: ${message?.error || "unknown error"}`;
+        }
+        clearActiveRun(requestId);
+        renderMessages();
+        rejectRequest(requestId, message?.error || "Streaming request failed.");
+        return;
+      default:
+        return;
+    }
   }
 
   async function submitComposer({ regenerate = false } = {}) {
@@ -909,7 +980,7 @@ export function mount(el, props, api) {
       "neutral",
     );
 
-    let assistantMessage = normalizeMessage({
+    const assistantMessage = normalizeMessage({
       id: `pending_${Date.now()}`,
       role: "assistant",
       keySource: source,
@@ -950,25 +1021,33 @@ export function mount(el, props, api) {
     state.messages.push(assistantMessage);
     renderMessages();
 
-    const payload = {
-      conversation_id: String(state.props.conversationId),
-      model: state.currentModel,
-      key_source: source,
-      message: text,
-      attachment_ids: state.pendingAttachments.map((attachment) => attachment.id),
-      regenerate,
-      edit_message_id: state.editMessageId || "",
-    };
-
     try {
-      await streamRequest(payload, assistantMessage);
+      const { requestId, promise } = startRequest("submit", {
+        message: text,
+        model: state.currentModel,
+        keySource: source,
+        attachmentIds: state.pendingAttachments.map((attachment) => attachment.id),
+        regenerate,
+        editMessageId: state.editMessageId || "",
+        browserKeys: source === "customer_byok_browser" ? browserKeyPayload() : {},
+      });
+      state.activeRunRequestId = requestId;
+      state.activeAssistantMessage = assistantMessage;
+
+      const outcome = await promise;
       assistantMessage.pending = false;
-      state.pendingAttachments = [];
-      state.draft = "";
-      state.editMessageId = "";
-      refs.textarea.value = "";
-      setStatus("Response complete.", "success");
-      renderPendingAttachments();
+      assistantMessage.error = false;
+      if (typeof outcome?.assistant?.text === "string" && outcome.assistant.text.trim()) {
+        assistantMessage.text = outcome.assistant.text;
+      }
+      if (outcome?.assistant?.toolTrace !== undefined) {
+        assistantMessage.toolTrace = Array.isArray(outcome.assistant.toolTrace) ? outcome.assistant.toolTrace : outcome.assistant.toolTrace || [];
+      }
+      if (outcome?.type === "chat_stopped") {
+        setStatus("Stopped streaming.", "warning");
+      } else {
+        setStatus("Response complete.", "success");
+      }
       renderComposerMeta();
       renderMessages();
     } catch (err) {
@@ -978,9 +1057,9 @@ export function mount(el, props, api) {
       setStatus(err?.message || "Streaming request failed.", "error");
       renderMessages();
     } finally {
-      state.abortController = null;
       state.busy = false;
       updateBusyControls();
+      renderComposerMeta();
     }
   }
 
@@ -1054,7 +1133,6 @@ export function mount(el, props, api) {
       submitComposer({ regenerate: true }).catch((err) => {
         setStatus(err?.message || "Regeneration failed.", "error");
       });
-      return;
     }
   });
 
@@ -1091,22 +1169,46 @@ export function mount(el, props, api) {
   });
 
   refs.stopButton.addEventListener("click", () => {
-    state.abortController?.abort();
-    setStatus("Stopped streaming.", "warning");
+    if (!state.activeRunRequestId) {
+      return;
+    }
+    try {
+      api.send({
+        type: "stop",
+        requestId: state.activeRunRequestId,
+      });
+      setStatus("Stopping stream…", "warning");
+    } catch (err) {
+      setStatus(err?.message || "Unable to stop the current stream.", "error");
+    }
   });
 
   renderStaticBits();
 
   return {
     update(nextProps) {
+      const previousConversationId = state.props?.conversationId;
       state.props = nextProps || {};
       state.currentModel = String(nextProps?.model || state.currentModel);
-      state.messages = Array.isArray(nextProps?.messages) ? nextProps.messages.map(normalizeMessage) : state.messages;
+      if (
+        Array.isArray(nextProps?.messages) &&
+        (!state.activeRunRequestId || String(nextProps?.conversationId || "") !== String(previousConversationId || ""))
+      ) {
+        state.messages = nextProps.messages.map(normalizeMessage);
+      }
+      refs.settingsKeys.href = String(state.props.settingsKeysURL || "/settings/keys");
+      refs.settingsBilling.href = String(state.props.settingsBillingURL || "/settings/billing");
       renderStaticBits();
     },
     destroy() {
-      state.abortController?.abort();
+      for (const pending of pendingRequests.values()) {
+        pending.reject(new Error("Chat island unmounted"));
+      }
+      pendingRequests.clear();
       el.innerHTML = "";
+    },
+    onMessage(message) {
+      handleServerMessage(message);
     },
     onReconnect() {
       setStatus("Connection restored. Refresh the page if the conversation looks stale.", "neutral");

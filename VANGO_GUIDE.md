@@ -119,6 +119,8 @@ Add feature packages only when the feature requires them:
 * `github.com/vango-go/vango/pkg/auth`
 * `github.com/vango-go/vango/pkg/authmw`
 * `github.com/vango-go/vango/pkg/auth/sessionauth`
+* `github.com/vango-go/vango/pkg/shell`
+* `github.com/vango-go/vango/pkg/surface`
 * `github.com/vango-go/vango/pkg/toast`
 * `github.com/vango-go/vango/pkg/upload`
 * `github.com/vango-go/vango/pkg/urlparam`
@@ -266,6 +268,28 @@ If SSR and WS mount disagree, you can get:
 Vango also enforces a maximum decoded `?path=` size.
 
 Treat unusually large query strings as suspect rather than relying on them for normal app state.
+
+#### SSR budgets
+
+SSR has two separate budgets:
+
+* `Config.SSR.PageTimeout`
+* `Config.SSR.ResourceTimeout`
+
+Rules:
+
+* during SSR, `ctx.StdContext()` carries the page render budget
+* `ctx.Done()` is request cancellation only, not the SSR page deadline
+* `PageTimeout` bounds route middleware, page handlers, layout assembly, and HTML rendering
+* `ResourceTimeout` only governs SSR resource preloading from `setup.Resource` and `setup.ResourceKeyed`
+* if `ResourceTimeout > 0`, SSR preloads use a child context derived from the page budget and wait on that same child context
+* if `ResourceTimeout = 0`, SSR may still start resources opportunistically, but it does not wait for them
+* page-budget expiry is an operational failure; SSR returns a generic `503 service unavailable` and bypasses custom error pages
+
+Design consequence:
+
+* page handlers stay thin
+* blocking reads for page data belong in `setup.Resource` or `setup.ResourceKeyed`
 
 ---
 
@@ -899,6 +923,8 @@ Operationally important semantics:
 * unmount cancels in-flight work
 * loader errors become Resource error state, not panics in app code
 * loaders must never write signals directly
+* during SSR, preload waiting is bounded by `Config.SSR.ResourceTimeout`, not by `ctx.Done()`
+* `ResourceTimeout = 0` means "do not wait", not "do not start"
 
 Render Resource state explicitly.
 
@@ -1283,10 +1309,21 @@ Prefer typed Vango view code whenever possible.
 Most layouts should include:
 
 ```go
-VangoScripts()
+RuntimeScripts(ctx)
 ```
 
-You may add script options when needed:
+Prefer `RuntimeScripts(ctx)` over `VangoScripts()` for normal app layouts.
+
+`RuntimeScripts(ctx)` is the canonical bootstrap helper for:
+
+* ordinary browser/web requests
+* normalized `ctx.Surface()` metadata
+* normalized `ctx.Shell()` capability metadata
+* adapter-injected desktop bootstrap such as macOS window and resume data
+
+Use `VangoScripts()` only when you intentionally want the lower-level script helper without context-aware bootstrap merging.
+
+You may add script options to `RuntimeScripts(ctx, ...)` when needed:
 
 * `WithScriptPath(...)`
 * `WithCSRFToken(...)`
@@ -1301,6 +1338,154 @@ If you intentionally allow trusted cross-origin module loading, keep the allowli
 * `WithAllowInsecureModuleOrigins()` only as a break-glass local/dev setting
 
 For module-origin configuration and special security cases, keep the options close to the layout so the trust boundary is obvious.
+
+---
+
+### 33A. Desktop surfaces and shell DX
+
+Vango app code may run against more than one client surface.
+
+Use:
+
+* `ctx.Surface()` for metadata about the current surface
+* `ctx.Shell()` for native host capabilities
+
+`ctx.Surface()` is the right place to branch on broad environment facts:
+
+* `Kind`
+* `Platform`
+* `WindowID`
+* `AppVersion`
+* `BuildChannel`
+* `Capabilities`
+
+Example:
+
+```go
+import "github.com/vango-go/vango/pkg/shell"
+import "github.com/vango-go/vango/pkg/surface"
+
+func desktopEffect() vango.Component {
+	return vango.Setup(vango.NoProps{}, func(s vango.SetupCtx[vango.NoProps]) vango.RenderFn {
+		s.Effect(func() vango.Cleanup {
+			ctx := vango.UseCtx()
+			if ctx == nil {
+				return nil
+			}
+			info := ctx.Surface()
+			if info.Kind == surface.KindDesktop && info.Platform == surface.PlatformMacOS {
+				_ = ctx.Shell().Dispatch(shell.SetWindowTitle("Inbox"))
+			}
+			return nil
+		})
+
+		return func() *vango.VNode {
+			return Div(Text("Ready"))
+		}
+	})
+}
+```
+
+Use `ctx.Shell().Capabilities()` for optional host work:
+
+```go
+if ctx.Shell().Capabilities().Has(shell.CapabilityNotification) {
+	_ = ctx.Shell().Dispatch(shell.ShowNotification(shell.Notification{
+		Title: "Saved",
+		Body:  "Your changes were written successfully.",
+	}))
+}
+```
+
+Current macOS desktop capability surface includes:
+
+* window title
+* default window size and minimum window size
+* app-defined native menus
+* open/save file dialogs
+* clipboard read/write
+* native user notifications
+* open external URLs
+* reveal file in Finder
+* deep-link ingress
+
+The shell contract has three distinct roles:
+
+* `Dispatch(...)` for non-blocking host commands
+* `Request(...)` for blocking or user-mediated host work
+* `Events()` for host-originated ingress such as menu clicks or deep links
+
+Treat `Request(...)` like other blocking or off-loop work:
+
+* prefer `setup.Action` when the flow is mutation-oriented
+* otherwise issue the request off-loop and come back with `ctx.Dispatch(...)`
+* do not block a latency-sensitive event handler on a native dialog round-trip
+
+Example request pattern:
+
+```go
+go func(reqCtx context.Context) {
+	response, err := ctx.Shell().Request(reqCtx, shell.OpenFileDialog(shell.FileDialogOptions{
+		Title:       "Choose a file",
+		AllowsFiles: true,
+	}))
+	ctx.Dispatch(func() {
+		// decode response and update signals here
+	})
+}(ctx.StdContext())
+```
+
+Host-originated menu and deep-link events arrive through `ctx.Shell().Events()`:
+
+```go
+return vango.Subscribe(ctx.Shell().Events(), func(event shell.Event) {
+	switch event.Kind {
+	case shell.EventMenuItemSelected:
+		if event.Menu != nil && event.Menu.ID == "notes.new" {
+			ctx.Navigate("/notes/new")
+		}
+	case shell.EventDeepLinkOpened:
+		if event.DeepLink != nil && event.DeepLink.Path != "" {
+			ctx.Navigate(event.DeepLink.Path)
+		}
+	}
+})
+```
+
+Unsupported shell operations return `shell.UnsupportedError`.
+
+Rules:
+
+* use `Surface()` for environment facts
+* use `Shell()` for host work
+* gate optional behavior on capabilities
+* keep app code shell-neutral; do not reach into host-specific internals
+
+---
+
+### 33B. Host-owned macOS behavior
+
+Some desktop UX is intentionally owned by the native host rather than by app code.
+
+On macOS desktop:
+
+* the app keeps standard native app/window menus
+* app code may add custom menus through `shell.SetMenu(...)`
+* host-owned menus remain separate from app-defined menus
+* the standard `View` menu owns zoom behavior
+
+Zoom is host-owned on macOS desktop:
+
+* `Cmd+=` zooms in
+* `Cmd+-` zooms out
+* `Cmd+0` resets to actual size
+* app-defined shell menus must not try to own those shortcuts
+
+This is deliberate.
+
+Browser-style page zoom is a desktop-shell concern, not a Vango shell capability.
+
+Do not add app-specific `shell.SetMenu(...)` items for the standard zoom shortcuts.
 
 ---
 
@@ -1461,6 +1646,8 @@ Thin-handler rule:
 
 Do not put blocking I/O in route handlers.
 
+Blocking reads for page data belong in `setup.Resource` or `setup.ResourceKeyed`.
+
 Push stateful logic into Setup components.
 
 Example:
@@ -1547,7 +1734,7 @@ func Layout(ctx vango.Ctx, children vango.Slot) *vango.VNode {
 		),
 		Body(
 			Main(children),
-			VangoScripts(),
+			RuntimeScripts(ctx),
 		),
 	)
 }
@@ -2770,6 +2957,7 @@ For new app code:
 * keep handler thin
 * parse params with typed `Params`
 * move stateful logic into a Setup component
+* move blocking reads into `setup.Resource`
 * use `ctx.StdContext()` in services and DB calls
 * commit regenerated routes
 
@@ -2862,6 +3050,7 @@ Primary constructors and helpers:
 * `NewSessionKey(...)`
 * `Default(...)`
 * `UseCtx()`
+* `RuntimeScripts(...)`
 * `Children(...)`
 * `PreventDefault(...)`
 * `Tx(...)`
@@ -3005,6 +3194,8 @@ Response and navigation:
 Session and auth:
 
 * `Session()`
+* `Surface()`
+* `Shell()`
 * `AuthSession()`
 * `User()`
 * `SetUser(user)`
@@ -3039,7 +3230,17 @@ Guidance:
 * route handlers use `ctx` directly
 * Setup code reaches `ctx` through `s.Ctx()`
 * render code reaches `ctx` through `vango.UseCtx()`
+* use `Surface()` for web/desktop/mobile environment facts
+* use `Shell()` for native host capabilities
+* use `Shell().Capabilities().Has(...)` before optional shell work
+* `Shell().Dispatch(...)` is for non-blocking host commands
+* `Shell().Request(...)` is for blocking or user-mediated native work
+* subscribe to `Shell().Events()` for menu and deep-link ingress
+* on macOS desktop, zoom shortcuts are host-owned and are not exposed through `Shell()`
 * off-loop integrations use `ctx.Dispatch(...)`
+* during SSR, `StdContext()` carries the page budget
+* `Done()` means request cancellation, not SSR page timeout
+* page-data reads belong in `setup.Resource`
 
 ### C.3 `setup` package
 

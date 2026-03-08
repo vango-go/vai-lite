@@ -93,6 +93,44 @@ func TestProxyMessagesCreate_SetsHeadersAndDecodesResponse(t *testing.T) {
 	}
 }
 
+func TestProxyMessagesCreate_PropagatesSessionIDHeader(t *testing.T) {
+	t.Parallel()
+
+	var gotSessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionID = r.Header.Get("X-VAI-Session-ID")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.MessageResponse{
+			Type:       "message",
+			ID:         "msg_123",
+			Model:      "openai/gpt-4o-mini",
+			Role:       "assistant",
+			Content:    []types.ContentBlock{types.TextBlock{Type: "text", Text: "hello"}},
+			StopReason: types.StopReasonEndTurn,
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithGatewayAPIKey("vai_sk_test"),
+		WithProviderKey("openai", "sk-openai"),
+		WithHTTPClient(server.Client()),
+	)
+
+	ctx := WithSessionID(context.Background(), "sess_task_123")
+	_, err := client.Messages.Create(ctx, &MessageRequest{
+		Model:    "openai/gpt-4o-mini",
+		Messages: []Message{{Role: "user", Content: Text("hello")}},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if gotSessionID != "sess_task_123" {
+		t.Fatalf("X-VAI-Session-ID = %q, want %q", gotSessionID, "sess_task_123")
+	}
+}
+
 func TestProxyMessagesCreate_UsesOpenAIHeaderForResponsesModels(t *testing.T) {
 	t.Parallel()
 

@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stripe/stripe-go/v84"
 	"github.com/vango-go/vai-lite/pkg/core/types"
 	neon "github.com/vango-go/vango-neon"
+	wos "github.com/vango-go/vango-workos"
 )
 
 type txRecorder struct {
@@ -106,6 +108,158 @@ func TestResolveExecutionHeaders_GatewayAPIKeyPrefersExternalBYOK(t *testing.T) 
 	}
 }
 
+func TestPrepareGatewayObservation_LinksToPriorRequestInSession(t *testing.T) {
+	t.Parallel()
+
+	svc := &AppServices{
+		DB: &neon.TestDB{
+			QueryRowFunc: func(_ context.Context, sql string, args ...any) pgx.Row {
+				if !strings.Contains(sql, "FROM gateway_request_logs") {
+					t.Fatalf("unexpected query: %s", sql)
+				}
+				if got := args[3]; got != "sess_task_123" {
+					t.Fatalf("session arg = %#v", got)
+				}
+				return neon.NewRow("req_parent_123", "chain_parent_123")
+			},
+		},
+	}
+
+	prepared, err := svc.PrepareGatewayObservation(context.Background(), GatewayObservationPrepareInput{
+		RequestID:               "req_current_123",
+		OrgID:                   "org_123",
+		GatewayAPIKeyID:         "gkey_123",
+		SessionID:               "sess_task_123",
+		EndpointFamily:          "runs",
+		InputContextFingerprint: "fingerprint_abc",
+	})
+	if err != nil {
+		t.Fatalf("PrepareGatewayObservation() error = %v", err)
+	}
+	if prepared.ParentRequestID != "req_parent_123" {
+		t.Fatalf("ParentRequestID = %q", prepared.ParentRequestID)
+	}
+	if prepared.ChainID != "chain_parent_123" {
+		t.Fatalf("ChainID = %q", prepared.ChainID)
+	}
+	if prepared.SessionID != "sess_task_123" {
+		t.Fatalf("SessionID = %q", prepared.SessionID)
+	}
+}
+
+func TestPrepareGatewayObservation_StartsNewChainWithoutSessionMatch(t *testing.T) {
+	t.Parallel()
+
+	var sawNoSessionLookup bool
+	svc := &AppServices{
+		DB: &neon.TestDB{
+			QueryRowFunc: func(_ context.Context, sql string, args ...any) pgx.Row {
+				if strings.Contains(sql, "session_id IS NULL") && strings.Contains(sql, "24 hours") {
+					sawNoSessionLookup = true
+				}
+				return &neon.ErrRow{Err: pgx.ErrNoRows}
+			},
+		},
+	}
+
+	prepared, err := svc.PrepareGatewayObservation(context.Background(), GatewayObservationPrepareInput{
+		RequestID:               "req_current_456",
+		OrgID:                   "org_123",
+		GatewayAPIKeyID:         "gkey_123",
+		EndpointFamily:          "messages",
+		InputContextFingerprint: "fingerprint_def",
+	})
+	if err != nil {
+		t.Fatalf("PrepareGatewayObservation() error = %v", err)
+	}
+	if !sawNoSessionLookup {
+		t.Fatalf("expected no-session chain lookup query")
+	}
+	if prepared.ParentRequestID != "" {
+		t.Fatalf("ParentRequestID = %q, want empty", prepared.ParentRequestID)
+	}
+	if !strings.HasPrefix(prepared.ChainID, "chain_") {
+		t.Fatalf("ChainID = %q, want generated chain id", prepared.ChainID)
+	}
+}
+
+func TestRecordGatewayObservation_PersistsRequestAndRunTrace(t *testing.T) {
+	t.Parallel()
+
+	tx := &txRecorder{}
+	svc := &AppServices{
+		DB: newTxDB(tx),
+	}
+
+	err := svc.RecordGatewayObservation(context.Background(), GatewayObservationRecordInput{
+		RequestID:                "req_123",
+		OrgID:                    "org_123",
+		GatewayAPIKeyID:          "gkey_123",
+		SessionID:                "sess_123",
+		ChainID:                  "chain_123",
+		ParentRequestID:          "req_parent_123",
+		EndpointKind:             "runs_stream",
+		EndpointFamily:           "runs",
+		Method:                   "POST",
+		Path:                     "/v1/runs:stream",
+		Provider:                 "anthropic",
+		Model:                    "anthropic/claude-sonnet-4",
+		KeySource:                KeySourcePlatformHosted,
+		AccessCredential:         AccessCredentialGatewayAPIKey,
+		StatusCode:               200,
+		DurationMS:               245,
+		InputContextFingerprint:  "input_fp",
+		OutputContextFingerprint: "output_fp",
+		RequestSummary:           `{"messages_count":2}`,
+		ResponseSummary:          `{"stop_reason":"end_turn"}`,
+		RequestBody:              `{"request":{"model":"anthropic/claude-sonnet-4"}}`,
+		ResponseBody:             `{"result":{"stop_reason":"end_turn"}}`,
+		StartedAt:                time.Unix(100, 0).UTC(),
+		CompletedAt:              time.Unix(101, 0).UTC(),
+		RunTrace: &GatewayRunTraceRecord{
+			RunConfig:     `{"max_turns":8}`,
+			Usage:         `{"input_tokens":120,"output_tokens":32,"total_tokens":152}`,
+			StopReason:    "end_turn",
+			TurnCount:     1,
+			ToolCallCount: 1,
+			Steps: []GatewayRunStepRecord{
+				{
+					StepIndex:       0,
+					DurationMS:      245,
+					ResponseBody:    `{"id":"msg_123"}`,
+					ResponseSummary: `{"tool_call_count":1}`,
+					ToolCalls: []GatewayRunToolCallRecord{
+						{
+							ToolCallID: "tool_123",
+							Name:       "vai_web_search",
+							InputJSON:  `{"query":"latest launch"}`,
+							ResultBody: `{"content":[{"type":"text","text":"ok"}]}`,
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RecordGatewayObservation() error = %v", err)
+	}
+	if len(tx.execCalls) != 4 {
+		t.Fatalf("len(execCalls) = %d, want 4", len(tx.execCalls))
+	}
+	if !strings.Contains(tx.execCalls[0].sql, "INSERT INTO gateway_request_logs") {
+		t.Fatalf("first exec sql = %q", tx.execCalls[0].sql)
+	}
+	if !strings.Contains(tx.execCalls[1].sql, "INSERT INTO gateway_run_traces") {
+		t.Fatalf("second exec sql = %q", tx.execCalls[1].sql)
+	}
+	if !strings.Contains(tx.execCalls[2].sql, "INSERT INTO gateway_run_steps") {
+		t.Fatalf("third exec sql = %q", tx.execCalls[2].sql)
+	}
+	if !strings.Contains(tx.execCalls[3].sql, "INSERT INTO gateway_run_tool_calls") {
+		t.Fatalf("fourth exec sql = %q", tx.execCalls[3].sql)
+	}
+}
+
 func TestResolveExecutionHeaders_GatewayAPIKeyUsesPlatformHostedWithoutProviderHeaders(t *testing.T) {
 	t.Parallel()
 
@@ -114,6 +268,9 @@ func TestResolveExecutionHeaders_GatewayAPIKeyUsesPlatformHostedWithoutProviderH
 			QueryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 				return orgRow("org_123", false, true)
 			},
+		},
+		platformKeys: map[string]string{
+			"openai": "sk-platform-openai",
 		},
 	}
 
@@ -126,6 +283,26 @@ func TestResolveExecutionHeaders_GatewayAPIKeyUsesPlatformHostedWithoutProviderH
 	}
 	if out == nil {
 		t.Fatal("ResolveExecutionHeaders() returned nil headers")
+	}
+	if got := out.Get("X-Provider-Key-OpenAI"); got != "sk-platform-openai" {
+		t.Fatalf("platform header = %q", got)
+	}
+}
+
+func TestResolveExecutionHeaders_PlatformHostedRequiresConfiguredPlatformKeys(t *testing.T) {
+	t.Parallel()
+
+	svc := &AppServices{
+		DB: &neon.TestDB{
+			QueryRowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return orgRow("org_123", false, true)
+			},
+		},
+	}
+
+	_, _, err := svc.ResolveExecutionHeaders(context.Background(), "org_123", nil, KeySourcePlatformHosted, AccessCredentialSessionAuth)
+	if err == nil || !strings.Contains(err.Error(), "not configured with upstream provider keys") {
+		t.Fatalf("ResolveExecutionHeaders() error = %v", err)
 	}
 }
 
@@ -387,5 +564,23 @@ func TestResolveExecutionHeadersPropagatesOrgLookupError(t *testing.T) {
 	_, _, err := svc.ResolveExecutionHeaders(context.Background(), "org_123", nil, "", AccessCredentialGatewayAPIKey)
 	if err == nil {
 		t.Fatal("ResolveExecutionHeaders() expected error")
+	}
+}
+
+func TestActorFromIdentityFallsBackToDerivedOrg(t *testing.T) {
+	t.Parallel()
+
+	actor, err := ActorFromIdentity(&wos.Identity{
+		UserID: "user_123",
+		Email:  "test@example.com",
+	})
+	if err != nil {
+		t.Fatalf("ActorFromIdentity() error = %v", err)
+	}
+	if actor.OrgID != "org_user_123" {
+		t.Fatalf("ActorFromIdentity() org = %q, want %q", actor.OrgID, "org_user_123")
+	}
+	if actor.Name != "test@example.com" {
+		t.Fatalf("ActorFromIdentity() name = %q, want email fallback", actor.Name)
 	}
 }

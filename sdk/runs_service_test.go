@@ -72,6 +72,43 @@ func TestRunsCreate_DecodesEnvelopeAndHeaders(t *testing.T) {
 	}
 }
 
+func TestRunsCreate_PropagatesSessionIDHeader(t *testing.T) {
+	t.Parallel()
+
+	var gotSessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionID = r.Header.Get("X-VAI-Session-ID")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(types.RunResultEnvelope{
+			Result: &types.RunResult{
+				Steps:      []types.RunStep{},
+				StopReason: types.RunStopReasonEndTurn,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithProviderKey("anthropic", "sk-ant"),
+		WithHTTPClient(server.Client()),
+	)
+
+	ctx := WithSessionID(context.Background(), "sess_run_123")
+	_, err := client.Runs.Create(ctx, &types.RunRequest{
+		Request: types.MessageRequest{
+			Model:    "anthropic/claude-sonnet-4",
+			Messages: []types.Message{{Role: "user", Content: "hello"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Runs.Create() error = %v", err)
+	}
+	if gotSessionID != "sess_run_123" {
+		t.Fatalf("X-VAI-Session-ID = %q, want %q", gotSessionID, "sess_run_123")
+	}
+}
+
 func TestRunsCreate_RejectsClientFunctionTools(t *testing.T) {
 	t.Parallel()
 

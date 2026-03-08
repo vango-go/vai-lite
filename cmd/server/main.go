@@ -7,7 +7,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/vango-go/vai-lite/app/components"
+	"github.com/vango-go/vai-lite/app/routes"
+	"github.com/vango-go/vai-lite/internal/appruntime"
 	"github.com/vango-go/vai-lite/internal/db"
 	"github.com/vango-go/vai-lite/internal/dotenv"
 	"github.com/vango-go/vai-lite/internal/services"
@@ -114,6 +118,13 @@ func main() {
 			Dir:    "public",
 			Prefix: "/",
 		},
+		SSR: vango.SSRConfig{
+			// Current page handlers still perform durable reads during SSR.
+			// Vango defaults SSR resource timeout to 300ms, which is too small
+			// for this app's current chat/settings loads and causes false timeout
+			// failures before the live session takes over.
+			ResourceTimeout: durationPtr(3 * time.Second),
+		},
 		DevMode: cfg.DevMode,
 	}
 	if bridge != nil {
@@ -127,6 +138,16 @@ func main() {
 		logger.Error("vango app init failed", "error", err)
 		os.Exit(1)
 	}
+	if cfg.DevMode {
+		// Temporary app-level workaround for a Vango config translation bug:
+		// vango.Config.DebugMode currently does not flow into server.ServerConfig.
+		// Force it here so websocket close reasons and client self-heal paths are debuggable.
+		app.Server().Config().DebugMode = true
+		if app.Server().Config().SessionConfig != nil {
+			app.Server().Config().SessionConfig.DebugMode = true
+		}
+		app.Server().SetLogger(logger)
+	}
 
 	server := &betaServer{
 		cfg:      cfg,
@@ -137,7 +158,22 @@ func main() {
 		workos:   workosClient,
 		app:      app,
 	}
-	server.registerPages()
+	appruntime.Set(&appruntime.Deps{
+		Services: appServices,
+		Gateway:  gw.Handler(),
+		Logger:   logger,
+		Config: appruntime.Config{
+			BaseURL:       cfg.BaseURL,
+			DefaultModel:  cfg.DefaultModel,
+			TopupOptions:  cfg.TopupOptions,
+			WorkOSEnabled: workosClient != nil,
+			DevMode:       cfg.DevMode,
+		},
+	})
+	routes.Register(app)
+	app.SetNotFound(func(ctx vango.Ctx) *vango.VNode {
+		return components.NotFoundPage()
+	})
 	if workosClient != nil {
 		app.Server().Use(workosClient.Middleware())
 	}
@@ -263,6 +299,10 @@ func loadGatewayConfigForMonolith() (gatewayconfig.Config, error) {
 	cfg.AuthMode = gatewayconfig.AuthModeDisabled
 	cfg.APIKeys = map[string]struct{}{}
 	return cfg, nil
+}
+
+func durationPtr(d time.Duration) *time.Duration {
+	return &d
 }
 
 func envOr(key, fallback string) string {

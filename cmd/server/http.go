@@ -20,6 +20,7 @@ import (
 	stripewebhook "github.com/stripe/stripe-go/v84/webhook"
 	"github.com/vango-go/vai-lite/internal/services"
 	"github.com/vango-go/vai-lite/pkg/core/types"
+	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 	workos "github.com/vango-go/vango-workos"
 )
 
@@ -70,15 +71,6 @@ func (s *betaServer) registerMux(mux *http.ServeMux) {
 	}
 
 	mux.Handle("/webhooks/stripe", http.HandlerFunc(s.handleStripeWebhook))
-	mux.Handle("/actions/chat/new", csrfMw(http.HandlerFunc(s.handleNewConversation)))
-	mux.Handle("/actions/developers/api-keys", csrfMw(http.HandlerFunc(s.handleCreateAPIKey)))
-	mux.Handle("/actions/developers/api-keys/revoke", csrfMw(http.HandlerFunc(s.handleRevokeAPIKey)))
-	mux.Handle("/actions/provider-secrets/store", csrfMw(http.HandlerFunc(s.handleStoreProviderSecret)))
-	mux.Handle("/actions/provider-secrets/delete", csrfMw(http.HandlerFunc(s.handleDeleteProviderSecret)))
-	mux.Handle("/actions/billing/topup", csrfMw(http.HandlerFunc(s.handleBillingTopup)))
-	mux.Handle("/api/uploads/intent", csrfMw(http.HandlerFunc(s.handleUploadIntent)))
-	mux.Handle("/api/uploads/claim", csrfMw(http.HandlerFunc(s.handleUploadClaim)))
-	mux.Handle("/api/chat/stream", csrfMw(http.HandlerFunc(s.handleChatStream)))
 	mux.Handle("/", s.app)
 }
 
@@ -128,7 +120,7 @@ func (s *betaServer) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!doctype html><html><head><title>API key created</title><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="/app.css"></head><body class="beta-app"><main class="token-page"><h1>Gateway API key created</h1><p>Copy this key now. It will not be shown again.</p><pre class="token-block">%s</pre><a class="btn btn-primary" href="/settings/developers">Back to developers</a></main></body></html>`, created.Token)
+	fmt.Fprintf(w, `<!doctype html><html><head><title>vai-lite gateway | API key created</title><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="/app.css"></head><body class="beta-app"><main class="token-page"><h1>API key created</h1><p>Copy this key now. It will not be shown again.</p><pre class="token-block">%s</pre><a class="btn btn-primary" href="/settings/developers">Back to developers</a></main></body></html>`, created.Token)
 }
 
 func (s *betaServer) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
@@ -324,7 +316,7 @@ func (s *betaServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	runReq, err := s.buildConversationRunRequest(r.Context(), detail)
+	runReq, err := s.buildConversationRunRequest(r.Context(), detail, resolvedHeaders)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -346,6 +338,12 @@ func (s *betaServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	writer := newCaptureWriter(w)
 	s.gateway.ServeHTTP(writer, req)
+	if writer.StatusCode() >= http.StatusBadRequest {
+		if gatewayErr := extractGatewayErrorMessage(writer.Body()); gatewayErr != "" {
+			s.logger.Warn("chat stream gateway rejected request", "status", writer.StatusCode(), "error", gatewayErr)
+		}
+		return
+	}
 	result, parseErr := extractRunResult(writer.Body())
 	if parseErr != nil {
 		s.logger.Error("stream parse failed", "error", parseErr)
@@ -437,20 +435,21 @@ func (s *betaServer) rawGatewayProxy() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := authTokenFromRequest(r)
 		if token == "" {
-			writeJSONError(w, http.StatusUnauthorized, "missing gateway API key")
+			writeGatewayError(w, http.StatusUnauthorized, "missing gateway API key")
 			return
 		}
-		org, err := s.services.ValidateAPIKey(r.Context(), token)
+		validated, err := s.services.ValidateGatewayAPIKey(r.Context(), token)
 		if err != nil {
-			writeJSONError(w, http.StatusUnauthorized, "invalid gateway API key")
+			writeGatewayError(w, http.StatusUnauthorized, "invalid gateway API key")
 			return
 		}
 
 		var body []byte
-		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/runs:stream") {
+		logged := isLoggedGatewayEndpoint(r.URL.Path)
+		if r.Method == http.MethodPost && logged {
 			body, err = io.ReadAll(r.Body)
 			if err != nil {
-				writeJSONError(w, http.StatusBadRequest, "invalid request body")
+				writeGatewayError(w, http.StatusBadRequest, "invalid request body")
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -463,73 +462,226 @@ func (s *betaServer) rawGatewayProxy() http.Handler {
 			return
 		}
 
-		resolvedHeaders, keySource, err := s.services.ResolveExecutionHeaders(r.Context(), org.ID, r.Header, "", services.AccessCredentialGatewayAPIKey)
+		var observed *observedGatewayRequest
+		var prepared *services.PreparedGatewayObservation
+		var requestID string
+		var startedAt time.Time
+		keySource := inferredGatewayKeySource(r.Header)
+		if logged {
+			startedAt = time.Now().UTC()
+			requestID = ensureGatewayRequestID(r.Header)
+			observed, err = parseObservedGatewayRequest(r, body, requestID)
+			if err != nil {
+				s.logger.Warn("gateway observability parse failed", "request_id", requestID, "path", r.URL.Path, "error", err)
+				observed = fallbackObservedGatewayRequest(r, body, requestID)
+			}
+			if observed == nil {
+				observed = fallbackObservedGatewayRequest(r, body, requestID)
+			}
+			if observed == nil {
+				writeGatewayError(w, http.StatusInternalServerError, "failed to initialize gateway observability")
+				return
+			}
+			prepared, err = s.services.PrepareGatewayObservation(r.Context(), services.GatewayObservationPrepareInput{
+				RequestID:               observed.RequestID,
+				OrgID:                   validated.Organization.ID,
+				GatewayAPIKeyID:         validated.APIKeyID,
+				SessionID:               observed.SessionID,
+				EndpointFamily:          observed.EndpointFamily,
+				InputContextFingerprint: observed.InputContextFingerprint,
+			})
+			if err != nil {
+				s.logger.Error("prepare gateway observation failed", "request_id", observed.RequestID, "error", err)
+				writeGatewayError(w, http.StatusInternalServerError, "failed to prepare observability")
+				return
+			}
+			setGatewayObservationHeaders(w.Header(), prepared)
+		}
+
+		resolvedHeaders, keySource, err := s.services.ResolveExecutionHeaders(r.Context(), validated.Organization.ID, r.Header, "", services.AccessCredentialGatewayAPIKey)
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeGatewayError(w, http.StatusBadRequest, err.Error())
+			s.recordGatewayObservation(r.Context(), validated, prepared, observed, &observedGatewayCompletion{
+				StatusCode:      http.StatusBadRequest,
+				ResponseBody:    mustJSONText(map[string]any{"error": map[string]any{"message": strings.TrimSpace(err.Error())}}),
+				ResponseSummary: mustJSONText(map[string]any{"status_code": http.StatusBadRequest, "error": strings.TrimSpace(err.Error())}),
+				ErrorSummary:    strings.TrimSpace(err.Error()),
+				ErrorJSON:       mustJSONText(map[string]any{"message": strings.TrimSpace(err.Error())}),
+			}, keySource, startedAt)
 			return
 		}
-		if keySource == services.KeySourcePlatformHosted && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/runs:stream") {
+		if keySource == services.KeySourcePlatformHosted && logged {
 			model := extractGatewayModel(r.URL.Path, body)
-			if err := s.services.ReservePlatformHostedUsage(r.Context(), org.ID, model); err != nil {
-				writeJSONError(w, http.StatusPaymentRequired, err.Error())
+			if err := s.services.ReservePlatformHostedUsage(r.Context(), validated.Organization.ID, model); err != nil {
+				writeGatewayError(w, http.StatusPaymentRequired, err.Error())
+				s.recordGatewayObservation(r.Context(), validated, prepared, observed, &observedGatewayCompletion{
+					StatusCode:      http.StatusPaymentRequired,
+					ResponseBody:    mustJSONText(map[string]any{"error": map[string]any{"message": strings.TrimSpace(err.Error())}}),
+					ResponseSummary: mustJSONText(map[string]any{"status_code": http.StatusPaymentRequired, "error": strings.TrimSpace(err.Error())}),
+					ErrorSummary:    strings.TrimSpace(err.Error()),
+					ErrorJSON:       mustJSONText(map[string]any{"message": strings.TrimSpace(err.Error())}),
+				}, keySource, startedAt)
 				return
 			}
 		}
 
 		req := r.Clone(r.Context())
 		req.Header = cloneForForward(resolvedHeaders)
+		if logged {
+			req.Header.Set(headerRequestID, requestID)
+			if prepared != nil && strings.TrimSpace(prepared.SessionID) != "" {
+				req.Header.Set(headerSessionID, prepared.SessionID)
+			}
+		}
 		if body != nil {
 			req.Body = io.NopCloser(bytes.NewReader(body))
 			req.ContentLength = int64(len(body))
 		}
 
-		switch r.URL.Path {
-		case "/v1/messages", "/v1/runs", "/v1/runs:stream":
-			writer := newCaptureWriter(w)
-			s.gateway.ServeHTTP(writer, req)
-			s.recordRawGatewayUsage(r.Context(), org.ID, r.URL.Path, body, writer, keySource)
-		default:
+		if !logged {
 			s.gateway.ServeHTTP(w, req)
+			return
 		}
+
+		writer := newCaptureWriter(w)
+		setGatewayObservationHeaders(writer.Header(), prepared)
+		s.gateway.ServeHTTP(writer, req)
+
+		completion, completionErr := completeObservedGatewayRequest(observed, writer.StatusCode(), writer.Body())
+		if completionErr != nil {
+			s.logger.Error("complete gateway observation failed", "request_id", requestID, "error", completionErr)
+			completion = &observedGatewayCompletion{
+				StatusCode:      writer.StatusCode(),
+				ResponseBody:    strings.TrimSpace(string(writer.Body())),
+				ResponseSummary: mustJSONText(map[string]any{"status_code": writer.StatusCode()}),
+				ErrorSummary:    "failed to materialize gateway response",
+				ErrorJSON:       mustJSONText(map[string]any{"message": completionErr.Error()}),
+			}
+		}
+		s.recordGatewayObservation(r.Context(), validated, prepared, observed, completion, keySource, startedAt)
 	})
 }
 
-func (s *betaServer) recordRawGatewayUsage(ctx context.Context, orgID, path string, body []byte, writer *captureWriter, keySource services.KeySource) {
-	if writer.StatusCode() >= http.StatusBadRequest {
+func isLoggedGatewayEndpoint(path string) bool {
+	switch path {
+	case "/v1/messages", "/v1/runs", "/v1/runs:stream":
+		return true
+	default:
+		return false
+	}
+}
+
+func inferredGatewayKeySource(headers http.Header) services.KeySource {
+	if gatewayRequestHasProviderKeyHeader(headers) {
+		return services.KeySourceCustomerBYOKExternal
+	}
+	return services.KeySourcePlatformHosted
+}
+
+func gatewayRequestHasProviderKeyHeader(headers http.Header) bool {
+	for key, values := range headers {
+		if !strings.HasPrefix(http.CanonicalHeaderKey(key), "X-Provider-Key-") {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func setGatewayObservationHeaders(headers http.Header, prepared *services.PreparedGatewayObservation) {
+	if headers == nil || prepared == nil {
 		return
 	}
-	switch path {
-	case "/v1/messages":
+	headers.Set(headerRequestID, prepared.RequestID)
+	if strings.TrimSpace(prepared.SessionID) != "" {
+		headers.Set(headerSessionID, prepared.SessionID)
+	}
+	headers.Set(headerChainID, prepared.ChainID)
+	if strings.TrimSpace(prepared.ParentRequestID) != "" {
+		headers.Set(headerParentRequestID, prepared.ParentRequestID)
+	}
+}
+
+func (s *betaServer) recordGatewayObservation(
+	ctx context.Context,
+	validated *services.ValidatedGatewayAPIKey,
+	prepared *services.PreparedGatewayObservation,
+	observed *observedGatewayRequest,
+	completion *observedGatewayCompletion,
+	keySource services.KeySource,
+	startedAt time.Time,
+) {
+	if validated == nil || prepared == nil || observed == nil || completion == nil {
+		return
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	completedAt := time.Now().UTC()
+	if completion.DurationMS == 0 {
+		completion.DurationMS = completedAt.Sub(startedAt).Milliseconds()
+	}
+	if err := s.services.RecordGatewayObservation(ctx, services.GatewayObservationRecordInput{
+		RequestID:                prepared.RequestID,
+		OrgID:                    validated.Organization.ID,
+		GatewayAPIKeyID:          validated.APIKeyID,
+		SessionID:                prepared.SessionID,
+		ChainID:                  prepared.ChainID,
+		ParentRequestID:          prepared.ParentRequestID,
+		EndpointKind:             observed.EndpointKind,
+		EndpointFamily:           observed.EndpointFamily,
+		Method:                   observed.Method,
+		Path:                     observed.Path,
+		Provider:                 observed.Provider,
+		Model:                    observed.Model,
+		KeySource:                keySource,
+		AccessCredential:         services.AccessCredentialGatewayAPIKey,
+		StatusCode:               completion.StatusCode,
+		DurationMS:               completion.DurationMS,
+		InputContextFingerprint:  observed.InputContextFingerprint,
+		OutputContextFingerprint: completion.OutputContextFingerprint,
+		RequestSummary:           observed.RequestSummary,
+		ResponseSummary:          completion.ResponseSummary,
+		RequestBody:              observed.RequestBody,
+		ResponseBody:             completion.ResponseBody,
+		ErrorSummary:             completion.ErrorSummary,
+		ErrorJSON:                completion.ErrorJSON,
+		StartedAt:                startedAt,
+		CompletedAt:              completedAt,
+		RunTrace:                 completion.RunTrace,
+	}); err != nil {
+		s.logger.Error("record gateway observation failed", "request_id", prepared.RequestID, "error", err)
+		return
+	}
+	s.recordObservedGatewayUsage(ctx, validated.Organization.ID, observed, completion, keySource)
+}
+
+func (s *betaServer) recordObservedGatewayUsage(ctx context.Context, orgID string, observed *observedGatewayRequest, completion *observedGatewayCompletion, keySource services.KeySource) {
+	if observed == nil || completion == nil || completion.StatusCode >= http.StatusBadRequest || completion.Usage == nil {
+		return
+	}
+	var meta map[string]any
+	switch observed.EndpointFamily {
+	case endpointKindMessages:
 		var req types.MessageRequest
-		_ = json.Unmarshal(body, &req)
-		resp, err := types.UnmarshalMessageResponse(writer.Body())
-		if err != nil {
-			s.logger.Error("parse message response failed", "error", err)
-			return
+		if err := json.Unmarshal([]byte(observed.RequestBody), &req); err == nil {
+			meta = pricingMetadataForGatewayRequest(&req)
 		}
-		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_messages", req.Model, keySource, services.AccessCredentialGatewayAPIKey, resp.Usage, pricingMetadataForGatewayRequest(&req))
-	case "/v1/runs":
+	case endpointKindRuns:
 		var req types.RunRequest
-		_ = json.Unmarshal(body, &req)
-		var env types.RunResultEnvelope
-		if err := json.Unmarshal(writer.Body(), &env); err != nil || env.Result == nil {
-			if err != nil {
-				s.logger.Error("parse run response failed", "error", err)
-			}
-			return
+		if err := json.Unmarshal([]byte(observed.RequestBody), &req); err == nil {
+			meta = pricingMetadataForGatewayRequest(&req.Request)
 		}
-		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_runs", req.Request.Model, keySource, services.AccessCredentialGatewayAPIKey, env.Result.Usage, pricingMetadataForGatewayRequest(&req.Request))
-	case "/v1/runs:stream":
-		var req types.RunRequest
-		_ = json.Unmarshal(body, &req)
-		result, err := extractRunResult(writer.Body())
-		if err != nil || result == nil {
-			if err != nil {
-				s.logger.Error("parse run stream failed", "error", err)
-			}
-			return
-		}
-		_ = s.services.RecordUsage(ctx, orgID, "", "", "gateway_runs_stream", req.Request.Model, keySource, services.AccessCredentialGatewayAPIKey, result.Usage, pricingMetadataForGatewayRequest(&req.Request))
+	}
+	if meta == nil {
+		meta = map[string]any{"via": "raw_gateway"}
+	}
+	if err := s.services.RecordUsage(ctx, orgID, "", "", observed.RequestKind, observed.Model, keySource, services.AccessCredentialGatewayAPIKey, *completion.Usage, meta); err != nil {
+		s.logger.Error("record raw gateway usage failed", "request_id", observed.RequestID, "error", err)
 	}
 }
 
@@ -652,7 +804,7 @@ func (s *betaServer) requireActorHTTP(w http.ResponseWriter, r *http.Request) (s
 	return actor, true
 }
 
-func (s *betaServer) buildConversationRunRequest(ctx context.Context, detail *services.ConversationDetail) (*types.RunRequest, error) {
+func (s *betaServer) buildConversationRunRequest(ctx context.Context, detail *services.ConversationDetail, resolvedHeaders http.Header) (*types.RunRequest, error) {
 	messages := make([]types.Message, 0, len(detail.Messages))
 	for _, msg := range detail.Messages {
 		blocks := make([]types.ContentBlock, 0, len(msg.Attachments)+1)
@@ -693,6 +845,8 @@ func (s *betaServer) buildConversationRunRequest(ctx context.Context, detail *se
 		}
 	}
 
+	serverToolsEnabled, serverToolConfig := conversationServerTools(resolvedHeaders)
+
 	return &types.RunRequest{
 		Request: types.MessageRequest{
 			Model:     detail.Conversation.Model,
@@ -702,11 +856,63 @@ func (s *betaServer) buildConversationRunRequest(ctx context.Context, detail *se
 		Run: types.RunConfig{
 			MaxTurns:      8,
 			MaxToolCalls:  8,
-			TimeoutMS:     10 * 60 * 1000,
+			TimeoutMS:     5 * 60 * 1000,
 			ParallelTools: true,
 			ToolTimeoutMS: 30 * 1000,
 		},
+		ServerTools:      serverToolsEnabled,
+		ServerToolConfig: serverToolConfig,
 	}, nil
+}
+
+func conversationServerTools(headers http.Header) ([]string, map[string]any) {
+	if headers == nil {
+		return nil, nil
+	}
+
+	tools := make([]string, 0, 2)
+	config := make(map[string]any, 2)
+
+	if provider := preferredWebSearchProvider(headers); provider != "" {
+		tools = append(tools, servertools.ToolWebSearch)
+		config[servertools.ToolWebSearch] = map[string]any{
+			"provider": provider,
+		}
+	}
+	if provider := preferredWebFetchProvider(headers); provider != "" {
+		tools = append(tools, servertools.ToolWebFetch)
+		config[servertools.ToolWebFetch] = map[string]any{
+			"provider": provider,
+			"format":   "markdown",
+		}
+	}
+
+	if len(tools) == 0 {
+		return nil, nil
+	}
+	return tools, config
+}
+
+func preferredWebSearchProvider(headers http.Header) string {
+	switch {
+	case strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyTavily)) != "":
+		return servertools.ProviderTavily
+	case strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyExa)) != "":
+		return servertools.ProviderExa
+	default:
+		return ""
+	}
+}
+
+func preferredWebFetchProvider(headers http.Header) string {
+	switch {
+	case strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyFirecrawl)) != "":
+		return servertools.ProviderFirecrawl
+	case strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyTavily)) != "":
+		return servertools.ProviderTavily
+	default:
+		return ""
+	}
 }
 
 type captureWriter struct {
@@ -764,6 +970,10 @@ type sseEvent struct {
 	Data  string
 }
 
+type gatewayErrorEnvelope struct {
+	Error any `json:"error"`
+}
+
 func extractRunResult(raw []byte) (*types.RunResult, error) {
 	events := parseSSE(raw)
 	for i := len(events) - 1; i >= 0; i-- {
@@ -805,6 +1015,30 @@ func parseSSE(raw []byte) []sseEvent {
 		}
 	}
 	return events
+}
+
+func extractGatewayErrorMessage(raw []byte) string {
+	var env gatewayErrorEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return ""
+	}
+	switch value := env.Error.(type) {
+	case map[string]any:
+		if message, _ := value["message"].(string); strings.TrimSpace(message) != "" {
+			return strings.TrimSpace(message)
+		}
+	case string:
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func writeGatewayError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message": strings.TrimSpace(message),
+		},
+	})
 }
 
 func decodeJSON(r *http.Request, dst any) error {
