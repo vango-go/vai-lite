@@ -1,9 +1,0 @@
-./client.go
-./errors.go
-./options.go
-./provider.go
-./request.go
-./response.go
-./stream.go
-./tools.go
-./types.go

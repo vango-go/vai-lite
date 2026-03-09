@@ -27,6 +27,9 @@
 *~
 .DS_Store
 
+# Vango cache
+.vango/
+
 # Dependencies
 /vendor/
 

@@ -1,7 +1,0 @@
-./config.go
-./helpers.go
-./image.go
-./image_refs.go
-./registry.go
-./web_fetch.go
-./web_search.go

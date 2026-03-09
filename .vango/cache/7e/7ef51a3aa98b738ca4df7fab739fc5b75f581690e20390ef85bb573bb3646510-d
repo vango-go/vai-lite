@@ -1,8 +1,0 @@
-./config.go
-./connect.go
-./db.go
-./doc.go
-./errors.go
-./helpers.go
-./pool.go
-./testkit.go

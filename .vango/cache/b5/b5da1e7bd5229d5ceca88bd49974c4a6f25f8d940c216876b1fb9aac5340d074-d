@@ -1,4 +1,0 @@
-./client.go
-./cryptography.go
-./vault.go
-./vault_live_example.go
