@@ -26,9 +26,9 @@ func TestRunMain_ReturnsNonZeroWhenConfigLoadFails(t *testing.T) {
 		loadConfig: func() (config.Config, error) {
 			return config.Config{}, errors.New("boom")
 		},
-		newGateway: func(cfg config.Config, logger *slog.Logger) *gatewayserver.Server {
+		newGateway: func(ctx context.Context, cfg config.Config, logger *slog.Logger) (*gatewayserver.Server, error) {
 			t.Fatalf("newGateway should not be called when config load fails")
-			return nil
+			return nil, nil
 		},
 		signalNotify: func(c chan<- os.Signal, sig ...os.Signal) {},
 		signalStop:   func(c chan<- os.Signal) {},
@@ -59,9 +59,9 @@ func TestRunMain_FormatsStructuredErrors(t *testing.T) {
 				ProviderError: map[string]any{"reason": "misconfigured"},
 			}
 		},
-		newGateway: func(cfg config.Config, logger *slog.Logger) *gatewayserver.Server {
+		newGateway: func(ctx context.Context, cfg config.Config, logger *slog.Logger) (*gatewayserver.Server, error) {
 			t.Fatalf("newGateway should not be called when config load fails")
-			return nil
+			return nil, nil
 		},
 		signalNotify: func(c chan<- os.Signal, sig ...os.Signal) {},
 		signalStop:   func(c chan<- os.Signal) {},

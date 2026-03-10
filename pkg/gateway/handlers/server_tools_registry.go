@@ -15,6 +15,13 @@ import (
 )
 
 func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *http.Request, enabled []string, rawConfig map[string]any) (*servertools.Registry, error) {
+	if r == nil {
+		return newServerToolsRegistryFromHeaders(cfg, baseHTTPClient, nil, enabled, rawConfig)
+	}
+	return newServerToolsRegistryFromHeaders(cfg, baseHTTPClient, r.Header, enabled, rawConfig)
+}
+
+func newServerToolsRegistryFromHeaders(cfg config.Config, baseHTTPClient *http.Client, headers http.Header, enabled []string, rawConfig map[string]any) (*servertools.Registry, error) {
 	enabledSet := make(map[string]struct{}, len(enabled))
 	for i, name := range enabled {
 		name = strings.TrimSpace(name)
@@ -64,8 +71,8 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 		}
 
 		if searchConfig.Provider == "" {
-			hasTavilyKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyTavily)) != ""
-			hasExaKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyExa)) != ""
+			hasTavilyKey := strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyTavily)) != ""
+			hasExaKey := strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyExa)) != ""
 			if hasTavilyKey == hasExaKey {
 				msg := "server_tool_config.vai_web_search.provider is required"
 				if hasTavilyKey && hasExaKey {
@@ -86,7 +93,7 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 		}
 
 		searchHeader := servertools.ProviderHeaderName(searchConfig.Provider)
-		searchKey := strings.TrimSpace(r.Header.Get(searchHeader))
+		searchKey := strings.TrimSpace(headers.Get(searchHeader))
 		if searchKey == "" {
 			return nil, &core.Error{
 				Type:    core.ErrAuthentication,
@@ -132,8 +139,8 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 			}
 		}
 		if fetchConfig.Provider == "" {
-			hasTavilyKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyTavily)) != ""
-			hasFirecrawlKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyFirecrawl)) != ""
+			hasTavilyKey := strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyTavily)) != ""
+			hasFirecrawlKey := strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyFirecrawl)) != ""
 			if hasTavilyKey == hasFirecrawlKey {
 				msg := "server_tool_config.vai_web_fetch.provider is required"
 				if hasTavilyKey && hasFirecrawlKey {
@@ -153,7 +160,7 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 			}
 		}
 		fetchHeader := servertools.ProviderHeaderName(fetchConfig.Provider)
-		fetchKey := strings.TrimSpace(r.Header.Get(fetchHeader))
+		fetchKey := strings.TrimSpace(headers.Get(fetchHeader))
 		if fetchKey == "" {
 			return nil, &core.Error{
 				Type:    core.ErrAuthentication,
@@ -199,8 +206,8 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 			}
 		}
 		if imageConfig.Provider == "" {
-			hasGemKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyGemini)) != ""
-			hasVertexKey := strings.TrimSpace(r.Header.Get(servertools.HeaderProviderKeyVertexAI)) != ""
+			hasGemKey := strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyGemini)) != ""
+			hasVertexKey := strings.TrimSpace(headers.Get(servertools.HeaderProviderKeyVertexAI)) != ""
 			if hasGemKey == hasVertexKey {
 				msg := "server_tool_config.vai_image.provider is required"
 				if hasGemKey && hasVertexKey {
@@ -220,7 +227,7 @@ func newServerToolsRegistry(cfg config.Config, baseHTTPClient *http.Client, r *h
 			}
 		}
 		imageHeader := servertools.ProviderHeaderName(imageConfig.Provider)
-		imageKey := strings.TrimSpace(r.Header.Get(imageHeader))
+		imageKey := strings.TrimSpace(headers.Get(imageHeader))
 		if imageKey == "" {
 			return nil, &core.Error{
 				Type:    core.ErrAuthentication,

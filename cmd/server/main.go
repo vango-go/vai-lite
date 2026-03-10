@@ -12,14 +12,16 @@ import (
 	"github.com/vango-go/vai-lite/app/components"
 	"github.com/vango-go/vai-lite/app/routes"
 	"github.com/vango-go/vai-lite/internal/appruntime"
+	"github.com/vango-go/vai-lite/internal/blobstore"
 	"github.com/vango-go/vai-lite/internal/db"
 	"github.com/vango-go/vai-lite/internal/dotenv"
 	"github.com/vango-go/vai-lite/internal/services"
+	assetsvc "github.com/vango-go/vai-lite/pkg/gateway/assets"
+	chainrt "github.com/vango-go/vai-lite/pkg/gateway/chains"
 	gatewayconfig "github.com/vango-go/vai-lite/pkg/gateway/config"
 	gatewayserver "github.com/vango-go/vai-lite/pkg/gateway/server"
 	"github.com/vango-go/vango"
 	neon "github.com/vango-go/vango-neon"
-	s3store "github.com/vango-go/vango-s3"
 	workos "github.com/vango-go/vango-workos"
 	wosvault "github.com/workos/workos-go/v6/pkg/vault"
 )
@@ -82,17 +84,25 @@ func main() {
 		logger.Error("gateway config load failed", "error", err)
 		os.Exit(1)
 	}
-	gw := gatewayserver.New(gwCfg, logger)
+	gwOpts := gatewayserver.Options{}
+	if pool != nil {
+		gwOpts.ChainStore = chainrt.NewPostgresStore(pool)
+	}
+	blobStore, err := blobstore.Build(ctx)
+	if err != nil {
+		logger.Error("blob store config invalid", "error", err)
+		os.Exit(1)
+	}
+	if pool != nil && blobStore != nil {
+		gwOpts.AssetService = assetsvc.NewService(pool, blobStore, nil, assetsvc.Config{
+			StorageProvider: blobstore.ProviderName(),
+		})
+	}
+	gw := gatewayserver.NewWithOptions(gwCfg, logger, gwOpts)
 
 	workosClient, bridge, err := buildWorkOSClient(cfg.BaseURL)
 	if err != nil {
 		logger.Error("workos config invalid", "error", err)
-		os.Exit(1)
-	}
-
-	blobStore, err := buildBlobStore(ctx)
-	if err != nil {
-		logger.Error("blob store config invalid", "error", err)
 		os.Exit(1)
 	}
 
@@ -249,35 +259,6 @@ func buildWorkOSClient(baseURL string) (*workos.Client, *workos.Bridge, error) {
 		return nil, nil, err
 	}
 	return client, client.SessionBridge(), nil
-}
-
-func buildBlobStore(ctx context.Context) (s3store.Store, error) {
-	accessKey := strings.TrimSpace(os.Getenv("S3_ACCESS_KEY_ID"))
-	secretKey := strings.TrimSpace(os.Getenv("S3_SECRET_ACCESS_KEY"))
-	bucket := strings.TrimSpace(os.Getenv("S3_BUCKET"))
-	intentSecret := strings.TrimSpace(os.Getenv("S3_INTENT_SECRET"))
-	if accessKey == "" || secretKey == "" || bucket == "" || intentSecret == "" {
-		return nil, nil
-	}
-
-	if accountID := strings.TrimSpace(os.Getenv("R2_ACCOUNT_ID")); accountID != "" {
-		return s3store.NewR2(ctx, s3store.R2Config{
-			AccountID:       accountID,
-			AccessKeyID:     accessKey,
-			SecretAccessKey: secretKey,
-			Bucket:          bucket,
-			IntentSecret:    intentSecret,
-		})
-	}
-
-	return s3store.New(ctx, s3store.Config{
-		Endpoint:        strings.TrimSpace(os.Getenv("S3_ENDPOINT")),
-		AccessKeyID:     accessKey,
-		SecretAccessKey: secretKey,
-		Bucket:          bucket,
-		Region:          envOr("S3_REGION", "auto"),
-		IntentSecret:    intentSecret,
-	})
 }
 
 func loadGatewayConfigForMonolith() (gatewayconfig.Config, error) {

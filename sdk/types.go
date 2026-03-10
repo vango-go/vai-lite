@@ -145,6 +145,90 @@ type (
 	// ServerRunErrorEvent is the terminal error event.
 	ServerRunErrorEvent = types.RunErrorEvent
 
+	// ChainDefaults are persistent chain defaults.
+	ChainDefaults = types.ChainDefaults
+
+	// ChainRunRecord is durable chain-run metadata.
+	ChainRunRecord = types.ChainRunRecord
+
+	// ChainRunResultEnvelope is the blocking stateful chain run response.
+	ChainRunResultEnvelope = types.ChainRunResultEnvelope
+
+	// ChainContextResponse materializes effective chain context/history.
+	ChainContextResponse = types.ChainContextResponse
+
+	// RunTimelineResponse exposes rich per-run timeline items.
+	RunTimelineResponse = types.RunTimelineResponse
+
+	// EffectiveRequestResponse exposes the effective provider request projection.
+	EffectiveRequestResponse = types.EffectiveRequestResponse
+
+	// AssetUploadIntentRequest creates a gateway-managed asset upload intent.
+	AssetUploadIntentRequest = types.AssetUploadIntentRequest
+
+	// AssetUploadIntentResponse contains the presigned upload details for a new asset.
+	AssetUploadIntentResponse = types.AssetUploadIntentResponse
+
+	// AssetClaimRequest finalizes an uploaded asset into durable gateway storage.
+	AssetClaimRequest = types.AssetClaimRequest
+
+	// AssetRecord is the durable gateway asset metadata record.
+	AssetRecord = types.AssetRecord
+
+	// AssetSignResponse contains a signed asset download URL.
+	AssetSignResponse = types.AssetSignResponse
+
+	// ChainClientFrame is a typed chain websocket client frame.
+	ChainClientFrame = types.ChainClientFrame
+
+	// ChainServerEvent is a typed chain websocket server event.
+	ChainServerEvent = types.ChainServerEvent
+
+	// ChainStartFrame creates a new chain attachment.
+	ChainStartFrame = types.ChainStartFrame
+
+	// ChainAttachFrame attaches to an existing chain.
+	ChainAttachFrame = types.ChainAttachFrame
+
+	// ChainUpdateFrame mutates persistent chain defaults.
+	ChainUpdateFrame = types.ChainUpdateFrame
+
+	// RunStartFrame starts a new run on an attached chain.
+	RunStartFrame = types.RunStartFrame
+
+	// ClientToolResultFrame resumes a pending client tool call.
+	ClientToolResultFrame = types.ClientToolResultFrame
+
+	// ChainCloseFrame gracefully closes an attached chain socket.
+	ChainCloseFrame = types.ChainCloseFrame
+
+	// ChainStartedEvent confirms chain creation and attachment.
+	ChainStartedEvent = types.ChainStartedEvent
+
+	// ChainAttachedEvent confirms attachment to an existing chain.
+	ChainAttachedEvent = types.ChainAttachedEvent
+
+	// ChainUpdatedEvent confirms persistent defaults updates.
+	ChainUpdatedEvent = types.ChainUpdatedEvent
+
+	// RunEnvelopeEvent wraps a gateway run event on the chain socket.
+	RunEnvelopeEvent = types.RunEnvelopeEvent
+
+	// ClientToolCallEvent requests client-side tool execution.
+	ClientToolCallEvent = types.ClientToolCallEvent
+
+	// ChainErrorEvent is the canonical chain/runtime websocket error event.
+	ChainErrorEvent = types.ChainErrorEvent
+
+	// CanonicalError is the transport-independent chain/runtime error envelope.
+	CanonicalError = types.CanonicalError
+
+	// ReplayStatus reports replay coverage on attach.
+	ReplayStatus = types.ReplayStatus
+
+	// AttachmentMode is the chain attachment transport mode.
+	AttachmentMode = types.AttachmentMode
+
 	// LiveSessionStartedEvent confirms live session startup.
 	LiveSessionStartedEvent = types.LiveSessionStartedEvent
 

@@ -16,6 +16,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
+	assetsvc "github.com/vango-go/vai-lite/pkg/gateway/assets"
 	"github.com/vango-go/vai-lite/pkg/gateway/compat"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
@@ -37,6 +38,7 @@ type RunsHandler struct {
 	Limiter    *ratelimit.Limiter
 	Lifecycle  *lifecycle.Lifecycle
 	Stream     bool
+	Assets     *assetsvc.Service
 }
 
 func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +100,12 @@ func (h RunsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	workingReq := *runReq
+	resolvedReq, err := resolveAssetBackedRequest(r.Context(), h.Assets, h.Config, r, &workingReq.Request)
+	if err != nil {
+		h.writeErr(w, reqID, err, false)
+		return
+	}
+	workingReq.Request = *resolvedReq
 	workingReq.Request.Model = modelName
 
 	needsSTT := types.RequestHasAudioSTT(&workingReq.Request)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -154,6 +155,10 @@ func DevelopersPage(p SettingsPageProps) vango.Component {
 				return appruntime.Get().Services.ListAPIKeys(ctx, orgID)
 			},
 		)
+		lastKeys := setup.Signal(&s, []services.APIKeyRecord(nil))
+		keys.OnSuccess(func(items []services.APIKeyRecord) {
+			lastKeys.Set(cloneAPIKeyRecords(items))
+		})
 		createKey := setup.Action(&s,
 			func(ctx context.Context, input string) (*services.CreatedAPIKey, error) {
 				return appruntime.Get().Services.CreateAPIKey(ctx, props.Peek().Actor, input)
@@ -170,6 +175,7 @@ func DevelopersPage(p SettingsPageProps) vango.Component {
 				}
 				createdKey.Set(created)
 				name.Set("")
+				lastKeys.Set(upsertAPIKeyRecord(lastKeys.Get(), created.Record))
 				keys.Refetch()
 			}),
 			vango.ActionOnError(func(err error) {
@@ -179,137 +185,218 @@ func DevelopersPage(p SettingsPageProps) vango.Component {
 			}),
 		)
 		revokeKey := setup.Action(&s,
-			func(ctx context.Context, id string) (struct{}, error) {
-				return struct{}{}, appruntime.Get().Services.RevokeAPIKey(ctx, props.Peek().Actor, id)
+			func(ctx context.Context, id string) (string, error) {
+				return id, appruntime.Get().Services.RevokeAPIKey(ctx, props.Peek().Actor, id)
 			},
 			vango.DropWhileRunning(),
-			vango.ActionOnSuccess(func(any) {
+			vango.ActionOnSuccess(func(result any) {
+				id, _ := result.(string)
+				if strings.TrimSpace(id) != "" {
+					lastKeys.Set(markAPIKeyRevoked(lastKeys.Get(), id, time.Now().UTC()))
+				}
 				keys.Refetch()
 			}),
 		)
 
 		return func() *vango.VNode {
-			return keys.Match(
-				vango.OnLoadingOrPending[[]services.APIKeyRecord](func() *vango.VNode {
-					return LoadingPanel("Loading API keys...")
-				}),
-				vango.OnError[[]services.APIKeyRecord](func(err error) *vango.VNode {
-					return PageErrorPanel(fmt.Errorf("load api keys: %w", err))
-				}),
-				vango.OnReady(func(items []services.APIKeyRecord) *vango.VNode {
-					keyResult := createdKey.Get()
-					haveCreatedKey := keyResult != nil
-					return Section(
-						Class("settings-panel"),
-						H1(Text("Developer access")),
-						P(Text("Create organization-scoped gateway API keys for `/v1/*` clients. Requests without provider headers use billable VAI-hosted access. Requests with provider headers are treated as customer BYOK and remain non-billable.")),
-						Form(
-							Method("POST"),
-							Action("/settings/developers"),
-							OnSubmit(vango.PreventDefault(func() {
-								nextName := strings.TrimSpace(name.Get())
-								switch {
-								case nextName == "":
-									nameError.Set("API key name is required")
-								case len(nextName) < 2:
-									nameError.Set("API key name must be at least 2 characters")
-								case len(nextName) > 100:
-									nameError.Set("API key name must be 100 characters or fewer")
-								default:
-									createKey.Run(nextName)
-								}
-							})),
-							Class("stack"),
-							TestID("developer-key-form"),
-							Label(Text("Key name")),
-							Input(
-								Type("text"),
-								Placeholder("Production backend"),
-								Value(name.Get()),
-								OnInput(func(next string) {
-									name.Set(next)
-									if nameError.Get() != "" {
-										nameError.Set("")
-									}
-								}),
-								TestID("developer-key-name"),
-							),
-							If(nameError.Get() != "",
-								P(Class("error-copy"), Text(nameError.Get())),
-							),
-							Button(
-								Type("submit"),
-								Class("btn btn-primary"),
-								Disabled(createKey.IsRunning()),
-								TestID("developer-key-create"),
-								Text("Create API key"),
-							),
-						),
-						If(createKey.IsRunning(),
-							P(Text("Creating API key...")),
-						),
-						func() *vango.VNode {
-							if !createKey.IsError() || nameError.Get() != "" || createKey.Error() == nil {
-								return nil
+			items, loading, err := resolveAPIKeysData(keys.State(), keys.Data(), keys.Error(), lastKeys.Get())
+			if err != nil {
+				return PageErrorPanel(fmt.Errorf("load api keys: %w", err))
+			}
+			if loading {
+				return LoadingPanel("Loading API keys...")
+			}
+			keyResult := createdKey.Get()
+			haveCreatedKey := keyResult != nil
+			return Section(
+				Class("settings-panel"),
+				H1(Text("Developer access")),
+				P(Text("Create organization-scoped gateway API keys for `/v1/*` clients. Requests without provider headers use billable VAI-hosted access. Requests with provider headers are treated as customer BYOK and remain non-billable.")),
+				Form(
+					Method("POST"),
+					Action("/settings/developers"),
+					OnSubmit(vango.PreventDefault(func() {
+						nextName := strings.TrimSpace(name.Get())
+						switch {
+						case nextName == "":
+							nameError.Set("API key name is required")
+						case len(nextName) < 2:
+							nameError.Set("API key name must be at least 2 characters")
+						case len(nextName) > 100:
+							nameError.Set("API key name must be 100 characters or fewer")
+						default:
+							createKey.Run(nextName)
+						}
+					})),
+					Class("stack"),
+					TestID("developer-key-form"),
+					Label(Text("Key name")),
+					Input(
+						Type("text"),
+						Placeholder("Production backend"),
+						Value(name.Get()),
+						OnInput(func(next string) {
+							name.Set(next)
+							if nameError.Get() != "" {
+								nameError.Set("")
 							}
-							return P(Class("error-copy"), Text(createKey.Error().Error()))
-						}(),
-						func() *vango.VNode {
-							if !haveCreatedKey {
-								return nil
+						}),
+						TestID("developer-key-name"),
+					),
+					If(nameError.Get() != "",
+						P(Class("error-copy"), Text(nameError.Get())),
+					),
+					Button(
+						Type("submit"),
+						Class("btn btn-primary"),
+						Disabled(createKey.IsRunning()),
+						TestID("developer-key-create"),
+						Text("Create API key"),
+					),
+				),
+				If(createKey.IsRunning(),
+					P(Text("Creating API key...")),
+				),
+				func() *vango.VNode {
+					if !createKey.IsError() || nameError.Get() != "" || createKey.Error() == nil {
+						return nil
+					}
+					return P(Class("error-copy"), Text(createKey.Error().Error()))
+				}(),
+				func() *vango.VNode {
+					if !haveCreatedKey {
+						return nil
+					}
+					return Article(
+						Class("settings-panel inset"),
+						H2(Text("API key created")),
+						P(Text("Copy this key now. It will not be shown again.")),
+						Pre(Class("code-block"), Text(keyResult.Token)),
+						P(Textf("Prefix: %s", keyResult.Record.TokenPrefix)),
+					)
+				}(),
+				Div(
+					Class("table-stack"),
+					RangeKeyed(items,
+						func(item services.APIKeyRecord) any { return item.ID },
+						func(item services.APIKeyRecord) *vango.VNode {
+							status := "active"
+							if item.RevokedAt != nil {
+								status = "revoked"
 							}
 							return Article(
-								Class("settings-panel inset"),
-								H2(Text("API key created")),
-								P(Text("Copy this key now. It will not be shown again.")),
-								Pre(Class("code-block"), Text(keyResult.Token)),
-								P(Textf("Prefix: %s", keyResult.Record.TokenPrefix)),
+								Class("card-row"),
+								Div(
+									Strong(Text(item.Name)),
+									P(Textf("Prefix: %s", item.TokenPrefix)),
+									P(Textf("Created: %s", item.CreatedAt.Format(time.RFC822))),
+									P(Textf("Status: %s", status)),
+								),
+								If(item.RevokedAt == nil,
+									Button(
+										Type("button"),
+										Class("btn btn-danger"),
+										Disabled(revokeKey.IsRunning()),
+										TestID("developer-key-revoke-"+item.ID),
+										OnClick(func() {
+											revokeKey.Run(item.ID)
+										}),
+										Text("Revoke"),
+									),
+								),
 							)
-						}(),
-						Div(
-							Class("table-stack"),
-							RangeKeyed(items,
-								func(item services.APIKeyRecord) any { return item.ID },
-								func(item services.APIKeyRecord) *vango.VNode {
-									status := "active"
-									if item.RevokedAt != nil {
-										status = "revoked"
-									}
-									return Article(
-										Class("card-row"),
-										Div(
-											Strong(Text(item.Name)),
-											P(Textf("Prefix: %s", item.TokenPrefix)),
-											P(Textf("Created: %s", item.CreatedAt.Format(time.RFC822))),
-											P(Textf("Status: %s", status)),
-										),
-										If(item.RevokedAt == nil,
-											Button(
-												Type("button"),
-												Class("btn btn-danger"),
-												Disabled(revokeKey.IsRunning()),
-												TestID("developer-key-revoke-"+item.ID),
-												OnClick(func() {
-													revokeKey.Run(item.ID)
-												}),
-												Text("Revoke"),
-											),
-										),
-									)
-								},
-							),
-						),
-						func() *vango.VNode {
-							if !revokeKey.IsError() || revokeKey.Error() == nil {
-								return nil
-							}
-							return P(Class("error-copy"), Text(revokeKey.Error().Error()))
-						}(),
-					)
-				}),
+						},
+					),
+				),
+				func() *vango.VNode {
+					if !revokeKey.IsError() || revokeKey.Error() == nil {
+						return nil
+					}
+					return P(Class("error-copy"), Text(revokeKey.Error().Error()))
+				}(),
 			)
 		}
 	})
+}
+
+func resolveAPIKeysData(state vango.ResourceState, current []services.APIKeyRecord, currentErr error, last []services.APIKeyRecord) ([]services.APIKeyRecord, bool, error) {
+	switch state {
+	case vango.Ready:
+		return current, false, nil
+	case vango.Error:
+		if last != nil {
+			return cloneAPIKeyRecords(last), false, nil
+		}
+		return nil, false, currentErr
+	default:
+		if last != nil {
+			return cloneAPIKeyRecords(last), false, nil
+		}
+		return nil, true, nil
+	}
+}
+
+func cloneAPIKeyRecords(items []services.APIKeyRecord) []services.APIKeyRecord {
+	if items == nil {
+		return nil
+	}
+	out := make([]services.APIKeyRecord, len(items))
+	for i := range items {
+		out[i] = cloneAPIKeyRecord(items[i])
+	}
+	return out
+}
+
+func cloneAPIKeyRecord(item services.APIKeyRecord) services.APIKeyRecord {
+	cloned := item
+	if item.LastUsedAt != nil {
+		lastUsedAt := *item.LastUsedAt
+		cloned.LastUsedAt = &lastUsedAt
+	}
+	if item.RevokedAt != nil {
+		revokedAt := *item.RevokedAt
+		cloned.RevokedAt = &revokedAt
+	}
+	return cloned
+}
+
+func upsertAPIKeyRecord(items []services.APIKeyRecord, item services.APIKeyRecord) []services.APIKeyRecord {
+	out := make([]services.APIKeyRecord, 0, len(items)+1)
+	found := false
+	for _, existing := range items {
+		if existing.ID == item.ID {
+			out = append(out, cloneAPIKeyRecord(item))
+			found = true
+			continue
+		}
+		out = append(out, cloneAPIKeyRecord(existing))
+	}
+	if !found {
+		out = append(out, cloneAPIKeyRecord(item))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out
+}
+
+func markAPIKeyRevoked(items []services.APIKeyRecord, id string, revokedAt time.Time) []services.APIKeyRecord {
+	if items == nil {
+		return nil
+	}
+	out := cloneAPIKeyRecords(items)
+	for i := range out {
+		if out[i].ID != id {
+			continue
+		}
+		ts := revokedAt
+		out[i].RevokedAt = &ts
+		break
+	}
+	return out
 }
 
 func KeysPage(p SettingsPageProps) vango.Component {

@@ -225,8 +225,11 @@ func (p *Provider) translateContentParts(blocks []types.ContentBlock) []contentP
 		case types.DocumentBlock:
 			// Documents are sent as files
 			part := contentPart{Type: "input_file"}
-			// If we have base64, we'd need to upload as file first
-			// For now, treat as inline if possible
+			if b.Source.Type == "url" {
+				part.FileURL = b.Source.URL
+			} else if b.Source.MediaType != "" && b.Source.Data != "" {
+				part.FileURL = fmt.Sprintf("data:%s;base64,%s", b.Source.MediaType, b.Source.Data)
+			}
 			parts = append(parts, part)
 
 		case types.ToolUseBlock:

@@ -93,6 +93,9 @@ func TestLiveServiceConnect_SendsStartFrameAndStartupEvent(t *testing.T) {
 		}
 		if err := conn.WriteJSON(types.LiveSessionStartedEvent{
 			Type:               "session_started",
+			ChainID:            "chain_live_123",
+			SessionID:          "sess_live_123",
+			ResumeToken:        "chain_rt_live_123",
 			InputFormat:        "pcm_s16le",
 			InputSampleRateHz:  16000,
 			OutputFormat:       "pcm_s16le",
@@ -112,6 +115,7 @@ func TestLiveServiceConnect_SendsStartFrameAndStartupEvent(t *testing.T) {
 	)
 
 	session, err := client.Live.Connect(context.Background(), &LiveConnectRequest{
+		ExternalSessionID: "live_session_123",
 		Request: MessageRequest{
 			Model:    "openai/gpt-5",
 			Messages: []Message{{Role: "user", Content: "hello"}},
@@ -136,6 +140,9 @@ func TestLiveServiceConnect_SendsStartFrameAndStartupEvent(t *testing.T) {
 		if obs.start.Type != "start" {
 			t.Fatalf("start.Type=%q", obs.start.Type)
 		}
+		if obs.start.ExternalSessionID != "live_session_123" {
+			t.Fatalf("external_session_id=%q", obs.start.ExternalSessionID)
+		}
 		if obs.start.RunRequest.Request.Model != "openai/gpt-5" {
 			t.Fatalf("model=%q", obs.start.RunRequest.Request.Model)
 		}
@@ -151,6 +158,15 @@ func TestLiveServiceConnect_SendsStartFrameAndStartupEvent(t *testing.T) {
 		}
 		if started.OutputSampleRateHz != 16000 {
 			t.Fatalf("output sample rate=%d", started.OutputSampleRateHz)
+		}
+		if session.ChainID() != "chain_live_123" {
+			t.Fatalf("ChainID()=%q", session.ChainID())
+		}
+		if session.SessionID() != "sess_live_123" {
+			t.Fatalf("SessionID()=%q", session.SessionID())
+		}
+		if session.ResumeToken() != "chain_rt_live_123" {
+			t.Fatalf("ResumeToken()=%q", session.ResumeToken())
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for startup event")

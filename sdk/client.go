@@ -29,6 +29,8 @@ type Client struct {
 	Messages *MessagesService
 	Runs     *RunsService
 	Live     *LiveService
+	Chains   *ChainsService
+	Assets   *AssetsService
 
 	// Internal
 	core          *core.Engine
@@ -66,6 +68,8 @@ func NewClient(opts ...ClientOption) *Client {
 	c.Messages = &MessagesService{client: c}
 	c.Runs = &RunsService{client: c}
 	c.Live = &LiveService{client: c}
+	c.Chains = &ChainsService{client: c}
+	c.Assets = &AssetsService{client: c}
 	return c
 }
 

@@ -17,7 +17,9 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
+	chainrt "github.com/vango-go/vai-lite/pkg/gateway/chains"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
+	"github.com/vango-go/vai-lite/pkg/gateway/mw"
 )
 
 type fakeLiveSTTSession struct {
@@ -448,6 +450,250 @@ func TestLiveHandler_EmptyMessagesAndZeroRunFieldsStillStartSession(t *testing.T
 	}
 }
 
+func TestLiveHandler_StartsBackedChainAndCommitsHistory(t *testing.T) {
+	oldNewVoicePipeline := newLiveVoicePipelineFunc
+	oldNewSTTSession := newLiveSTTSessionFunc
+	oldNewTTSSession := newLiveTTSSessionFunc
+	defer func() {
+		newLiveVoicePipelineFunc = oldNewVoicePipeline
+		newLiveSTTSessionFunc = oldNewSTTSession
+		newLiveTTSSessionFunc = oldNewTTSSession
+	}()
+
+	newLiveVoicePipelineFunc = func(cartesiaKey string, httpClient *http.Client) *voice.Pipeline {
+		return &voice.Pipeline{}
+	}
+	newLiveSTTSessionFunc = func(ctx context.Context, pipeline *voice.Pipeline, model string) (liveSTTSession, error) {
+		return newFakeLiveSTTSession(), nil
+	}
+	newLiveTTSSessionFunc = func(ctx context.Context, pipeline *voice.Pipeline, voiceCfg *types.VoiceConfig, ttsModel string) (liveTTSSession, error) {
+		audioCh := make(chan []byte)
+		close(audioCh)
+		return &fakeLiveTTSSession{audioCh: audioCh}, nil
+	}
+
+	manager := chainrt.NewManager(chainrt.NewMemoryStore(), chainrt.DefaultManagerConfig())
+	h := LiveHandler{
+		Config: config.Config{
+			WSMaxSessionDuration:      time.Minute,
+			WSMaxSessionsPerPrincipal: 2,
+		},
+		Upstreams: fakeFactory{p: &fakeProvider{streamEvents: chainTestStreamEvents("hello from live")}},
+		Chains:    manager,
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/live", h)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	headers := http.Header{}
+	headers.Set("X-Provider-Key-Anthropic", "sk-test")
+	headers.Set("X-Provider-Key-Cartesia", "sk-cartesia")
+	conn := dialLiveTestConn(t, server.URL, headers)
+	defer conn.Close()
+
+	start := map[string]any{
+		"type":                "start",
+		"external_session_id": "live_session_123",
+		"run_request": map[string]any{
+			"request": map[string]any{
+				"model": "anthropic/test",
+				"voice": map[string]any{
+					"output": map[string]any{
+						"voice":       "a167e0f3-df7e-4d52-a9c3-f949145efdab",
+						"format":      "pcm",
+						"sample_rate": 24000,
+					},
+				},
+			},
+		},
+	}
+	if err := conn.WriteJSON(start); err != nil {
+		t.Fatalf("write start frame: %v", err)
+	}
+
+	started := readLiveEvent(t, conn)
+	if got, _ := started["type"].(string); got != "session_started" {
+		t.Fatalf("type=%v, want session_started", started["type"])
+	}
+	chainID, _ := started["chain_id"].(string)
+	if strings.TrimSpace(chainID) == "" {
+		t.Fatalf("missing chain_id in session_started: %#v", started)
+	}
+	if got, _ := started["session_id"].(string); strings.TrimSpace(got) == "" {
+		t.Fatalf("missing session_id in session_started: %#v", started)
+	}
+	if got, _ := started["resume_token"].(string); !strings.HasPrefix(got, "chain_rt_") {
+		t.Fatalf("resume_token=%q, want chain_rt_*", got)
+	}
+
+	record, err := manager.GetChain(context.Background(), chainID)
+	if err != nil {
+		t.Fatalf("GetChain(start): %v", err)
+	}
+	if record.ActiveAttachment == nil || record.ActiveAttachment.Mode != types.AttachmentModeLiveWS {
+		t.Fatalf("active attachment=%#v, want live_ws", record.ActiveAttachment)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "input_commit",
+		"content": []map[string]any{
+			{"type": "text", "text": "Hello there"},
+		},
+	}); err != nil {
+		t.Fatalf("write input_commit: %v", err)
+	}
+
+	var sawTurnComplete bool
+	deadline := time.Now().Add(5 * time.Second)
+	for !sawTurnComplete && time.Now().Before(deadline) {
+		event := readLiveEvent(t, conn)
+		if got, _ := event["type"].(string); got == "turn_complete" {
+			sawTurnComplete = true
+			history, _ := event["history"].([]any)
+			if len(history) != 2 {
+				t.Fatalf("turn_complete history len=%d, want 2", len(history))
+			}
+		}
+	}
+	if !sawTurnComplete {
+		t.Fatal("expected turn_complete event")
+	}
+
+	ctxResp, err := manager.GetChainContext(context.Background(), chainID)
+	if err != nil {
+		t.Fatalf("GetChainContext: %v", err)
+	}
+	if len(ctxResp.Messages) != 2 {
+		t.Fatalf("chain context len=%d, want 2", len(ctxResp.Messages))
+	}
+	if got := ctxResp.Messages[0].TextContent(); got != "Hello there" {
+		t.Fatalf("user history=%q, want %q", got, "Hello there")
+	}
+	if got := ctxResp.Messages[1].TextContent(); got != "hello from live" {
+		t.Fatalf("assistant history=%q, want %q", got, "hello from live")
+	}
+}
+
+func TestLiveHandler_AttachRejectsCrossOrgEvenWithResumeToken(t *testing.T) {
+	const (
+		ownerKey    = "vai_sk_live_owner"
+		attackerKey = "vai_sk_live_attacker"
+	)
+
+	restore := stubLiveVoiceFactories()
+	defer restore()
+
+	cfg := config.Config{
+		WSMaxSessionDuration:      time.Minute,
+		WSMaxSessionsPerPrincipal: 2,
+		AuthMode:                  config.AuthModeRequired,
+		APIKeys: map[string]struct{}{
+			ownerKey:    {},
+			attackerKey: {},
+		},
+	}
+	h := LiveHandler{
+		Config:    cfg,
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+		Chains:    chainrt.NewManager(chainrt.NewMemoryStore(), chainrt.DefaultManagerConfig()),
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/live", mw.Auth(cfg, h))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ownerConn := dialLiveTestConn(t, server.URL, liveAuthHeaders(ownerKey, ""))
+	defer ownerConn.Close()
+	if err := ownerConn.WriteJSON(minimalLiveStartFrame(nil)); err != nil {
+		t.Fatalf("write live start: %v", err)
+	}
+	started := readLiveEvent(t, ownerConn)
+	if got, _ := started["type"].(string); got != "session_started" {
+		t.Fatalf("type=%v, want session_started", started["type"])
+	}
+
+	attachConn := dialLiveTestConn(t, server.URL, liveAuthHeaders(attackerKey, ""))
+	defer attachConn.Close()
+	if err := attachConn.WriteJSON(minimalLiveStartFrame(map[string]any{
+		"chain_id":     started["chain_id"],
+		"resume_token": started["resume_token"],
+		"takeover":     true,
+	})); err != nil {
+		t.Fatalf("write live attach start: %v", err)
+	}
+	event := readLiveEvent(t, attachConn)
+	if got, _ := event["type"].(string); got != "error" {
+		t.Fatalf("type=%v, want error", event["type"])
+	}
+	if got, _ := event["code"].(string); got != string(types.ErrorCodeAuthResumeTokenInvalid) {
+		t.Fatalf("code=%v, want %q", event["code"], types.ErrorCodeAuthResumeTokenInvalid)
+	}
+}
+
+func TestLiveHandler_AttachRejectsMissingAndWrongActor(t *testing.T) {
+	const ownerKey = "vai_sk_live_actor"
+
+	restore := stubLiveVoiceFactories()
+	defer restore()
+
+	cfg := config.Config{
+		WSMaxSessionDuration:      time.Minute,
+		WSMaxSessionsPerPrincipal: 2,
+		AuthMode:                  config.AuthModeRequired,
+		APIKeys:                   map[string]struct{}{ownerKey: {}},
+	}
+	h := LiveHandler{
+		Config:    cfg,
+		Upstreams: fakeFactory{p: &fakeProvider{}},
+		Chains:    chainrt.NewManager(chainrt.NewMemoryStore(), chainrt.DefaultManagerConfig()),
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/live", mw.Auth(cfg, h))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ownerConn := dialLiveTestConn(t, server.URL, liveAuthHeaders(ownerKey, "user_123"))
+	defer ownerConn.Close()
+	if err := ownerConn.WriteJSON(minimalLiveStartFrame(nil)); err != nil {
+		t.Fatalf("write live start: %v", err)
+	}
+	started := readLiveEvent(t, ownerConn)
+	if got, _ := started["type"].(string); got != "session_started" {
+		t.Fatalf("type=%v, want session_started", started["type"])
+	}
+
+	for _, tc := range []struct {
+		name    string
+		actorID string
+	}{
+		{name: "missing_actor", actorID: ""},
+		{name: "wrong_actor", actorID: "user_456"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := dialLiveTestConn(t, server.URL, liveAuthHeaders(ownerKey, tc.actorID))
+			defer conn.Close()
+			if err := conn.WriteJSON(minimalLiveStartFrame(map[string]any{
+				"chain_id":     started["chain_id"],
+				"resume_token": started["resume_token"],
+				"takeover":     true,
+			})); err != nil {
+				t.Fatalf("write live attach start: %v", err)
+			}
+			event := readLiveEvent(t, conn)
+			if got, _ := event["type"].(string); got != "error" {
+				t.Fatalf("type=%v, want error", event["type"])
+			}
+			if got, _ := event["code"].(string); got != string(types.ErrorCodeAuthActorScopeDenied) {
+				t.Fatalf("code=%v, want %q", event["code"], types.ErrorCodeAuthActorScopeDenied)
+			}
+		})
+	}
+}
+
 func TestNormalizeLiveRunRequestForStrict_SeedsMessagesAndDropsZeroLimits(t *testing.T) {
 	raw := json.RawMessage(`{
 		"request": {
@@ -486,6 +732,63 @@ func TestNormalizeLiveRunRequestForStrict_SeedsMessagesAndDropsZeroLimits(t *tes
 	}
 	if req.Run.ToolTimeoutMS <= 0 {
 		t.Fatalf("run.tool_timeout_ms=%d, want >0 default", req.Run.ToolTimeoutMS)
+	}
+}
+
+func liveAuthHeaders(apiKey, actorID string) http.Header {
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+apiKey)
+	headers.Set("X-Provider-Key-Anthropic", "sk-test")
+	headers.Set("X-Provider-Key-Cartesia", "sk-cartesia")
+	if actorID != "" {
+		headers.Set("X-VAI-Actor-ID", actorID)
+	}
+	return headers
+}
+
+func minimalLiveStartFrame(overrides map[string]any) map[string]any {
+	frame := map[string]any{
+		"type": "start",
+		"run_request": map[string]any{
+			"request": map[string]any{
+				"model": "anthropic/test",
+				"voice": map[string]any{
+					"output": map[string]any{
+						"voice":       "a167e0f3-df7e-4d52-a9c3-f949145efdab",
+						"format":      "pcm",
+						"sample_rate": 24000,
+					},
+				},
+			},
+		},
+	}
+	for key, value := range overrides {
+		frame[key] = value
+	}
+	return frame
+}
+
+func stubLiveVoiceFactories() func() {
+	oldNewVoicePipeline := newLiveVoicePipelineFunc
+	oldNewSTTSession := newLiveSTTSessionFunc
+	oldNewTTSSession := newLiveTTSSessionFunc
+
+	newLiveVoicePipelineFunc = func(cartesiaKey string, httpClient *http.Client) *voice.Pipeline {
+		return &voice.Pipeline{}
+	}
+	newLiveSTTSessionFunc = func(ctx context.Context, pipeline *voice.Pipeline, model string) (liveSTTSession, error) {
+		return newFakeLiveSTTSession(), nil
+	}
+	newLiveTTSSessionFunc = func(ctx context.Context, pipeline *voice.Pipeline, voiceCfg *types.VoiceConfig, ttsModel string) (liveTTSSession, error) {
+		audioCh := make(chan []byte)
+		close(audioCh)
+		return &fakeLiveTTSSession{audioCh: audioCh}, nil
+	}
+
+	return func() {
+		newLiveVoicePipelineFunc = oldNewVoicePipeline
+		newLiveSTTSessionFunc = oldNewSTTSession
+		newLiveTTSSessionFunc = oldNewTTSSession
 	}
 }
 
@@ -1606,7 +1909,7 @@ func TestLiveSession_STTInterruptOutsideGrace_EmitsAudioReset(t *testing.T) {
 	<-done
 }
 
-func TestLiveSession_FinalizeTurn_TruncatesAssistantTextOnInterrupt(t *testing.T) {
+func TestLiveSession_FinalizeTurn_PreservesCanonicalHistoryOnInterrupt(t *testing.T) {
 	session := &liveSession{
 		ctx:    context.Background(),
 		sendCh: make(chan any, 4),
@@ -1666,7 +1969,7 @@ func TestLiveSession_FinalizeTurn_TruncatesAssistantTextOnInterrupt(t *testing.T
 		if found == "" {
 			t.Fatal("did not find assistant text content in history")
 		}
-		want := "Once upon a time, [user interrupt detected]"
+		want := full
 		if found != want {
 			t.Fatalf("assistant_text=%q, want %q", found, want)
 		}

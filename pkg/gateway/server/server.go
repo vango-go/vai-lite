@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"time"
 
+	assetsvc "github.com/vango-go/vai-lite/pkg/gateway/assets"
+	chainrt "github.com/vango-go/vai-lite/pkg/gateway/chains"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	"github.com/vango-go/vai-lite/pkg/gateway/handlers"
 	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
@@ -23,9 +25,20 @@ type Server struct {
 	httpClient *http.Client
 	limiter    *ratelimit.Limiter
 	lifecycle  *lifecycle.Lifecycle
+	chains     *chainrt.Manager
+	assets     *assetsvc.Service
+}
+
+type Options struct {
+	ChainStore   chainrt.Store
+	AssetService *assetsvc.Service
 }
 
 func New(cfg config.Config, logger *slog.Logger) *Server {
+	return NewWithOptions(cfg, logger, Options{})
+}
+
+func NewWithOptions(cfg config.Config, logger *slog.Logger, opts Options) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -61,6 +74,8 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 			MaxConcurrentWSSessions: cfg.WSMaxSessionsPerPrincipal,
 		}),
 		lifecycle: &lifecycle.Lifecycle{},
+		chains:    chainrt.NewManager(opts.ChainStore, chainrt.DefaultManagerConfig()),
+		assets:    opts.AssetService,
 	}
 
 	s.routes()
@@ -78,6 +93,7 @@ func (s *Server) routes() {
 		Logger:     s.logger,
 		Limiter:    s.limiter,
 		Lifecycle:  s.lifecycle,
+		Assets:     s.assets,
 	})
 	s.mux.Handle("/v1/runs", handlers.RunsHandler{
 		Config:     s.cfg,
@@ -87,6 +103,7 @@ func (s *Server) routes() {
 		Limiter:    s.limiter,
 		Lifecycle:  s.lifecycle,
 		Stream:     false,
+		Assets:     s.assets,
 	})
 	s.mux.Handle("/v1/runs:stream", handlers.RunsHandler{
 		Config:     s.cfg,
@@ -96,6 +113,7 @@ func (s *Server) routes() {
 		Limiter:    s.limiter,
 		Lifecycle:  s.lifecycle,
 		Stream:     true,
+		Assets:     s.assets,
 	})
 	s.mux.Handle("/v1/live", handlers.LiveHandler{
 		Config:     s.cfg,
@@ -104,7 +122,44 @@ func (s *Server) routes() {
 		Logger:     s.logger,
 		Limiter:    s.limiter,
 		Lifecycle:  s.lifecycle,
+		Chains:     s.chains,
+		Assets:     s.assets,
 	})
+	s.mux.Handle("/v1/chains/ws", handlers.ChainWSHandler{
+		Config:     s.cfg,
+		Upstreams:  s.upstreams,
+		HTTPClient: s.httpClient,
+		Logger:     s.logger,
+		Limiter:    s.limiter,
+		Lifecycle:  s.lifecycle,
+		Chains:     s.chains,
+		Assets:     s.assets,
+	})
+	s.mux.Handle("/v1/chains", handlers.ChainsHandler{
+		Config:     s.cfg,
+		Upstreams:  s.upstreams,
+		HTTPClient: s.httpClient,
+		Logger:     s.logger,
+		Limiter:    s.limiter,
+		Lifecycle:  s.lifecycle,
+		Chains:     s.chains,
+		Assets:     s.assets,
+	})
+	s.mux.Handle("/v1/chains/", handlers.ChainsHandler{
+		Config:     s.cfg,
+		Upstreams:  s.upstreams,
+		HTTPClient: s.httpClient,
+		Logger:     s.logger,
+		Limiter:    s.limiter,
+		Lifecycle:  s.lifecycle,
+		Chains:     s.chains,
+		Assets:     s.assets,
+	})
+	s.mux.Handle("/v1/assets:upload-intent", handlers.AssetsHandler{Config: s.cfg, Logger: s.logger, Assets: s.assets})
+	s.mux.Handle("/v1/assets:claim", handlers.AssetsHandler{Config: s.cfg, Logger: s.logger, Assets: s.assets})
+	s.mux.Handle("/v1/assets/", handlers.AssetsHandler{Config: s.cfg, Logger: s.logger, Assets: s.assets})
+	s.mux.Handle("/v1/sessions/", handlers.SessionsHandler{Chains: s.chains})
+	s.mux.Handle("/v1/runs/", handlers.ChainRunsReadHandler{Chains: s.chains})
 	s.mux.Handle("/v1/server-tools:execute", handlers.ServerToolsHandler{
 		Config:     s.cfg,
 		HTTPClient: s.httpClient,

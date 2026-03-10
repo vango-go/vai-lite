@@ -22,6 +22,8 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
+	assetsvc "github.com/vango-go/vai-lite/pkg/gateway/assets"
+	chainrt "github.com/vango-go/vai-lite/pkg/gateway/chains"
 	"github.com/vango-go/vai-lite/pkg/gateway/compat"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
@@ -29,7 +31,6 @@ import (
 	"github.com/vango-go/vai-lite/pkg/gateway/mw"
 	"github.com/vango-go/vai-lite/pkg/gateway/principal"
 	"github.com/vango-go/vai-lite/pkg/gateway/ratelimit"
-	"github.com/vango-go/vai-lite/pkg/gateway/runloop"
 	"github.com/vango-go/vai-lite/pkg/gateway/tools/servertools"
 )
 
@@ -61,8 +62,14 @@ const (
 )
 
 type liveInboundStartFrame struct {
-	Type       string          `json:"type"`
-	RunRequest json.RawMessage `json:"run_request"`
+	Type               string          `json:"type"`
+	ExternalSessionID  string          `json:"external_session_id,omitempty"`
+	ChainID            string          `json:"chain_id,omitempty"`
+	ResumeToken        string          `json:"resume_token,omitempty"`
+	AfterEventID       int64           `json:"after_event_id,omitempty"`
+	RequireExactReplay bool            `json:"require_exact_replay,omitempty"`
+	Takeover           bool            `json:"takeover,omitempty"`
+	RunRequest         json.RawMessage `json:"run_request"`
 }
 
 type liveInboundToolResultFrame struct {
@@ -103,10 +110,8 @@ type liveInboundInputClearFrame struct {
 	Type string `json:"type"`
 }
 
-type liveToolResultPayload struct {
-	Content []types.ContentBlock
-	IsError bool
-	Error   *types.Error
+type livePendingToolResult struct {
+	RunID string
 }
 
 type liveCommittedTurn struct {
@@ -150,7 +155,8 @@ type liveTurnRuntime struct {
 	pendingResult       *livePendingTurnResult
 	runCancel           context.CancelFunc
 	baseUserPCM         []byte
-	baseHistory         []types.Message
+	runID               string
+	talkState           *liveTalkTurnState
 }
 
 type liveTalkTTS struct {
@@ -248,7 +254,14 @@ type LiveHandler struct {
 	Logger     *slog.Logger
 	Limiter    *ratelimit.Limiter
 	Lifecycle  *lifecycle.Lifecycle
+	Chains     *chainrt.Manager
+	Assets     *assetsvc.Service
 }
+
+func (h LiveHandler) getConfig() config.Config      { return h.Config }
+func (h LiveHandler) getHTTPClient() *http.Client   { return h.HTTPClient }
+func (h LiveHandler) getUpstreams() ProviderFactory { return h.Upstreams }
+func (h LiveHandler) getAssets() *assetsvc.Service  { return h.Assets }
 
 func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqID, _ := mw.RequestIDFrom(r.Context())
@@ -338,7 +351,10 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeLiveFatalAndClose(conn, err)
 		return
 	}
-	_ = startFrame
+	chains := h.Chains
+	if chains == nil {
+		chains = chainrt.NewManager(nil, chainrt.DefaultManagerConfig())
+	}
 
 	session := &liveSession{
 		ctx:            ctx,
@@ -350,12 +366,18 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		prioritySendCh: make(chan any, 16),
 		sendCh:         make(chan any, 256),
 		state:          liveStateRunning,
-		toolWaiters:    make(map[string]chan liveToolResultPayload),
+		toolWaiters:    make(map[string]livePendingToolResult),
 		runTemplate:    runReq,
 		controllerCfg:  sessionCfg,
+		chains:         chains,
 	}
-	session.serverRegistry = sessionCfg.ServerRegistry
-	session.toolExec = &liveToolExecutor{session: session}
+	pr := chainPrincipalFromRequest(r, h.Config)
+	session.runtimeEnv = chainEnv(h, pr, r.Header, types.AttachmentModeLiveWS, "live", true, session.handleChainEvent)
+	if err := session.startOrAttachChain(ctx, startFrame); err != nil {
+		h.writeLiveFatalAndClose(conn, err)
+		return
+	}
+	defer session.detachChain(context.Background(), "socket_closed")
 
 	session.sttSession, err = newLiveSTTSessionFunc(ctx, sessionCfg.VoicePipeline, sessionCfg.ResolvedSTTModel)
 	if err != nil {
@@ -378,6 +400,9 @@ func (h LiveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !session.send(types.LiveSessionStartedEvent{
 		Type:               "session_started",
+		ChainID:            session.chainID,
+		SessionID:          session.sessionID,
+		ResumeToken:        session.resumeToken,
 		InputFormat:        liveInputFormat,
 		InputSampleRateHz:  liveInputSampleRateHz,
 		OutputFormat:       liveOutputFormat,
@@ -409,11 +434,14 @@ type liveSessionConfig struct {
 	ProviderName       string
 	PublicModel        string
 	ModelName          string
-	Provider           core.Provider
 	VoicePipeline      *voice.Pipeline
 	ResolvedSTTModel   string
 	OutputSampleRateHz int
-	ServerRegistry     *servertools.Registry
+	ServerTools        []string
+	ServerToolConfig   map[string]any
+	ChainDefaults      types.ChainDefaults
+	ExternalSessionID  string
+	AttachFrame        *types.ChainAttachFrame
 }
 
 func (h LiveHandler) readAndValidateLiveStart(ctx context.Context, r *http.Request, conn *websocket.Conn) (*liveInboundStartFrame, *types.RunRequest, *liveSessionConfig, error) {
@@ -568,8 +596,7 @@ func (h LiveHandler) readAndValidateLiveStart(ctx context.Context, r *http.Reque
 	}
 	runReq.Request.STTModel = resolvedSTTModel.Raw
 
-	provider, err := h.Upstreams.New(providerName, upstreamKey)
-	if err != nil {
+	if _, err := h.Upstreams.New(providerName, upstreamKey); err != nil {
 		coreErr, _ := coreErrorFrom(err, reqID)
 		return nil, nil, nil, coreErr
 	}
@@ -585,26 +612,49 @@ func (h LiveHandler) readAndValidateLiveStart(ctx context.Context, r *http.Reque
 		coreErr, _ := coreErrorFrom(err, reqID)
 		return nil, nil, nil, coreErr
 	}
-	injectedTools, err := injectLiveTools(runReq.Request.Tools, effectiveServerTools, registry)
-	if err != nil {
+	if err := validateLiveToolSelection(runReq.Request.Tools, effectiveServerTools, registry); err != nil {
 		coreErr, _ := coreErrorFrom(err, reqID)
 		return nil, nil, nil, coreErr
 	}
-	runReq.Request.Tools = injectedTools
 	runReq.Request.System = ensureLiveAssistantSpeechSystem(runReq.Request.System)
 
 	publicModel := runReq.Request.Model
 	runReq.Request.Model = modelName
 
+	var attachFrame *types.ChainAttachFrame
+	if chainID := strings.TrimSpace(start.ChainID); chainID != "" {
+		if strings.TrimSpace(start.ResumeToken) == "" {
+			return nil, nil, nil, &core.Error{
+				Type:      core.ErrAuthentication,
+				Message:   "resume_token is required when chain_id is provided",
+				Param:     "resume_token",
+				Code:      "resume_token_required",
+				RequestID: reqID,
+			}
+		}
+		attachFrame = &types.ChainAttachFrame{
+			Type:               "chain.attach",
+			IdempotencyKey:     liveIdempotencyKey("attach", reqID, 0),
+			ChainID:            chainID,
+			ResumeToken:        strings.TrimSpace(start.ResumeToken),
+			AfterEventID:       start.AfterEventID,
+			RequireExactReplay: start.RequireExactReplay,
+			Takeover:           start.Takeover,
+		}
+	}
+
 	return &start, runReq, &liveSessionConfig{
 		ProviderName:       providerName,
 		PublicModel:        publicModel,
 		ModelName:          modelName,
-		Provider:           provider,
 		VoicePipeline:      voicePipeline,
 		ResolvedSTTModel:   resolvedSTTModel.Model,
 		OutputSampleRateHz: runReq.Request.Voice.Output.SampleRate,
-		ServerRegistry:     registry,
+		ServerTools:        append([]string(nil), effectiveServerTools...),
+		ServerToolConfig:   cloneJSON(runReq.ServerToolConfig),
+		ChainDefaults:      buildLiveChainDefaults(runReq, publicModel, effectiveServerTools),
+		ExternalSessionID:  strings.TrimSpace(start.ExternalSessionID),
+		AttachFrame:        attachFrame,
 	}, nil
 }
 
@@ -612,14 +662,22 @@ func (h LiveHandler) writeLiveFatalAndClose(conn *websocket.Conn, err error) {
 	if conn == nil {
 		return
 	}
-	coreErr, _ := coreErrorFrom(err, "")
 	msg := "internal error"
 	code := ""
-	if coreErr != nil {
-		if strings.TrimSpace(coreErr.Message) != "" {
-			msg = coreErr.Message
+	var canonicalErr *types.CanonicalError
+	if errors.As(err, &canonicalErr) && canonicalErr != nil {
+		if strings.TrimSpace(canonicalErr.Message) != "" {
+			msg = canonicalErr.Message
 		}
-		code = strings.TrimSpace(coreErr.Code)
+		code = strings.TrimSpace(string(canonicalErr.Code))
+	} else {
+		coreErr, _ := coreErrorFrom(err, "")
+		if coreErr != nil {
+			if strings.TrimSpace(coreErr.Message) != "" {
+				msg = coreErr.Message
+			}
+			code = strings.TrimSpace(coreErr.Code)
+		}
 	}
 	_ = conn.WriteJSON(types.LiveErrorEvent{
 		Type:    "error",
@@ -655,20 +713,161 @@ type liveSession struct {
 	activeTurn       *liveTurnRuntime
 	aggregatePrefix  []byte
 	history          []types.Message
-	toolWaiters      map[string]chan liveToolResultPayload
+	toolWaiters      map[string]livePendingToolResult
 
 	commitCh chan liveCommittedTurn
 
-	runTemplate    *types.RunRequest
-	controllerCfg  *liveSessionConfig
-	serverRegistry *servertools.Registry
-	toolExec       *liveToolExecutor
+	runTemplate   *types.RunRequest
+	controllerCfg *liveSessionConfig
+	chains        *chainrt.Manager
+	chainID       string
+	sessionID     string
+	resumeToken   string
+	attachmentID  string
+	runtimeEnv    chainrt.RuntimeEnvironment
 
-	sttSession liveSTTSession
-	sttFailed  bool
-
-	execCounter atomic.Uint64
+	sttSession  liveSTTSession
+	sttFailed   bool
 	turnCounter atomic.Uint64
+}
+
+func (s *liveSession) startOrAttachChain(ctx context.Context, start *liveInboundStartFrame) error {
+	if s == nil || s.chains == nil || s.controllerCfg == nil {
+		return errors.New("live chain runtime is not configured")
+	}
+	if s.controllerCfg.AttachFrame != nil {
+		attached, _, attachmentID, err := s.chains.AttachChain(ctx, s.runtimeEnv.Principal, s.runtimeEnv, *s.controllerCfg.AttachFrame)
+		if err != nil {
+			return err
+		}
+		if attached.ActiveRun != nil {
+			_ = s.chains.Detach(context.Background(), attached.ChainID, attachmentID, "unsupported_active_run")
+			return types.NewCanonicalError(types.ErrorCodeProtocolUnsupportedCapability, "attaching /v1/live to a chain with an active run is not supported yet").WithChain(attached.ChainID)
+		}
+		s.chainID = attached.ChainID
+		s.sessionID = attached.SessionID
+		s.resumeToken = attached.ResumeToken
+		s.attachmentID = attachmentID
+		if ctxResp, err := s.chains.GetChainContext(ctx, attached.ChainID); err == nil {
+			s.history = cloneMessages(ctxResp.Messages)
+		}
+		return nil
+	}
+
+	event, attachmentID, err := s.chains.StartChain(ctx, s.runtimeEnv.Principal, s.runtimeEnv, types.ChainStartPayload{
+		ExternalSessionID: s.controllerCfg.ExternalSessionID,
+		Defaults:          cloneJSON(s.controllerCfg.ChainDefaults),
+		History:           cloneMessages(s.runTemplate.Request.Messages),
+		Metadata:          cloneJSON(s.runTemplate.Request.Metadata),
+	}, liveIdempotencyKey("start", s.reqID, 0))
+	if err != nil {
+		return err
+	}
+	s.chainID = event.ChainID
+	s.sessionID = event.SessionID
+	s.resumeToken = event.ResumeToken
+	s.attachmentID = attachmentID
+	s.history = cloneMessages(s.runTemplate.Request.Messages)
+	_ = start
+	return nil
+}
+
+func (s *liveSession) detachChain(ctx context.Context, reason string) {
+	if s == nil || s.chains == nil {
+		return
+	}
+	chainID := strings.TrimSpace(s.chainID)
+	attachmentID := strings.TrimSpace(s.attachmentID)
+	if chainID == "" || attachmentID == "" {
+		return
+	}
+	_ = s.chains.Detach(ctx, chainID, attachmentID, reason)
+}
+
+func (s *liveSession) handleChainEvent(event types.ChainServerEvent) error {
+	if s == nil {
+		return nil
+	}
+	switch ev := event.(type) {
+	case types.RunEnvelopeEvent:
+		s.mu.Lock()
+		active := s.activeTurn
+		if active != nil {
+			active.runID = ev.RunID
+		}
+		var talkState *liveTalkTurnState
+		if active != nil {
+			talkState = active.talkState
+		}
+		s.mu.Unlock()
+		if talkState != nil {
+			if err := talkState.handleRunEvent(ev.Event); err != nil {
+				return err
+			}
+		}
+		return nil
+	case types.ClientToolCallEvent:
+		s.markToolCalledForRun(ev.RunID)
+		s.mu.Lock()
+		s.toolWaiters[ev.ExecutionID] = livePendingToolResult{RunID: ev.RunID}
+		s.mu.Unlock()
+		if !s.send(types.LiveToolCallEvent{
+			Type:        "tool_call",
+			TurnID:      s.currentTurnID(),
+			ExecutionID: ev.ExecutionID,
+			Name:        ev.Name,
+			Input:       cloneJSON(ev.Input),
+		}) {
+			return context.Canceled
+		}
+		return nil
+	case types.ChainErrorEvent:
+		if !s.send(types.LiveErrorEvent{
+			Type:    "error",
+			Fatal:   false,
+			Message: ev.Message,
+			Code:    string(ev.Code),
+		}) {
+			return context.Canceled
+		}
+	}
+	return nil
+}
+
+func (s *liveSession) markToolCalledForRun(runID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTurn == nil {
+		return
+	}
+	if runID != "" && s.activeTurn.runID != "" && s.activeTurn.runID != runID {
+		return
+	}
+	s.activeTurn.toolCalled = true
+}
+
+func (s *liveSession) clearToolWaitersForRun(runID string) {
+	if s == nil || strings.TrimSpace(runID) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for executionID, waiter := range s.toolWaiters {
+		if waiter.RunID == runID {
+			delete(s.toolWaiters, executionID)
+		}
+	}
+}
+
+func (s *liveSession) authoritativeHistory(ctx context.Context, fallback []types.Message) []types.Message {
+	if s == nil || s.chains == nil || strings.TrimSpace(s.chainID) == "" {
+		return cloneMessages(fallback)
+	}
+	resp, err := s.chains.GetChainContext(ctx, s.chainID)
+	if err != nil || resp == nil {
+		return cloneMessages(fallback)
+	}
+	return cloneMessages(resp.Messages)
 }
 
 func (s *liveSession) send(event any) bool {
@@ -1022,6 +1221,9 @@ func (s *liveSession) handleToolResultFrame(data []byte) error {
 				toolErr.ProviderError = v
 			}
 		}
+		if len(content) == 0 {
+			content = []types.ContentBlock{types.TextBlock{Type: "text", Text: toolErr.Message}}
+		}
 	}
 
 	s.mu.Lock()
@@ -1039,15 +1241,17 @@ func (s *liveSession) handleToolResultFrame(data []byte) error {
 		})
 		return nil
 	}
-	select {
-	case waiter <- liveToolResultPayload{
-		Content: content,
-		IsError: frame.IsError,
-		Error:   toolErr,
-	}:
-	case <-s.ctx.Done():
+	if s.chains == nil || strings.TrimSpace(s.chainID) == "" {
+		return errors.New("live chain is not initialized")
 	}
-	return nil
+	return s.chains.SubmitClientToolResult(s.ctx, s.chainID, types.ClientToolResultFrame{
+		Type:           "client_tool.result",
+		IdempotencyKey: liveIdempotencyKey("tool_result", execID, 0),
+		RunID:          waiter.RunID,
+		ExecutionID:    execID,
+		Content:        content,
+		IsError:        frame.IsError,
+	})
 }
 
 func (s *liveSession) sttLoop() {
@@ -1227,6 +1431,15 @@ func (s *liveSession) runTurn(committed liveCommittedTurn) {
 	if len(committed.PCM) == 0 && len(committed.Blocks) == 0 {
 		return
 	}
+	if s.chains == nil || strings.TrimSpace(s.chainID) == "" {
+		s.send(types.LiveErrorEvent{
+			Type:    "error",
+			Fatal:   false,
+			Message: "live chain is not initialized",
+			Code:    "live_chain_unavailable",
+		})
+		return
+	}
 
 	runCtx, runCancel := context.WithCancel(s.ctx)
 	speechEnded := committed.SpeechEnded
@@ -1241,6 +1454,7 @@ func (s *liveSession) runTurn(committed liveCommittedTurn) {
 		runCancel:     runCancel,
 		baseUserPCM:   append([]byte(nil), committed.PCM...),
 	}
+	turn.talkState = newLiveTalkTurnState(s, turn.id)
 
 	s.mu.Lock()
 	s.runBusy = true
@@ -1262,33 +1476,20 @@ func (s *liveSession) runTurn(committed liveCommittedTurn) {
 		Content: userBlocks,
 	}
 
-	runReq := cloneRunRequest(s.runTemplate)
-	s.mu.Lock()
-	historyCopy := make([]types.Message, len(s.history))
-	copy(historyCopy, s.history)
-	s.mu.Unlock()
-	runReq.Request.Messages = append(historyCopy, userMsg)
-	runReq.Request.Voice = nil
-	turn.baseHistory = append([]types.Message(nil), runReq.Request.Messages...)
-
-	controller := &runloop.Controller{
-		Provider:          s.controllerCfg.Provider,
-		Tools:             s.toolExec,
-		VoicePipeline:     s.controllerCfg.VoicePipeline,
-		StreamIdleTimeout: 60 * time.Second,
-		RequestID:         s.reqID,
-		PublicModel:       s.controllerCfg.PublicModel,
+	run, result, err := s.chains.RunBlocking(runCtx, s.chainID, s.runtimeEnv, types.RunStartPayload{
+		Input: []types.Message{userMsg},
+	}, liveIdempotencyKey("run", turn.id, 0))
+	if run != nil {
+		s.clearToolWaitersForRun(run.ID)
 	}
-
-	talkState := newLiveTalkTurnState(s, turn.id)
-	result, err := controller.RunStream(runCtx, runReq, func(event types.RunStreamEvent) error {
-		return talkState.handleRunEvent(event)
-	})
-	talkState.finish()
+	turn.talkState.finish()
 
 	s.mu.Lock()
 	if s.activeTurn == turn {
 		turn.runCancel = nil
+		if run != nil {
+			turn.runID = run.ID
+		}
 	}
 	turnCancelled := s.activeTurn == turn && turn.lifecycle == liveTurnLifecycleCancelled
 	turnInterrupted := s.activeTurn == turn && turn.interruptRequested
@@ -1312,24 +1513,15 @@ func (s *liveSession) runTurn(committed liveCommittedTurn) {
 			return
 		}
 	}
-	if result == nil && !turnInterrupted {
-		return
-	}
-	if result != nil && len(result.Messages) == 0 && !turnInterrupted {
-		return
+
+	history := s.authoritativeHistory(context.Background(), nil)
+	if result != nil && len(result.Messages) > 0 {
+		history = cloneMessages(result.Messages)
 	}
 
-	// If this was an interruption-driven cancellation, synthesize a coherent pending history.
 	if turnInterrupted && (result == nil || errors.Is(err, context.Canceled)) {
-		stopReason := types.RunStopReasonCancelled
-		history := append([]types.Message(nil), turn.baseHistory...)
-		if result != nil && len(result.Messages) > 0 {
-			stopReason = result.StopReason
-			history = append([]types.Message(nil), result.Messages...)
-		}
-		history = ensureAssistantTextHistory(history, turn.assistantFullText.String())
 		if !s.setPendingTurnResult(turn.id, &livePendingTurnResult{
-			stopReason: stopReason,
+			stopReason: types.RunStopReasonCancelled,
 			history:    history,
 		}) {
 			return
@@ -1337,10 +1529,13 @@ func (s *liveSession) runTurn(committed liveCommittedTurn) {
 		s.finalizeTurn(turn.id)
 		return
 	}
+	if result == nil {
+		return
+	}
 
 	if !s.setPendingTurnResult(turn.id, &livePendingTurnResult{
 		stopReason: result.StopReason,
-		history:    append([]types.Message(nil), result.Messages...),
+		history:    history,
 	}) {
 		return
 	}
@@ -1451,9 +1646,6 @@ func (s *liveSession) finalizeTurn(turnID string) {
 	if turn.lifecycle == liveTurnLifecycleCancelled || turn.lifecycle == liveTurnLifecycleFinalized || turn.pendingResult == nil {
 		s.mu.Unlock()
 		return
-	}
-	if turn.interruptRequested {
-		s.applyInterruptTruncationLocked(turn)
 	}
 	turn.lifecycle = liveTurnLifecycleFinalized
 	s.history = append([]types.Message(nil), turn.pendingResult.history...)
@@ -2175,119 +2367,39 @@ func (s *liveTalkTurnState) finish() {
 	_ = s.tts.Close()
 }
 
-type liveToolExecutor struct {
-	session *liveSession
-}
-
-func (e *liveToolExecutor) Execute(ctx context.Context, name string, input map[string]any) ([]types.ContentBlock, *types.Error) {
-	if e == nil || e.session == nil {
-		return nil, &types.Error{
-			Type:    string(core.ErrAPI),
-			Message: "live session is not available",
-			Code:    "live_session_unavailable",
-		}
-	}
-	trimmed := strings.TrimSpace(name)
-	if strings.EqualFold(trimmed, "talk_to_user") {
-		return nil, &types.Error{
-			Type:    string(core.ErrInvalidRequest),
-			Message: "talk_to_user is deprecated in live mode; use normal assistant text for speaking",
-			Code:    "talk_to_user_deprecated",
-		}
-	}
-	if e.session.serverRegistry != nil && e.session.serverRegistry.Has(trimmed) {
-		return e.session.serverRegistry.Execute(ctx, trimmed, input)
-	}
-
-	execID := fmt.Sprintf("exec_%d", e.session.execCounter.Add(1))
-	waitCh := make(chan liveToolResultPayload, 1)
-	e.session.mu.Lock()
-	e.session.toolWaiters[execID] = waitCh
-	e.session.mu.Unlock()
-
-	if !e.session.send(types.LiveToolCallEvent{
-		Type:        "tool_call",
-		TurnID:      e.session.currentTurnID(),
-		ExecutionID: execID,
-		Name:        trimmed,
-		Input:       input,
-	}) {
-		e.session.mu.Lock()
-		delete(e.session.toolWaiters, execID)
-		e.session.mu.Unlock()
-		return nil, &types.Error{
-			Type:    string(core.ErrAPI),
-			Message: "live session closed while waiting for tool result",
-			Code:    "tool_result_wait_failed",
-		}
-	}
-
-	select {
-	case payload := <-waitCh:
-		if payload.IsError {
-			if payload.Error != nil {
-				return payload.Content, payload.Error
-			}
-			return payload.Content, &types.Error{
-				Type:    string(core.ErrAPI),
-				Message: "tool execution failed",
-				Code:    "tool_execution_failed",
-			}
-		}
-		return payload.Content, nil
-	case <-ctx.Done():
-		e.session.mu.Lock()
-		delete(e.session.toolWaiters, execID)
-		e.session.mu.Unlock()
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, &types.Error{
-				Type:    string(core.ErrAPI),
-				Message: "tool result timed out",
-				Code:    "tool_timeout",
-			}
-		}
-		return nil, &types.Error{
-			Type:    string(core.ErrAPI),
-			Message: "tool execution canceled",
-			Code:    "tool_canceled",
-		}
-	}
-}
-
-func injectLiveTools(reqTools []types.Tool, serverTools []string, registry *servertools.Registry) ([]types.Tool, error) {
-	out := make([]types.Tool, 0, len(reqTools)+len(serverTools))
-	seenByName := make(map[string]types.Tool, len(reqTools)+len(serverTools))
+func validateLiveToolSelection(reqTools []types.Tool, serverTools []string, registry *servertools.Registry) error {
+	seenByName := make(map[string]struct{}, len(reqTools)+len(serverTools))
 
 	for i, tool := range reqTools {
-		if tool.Type == types.ToolTypeFunction {
-			name := strings.TrimSpace(tool.Name)
-			if name == "" {
-				return nil, &core.Error{
-					Type:    core.ErrInvalidRequest,
-					Message: "function tool name must be non-empty",
-					Param:   fmt.Sprintf("request.tools[%d].name", i),
-					Code:    "run_validation_failed",
-				}
-			}
-			if strings.EqualFold(name, "talk_to_user") {
-				return nil, &core.Error{
-					Type:    core.ErrInvalidRequest,
-					Message: "talk_to_user is deprecated in live mode; use normal assistant text for speaking",
-					Param:   fmt.Sprintf("request.tools[%d].name", i),
-					Code:    "run_validation_failed",
-				}
-			}
-			if _, exists := seenByName[name]; exists {
-				return nil, &core.Error{
-					Type:    core.ErrInvalidRequest,
-					Message: "duplicate function tool name",
-					Param:   fmt.Sprintf("request.tools[%d].name", i),
-					Code:    "run_validation_failed",
-				}
-			}
-			seenByName[name] = tool
+		if tool.Type != types.ToolTypeFunction {
+			continue
 		}
-		out = append(out, tool)
+		name := strings.TrimSpace(tool.Name)
+		if name == "" {
+			return &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: "function tool name must be non-empty",
+				Param:   fmt.Sprintf("request.tools[%d].name", i),
+				Code:    "run_validation_failed",
+			}
+		}
+		if strings.EqualFold(name, "talk_to_user") {
+			return &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: "talk_to_user is deprecated in live mode; use normal assistant text for speaking",
+				Param:   fmt.Sprintf("request.tools[%d].name", i),
+				Code:    "run_validation_failed",
+			}
+		}
+		if _, exists := seenByName[name]; exists {
+			return &core.Error{
+				Type:    core.ErrInvalidRequest,
+				Message: "duplicate function tool name",
+				Param:   fmt.Sprintf("request.tools[%d].name", i),
+				Code:    "run_validation_failed",
+			}
+		}
+		seenByName[name] = struct{}{}
 	}
 
 	for i, name := range serverTools {
@@ -2295,9 +2407,8 @@ func injectLiveTools(reqTools []types.Tool, serverTools []string, registry *serv
 		if name == "" {
 			continue
 		}
-		def, ok := registry.Definition(name)
-		if !ok {
-			return nil, &core.Error{
+		if _, ok := registry.Definition(name); !ok {
+			return &core.Error{
 				Type:    core.ErrInvalidRequest,
 				Message: fmt.Sprintf("unsupported server tool %q", name),
 				Param:   fmt.Sprintf("server_tools[%d]", i),
@@ -2305,17 +2416,53 @@ func injectLiveTools(reqTools []types.Tool, serverTools []string, registry *serv
 			}
 		}
 		if _, exists := seenByName[name]; exists {
-			return nil, &core.Error{
+			return &core.Error{
 				Type:    core.ErrInvalidRequest,
 				Message: "function tool name collides with selected server tool",
 				Param:   fmt.Sprintf("server_tools[%d]", i),
 				Code:    "run_validation_failed",
 			}
 		}
-		seenByName[name] = def
-		out = append(out, def)
+		seenByName[name] = struct{}{}
 	}
-	return out, nil
+	return nil
+}
+
+func buildLiveChainDefaults(runReq *types.RunRequest, publicModel string, serverTools []string) types.ChainDefaults {
+	if runReq == nil {
+		return types.ChainDefaults{Model: publicModel}
+	}
+	req := runReq.Request
+	return types.ChainDefaults{
+		Model:             publicModel,
+		System:            cloneJSON(req.System),
+		Tools:             cloneJSON(req.Tools),
+		GatewayTools:      append([]string(nil), serverTools...),
+		GatewayToolConfig: cloneJSON(runReq.ServerToolConfig),
+		ToolChoice:        cloneJSON(req.ToolChoice),
+		MaxTokens:         req.MaxTokens,
+		Temperature:       cloneJSON(req.Temperature),
+		TopP:              cloneJSON(req.TopP),
+		TopK:              cloneJSON(req.TopK),
+		StopSequences:     append([]string(nil), req.StopSequences...),
+		STTModel:          req.STTModel,
+		TTSModel:          req.TTSModel,
+		OutputFormat:      cloneJSON(req.OutputFormat),
+		Output:            cloneJSON(req.Output),
+		Extensions:        cloneJSON(req.Extensions),
+		Metadata:          cloneJSON(req.Metadata),
+	}
+}
+
+func liveIdempotencyKey(prefix, seed string, seq int) string {
+	seed = strings.TrimSpace(seed)
+	if seed == "" {
+		seed = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	if seq > 0 {
+		return fmt.Sprintf("live_%s_%s_%d", prefix, seed, seq)
+	}
+	return fmt.Sprintf("live_%s_%s", prefix, seed)
 }
 
 func ensureLiveAssistantSpeechSystem(system any) any {

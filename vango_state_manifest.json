@@ -13,7 +13,7 @@
       "debugName": "topup",
       "source": {
         "file": "app/components/settings.go",
-        "line": 489,
+        "line": 576,
         "col": 12
       }
     },
@@ -26,7 +26,7 @@
       "debugName": "topup",
       "source": {
         "file": "app/components/settings.go",
-        "line": 510,
+        "line": 597,
         "col": 3
       }
     },
@@ -39,7 +39,7 @@
       "debugName": "data",
       "source": {
         "file": "app/components/settings.go",
-        "line": 519,
+        "line": 606,
         "col": 11
       }
     },
@@ -52,7 +52,7 @@
       "debugName": "amountUSD",
       "source": {
         "file": "app/components/settings.go",
-        "line": 486,
+        "line": 573,
         "col": 16
       }
     },
@@ -65,7 +65,7 @@
       "debugName": "amountError",
       "source": {
         "file": "app/components/settings.go",
-        "line": 487,
+        "line": 574,
         "col": 18
       }
     },
@@ -78,7 +78,7 @@
       "debugName": "pendingCheckoutURL",
       "source": {
         "file": "app/components/settings.go",
-        "line": 488,
+        "line": 575,
         "col": 25
       }
     },
@@ -260,7 +260,7 @@
       "debugName": "createKey",
       "source": {
         "file": "app/components/settings.go",
-        "line": 157,
+        "line": 162,
         "col": 16
       }
     },
@@ -268,12 +268,12 @@
       "stableID": "f49d5ddb",
       "class": "local",
       "kind": "action",
-      "codecFingerprint": "fp:v1:d7d7e96309bd7c12dc347481a0351d84a6b18616037a2252686623c854502123",
+      "codecFingerprint": "fp:v1:155b953d3844c78c93beb37111823a728df841eb2d9e5ffe465fc28831de7587",
       "persisted": false,
       "debugName": "revokeKey",
       "source": {
         "file": "app/components/settings.go",
-        "line": 181,
+        "line": 187,
         "col": 16
       }
     },
@@ -286,7 +286,7 @@
       "debugName": "keys",
       "source": {
         "file": "app/components/settings.go",
-        "line": 151,
+        "line": 152,
         "col": 11
       }
     },
@@ -299,7 +299,7 @@
       "debugName": "name",
       "source": {
         "file": "app/components/settings.go",
-        "line": 148,
+        "line": 149,
         "col": 11
       }
     },
@@ -312,7 +312,7 @@
       "debugName": "nameError",
       "source": {
         "file": "app/components/settings.go",
-        "line": 149,
+        "line": 150,
         "col": 16
       }
     },
@@ -325,8 +325,21 @@
       "debugName": "createdKey",
       "source": {
         "file": "app/components/settings.go",
-        "line": 150,
+        "line": 151,
         "col": 17
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.DevelopersPage#setup0.local.signal@3": {
+      "stableID": "3d906b0f",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:5b0ae8f64c15b1987f44a236a16a2c7e3184f404e42324344d3a1c37ac90ddbe",
+      "persisted": false,
+      "debugName": "lastKeys",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 158,
+        "col": 15
       }
     },
     "github.com/vango-go/vai-lite/app/components.HomePage#setup0.local.action@0": {
@@ -416,7 +429,7 @@
       "debugName": "storeSecret",
       "source": {
         "file": "app/components/settings.go",
-        "line": 327,
+        "line": 414,
         "col": 18
       }
     },
@@ -429,7 +442,7 @@
       "debugName": "deleteSecret",
       "source": {
         "file": "app/components/settings.go",
-        "line": 346,
+        "line": 433,
         "col": 19
       }
     },
@@ -442,7 +455,7 @@
       "debugName": "secrets",
       "source": {
         "file": "app/components/settings.go",
-        "line": 321,
+        "line": 408,
         "col": 14
       }
     },
@@ -455,7 +468,7 @@
       "debugName": "provider",
       "source": {
         "file": "app/components/settings.go",
-        "line": 318,
+        "line": 405,
         "col": 15
       }
     },
@@ -468,7 +481,7 @@
       "debugName": "secretValue",
       "source": {
         "file": "app/components/settings.go",
-        "line": 319,
+        "line": 406,
         "col": 18
       }
     },
@@ -481,7 +494,7 @@
       "debugName": "formError",
       "source": {
         "file": "app/components/settings.go",
-        "line": 320,
+        "line": 407,
         "col": 16
       }
     },
@@ -494,7 +507,7 @@
       "debugName": "keys",
       "source": {
         "file": "app/components/settings.go",
-        "line": 756,
+        "line": 843,
         "col": 11
       }
     },
@@ -507,8 +520,112 @@
       "debugName": "data",
       "source": {
         "file": "app/components/settings.go",
-        "line": 762,
+        "line": 849,
         "col": 11
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@0": {
+      "stableID": "4dd0a25c",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+      "persisted": false,
+      "debugName": "endpointKind",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 834,
+        "col": 19
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@1": {
+      "stableID": "86d17c8a",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+      "persisted": false,
+      "debugName": "model",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 835,
+        "col": 12
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@2": {
+      "stableID": "f9f8e105",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+      "persisted": false,
+      "debugName": "status",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 836,
+        "col": 13
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@3": {
+      "stableID": "0a8755fa",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+      "persisted": false,
+      "debugName": "apiKeyID",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 837,
+        "col": 15
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@4": {
+      "stableID": "f67982d2",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+      "persisted": false,
+      "debugName": "sessionID",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 838,
+        "col": 16
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@5": {
+      "stableID": "6b10d92b",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+      "persisted": false,
+      "debugName": "chainID",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 839,
+        "col": 14
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@6": {
+      "stableID": "31001743",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:af876b295bffc33b0adb9c5c0331c91afc05d78f4af450ef298f686b3288b9f4",
+      "persisted": false,
+      "debugName": "hours",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 840,
+        "col": 12
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@7": {
+      "stableID": "0634dc04",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+      "persisted": false,
+      "debugName": "requestID",
+      "source": {
+        "file": "app/components/settings.go",
+        "line": 841,
+        "col": 16
       }
     },
     "github.com/vango-go/vai-lite/app/components.SettingsOverviewPage#setup0.local.resource@0": {
@@ -520,7 +637,7 @@
       "debugName": "data",
       "source": {
         "file": "app/components/settings.go",
-        "line": 60,
+        "line": 61,
         "col": 11
       }
     }

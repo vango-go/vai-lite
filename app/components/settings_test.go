@@ -132,6 +132,7 @@ func TestDevelopersPageCreateAndRevokeKey(t *testing.T) {
 
 	h.InputByTestID(m, "developer-key-name", "Production backend")
 	h.SubmitByTestID(m, "developer-key-form")
+	h.AwaitAction(m, "createKey")
 
 	html := h.HTML(m)
 	if !strings.Contains(html, "API key created") {
@@ -145,6 +146,7 @@ func TestDevelopersPageCreateAndRevokeKey(t *testing.T) {
 	}
 
 	h.ClickByTestID(m, "developer-key-revoke-gak_existing")
+	h.AwaitAction(m, "revokeKey")
 
 	html = h.HTML(m)
 	if !strings.Contains(html, "Status: revoked") {
@@ -161,6 +163,102 @@ func TestDevelopersPageCreateAndRevokeKey(t *testing.T) {
 	}
 	if !foundRevoked {
 		t.Fatalf("expected existing key to be revoked, got %#v", keys)
+	}
+}
+
+func TestDevelopersPage_KeepsLastReadyKeysWhileRevokeRefetchIsPending(t *testing.T) {
+	now := time.Date(2026, time.March, 7, 12, 0, 0, 0, time.UTC)
+	store := newTestAPIKeyStore([]services.APIKeyRecord{
+		{
+			ID:          "gak_existing",
+			Name:        "Existing key",
+			TokenPrefix: "vai_sk_existing",
+			CreatedAt:   now.Add(-time.Hour),
+		},
+	})
+	installTestAppRuntime(t, &services.AppServices{
+		DB:           store.db(),
+		DefaultModel: "oai-resp/gpt-5-mini",
+		Pricing:      services.DefaultPricingCatalog(),
+	})
+
+	h := vtest.New(t)
+	m := vtest.Mount(h, DevelopersPage, SettingsPageProps{Actor: testActor()})
+
+	h.AwaitResource(m, "keys")
+	release := store.blockNextQuery()
+
+	h.ClickByTestID(m, "developer-key-revoke-gak_existing")
+	h.AwaitAction(m, "revokeKey")
+
+	html := h.HTML(m)
+	if !strings.Contains(html, "Existing key") {
+		t.Fatalf("expected last ready key list while refetch pending, got HTML:\n%s", html)
+	}
+	if !strings.Contains(html, "Status: revoked") {
+		t.Fatalf("expected optimistic revoked status while refetch pending, got HTML:\n%s", html)
+	}
+
+	close(release)
+	h.AwaitResource(m, "keys")
+
+	html = h.HTML(m)
+	if !strings.Contains(html, "Status: revoked") {
+		t.Fatalf("expected revoked status after refetch completes, got HTML:\n%s", html)
+	}
+}
+
+func TestObservabilityPageLoadsWithoutBindingMismatch(t *testing.T) {
+	now := time.Date(2026, time.March, 10, 16, 0, 0, 0, time.UTC)
+	store := newTestObservabilityStore(
+		[]services.APIKeyRecord{
+			{
+				ID:          "gak_existing",
+				Name:        "Existing key",
+				TokenPrefix: "vai_sk_existing",
+				CreatedAt:   now.Add(-2 * time.Hour),
+			},
+		},
+		[]services.GatewayRequestListEntry{
+			{
+				RequestID:         "req_123",
+				GatewayAPIKeyID:   "gak_existing",
+				GatewayAPIKeyName: "Existing key",
+				GatewayAPIKeyPref: "vai_sk_existing",
+				SessionID:         "sess_123",
+				ChainID:           "chain_123",
+				EndpointKind:      "runs_stream",
+				Model:             "oai-resp/gpt-5-mini",
+				KeySource:         services.KeySourcePlatformHosted,
+				AccessCredential:  services.AccessCredentialGatewayAPIKey,
+				StatusCode:        http.StatusOK,
+				DurationMS:        842,
+				StartedAt:         now.Add(-time.Minute),
+				CompletedAt:       now,
+			},
+		},
+	)
+	installTestAppRuntime(t, &services.AppServices{
+		DB:           store.db(),
+		DefaultModel: "oai-resp/gpt-5-mini",
+		Pricing:      services.DefaultPricingCatalog(),
+	})
+
+	h := vtest.New(t)
+	m := vtest.Mount(h, ObservabilityPage, ObservabilityPageProps{Actor: testActor()})
+
+	h.AwaitResource(m, "keys")
+	h.AwaitResource(m, "data")
+
+	html := h.HTML(m)
+	if !strings.Contains(html, "Gateway observability") {
+		t.Fatalf("expected observability title, got HTML:\n%s", html)
+	}
+	if !strings.Contains(html, "req_123") {
+		t.Fatalf("expected request log row, got HTML:\n%s", html)
+	}
+	if !strings.Contains(html, "Chain chain_123") {
+		t.Fatalf("expected chain metadata in row, got HTML:\n%s", html)
 	}
 }
 
@@ -223,8 +321,9 @@ func (s *testConversationStore) db() *neon.TestDB {
 }
 
 type testAPIKeyStore struct {
-	mu   sync.Mutex
-	keys []services.APIKeyRecord
+	mu             sync.Mutex
+	keys           []services.APIKeyRecord
+	nextQueryBlock chan struct{}
 }
 
 func newTestAPIKeyStore(keys []services.APIKeyRecord) *testAPIKeyStore {
@@ -238,6 +337,14 @@ func (s *testAPIKeyStore) snapshot() []services.APIKeyRecord {
 	return append([]services.APIKeyRecord(nil), s.keys...)
 }
 
+func (s *testAPIKeyStore) blockNextQuery() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := make(chan struct{})
+	s.nextQueryBlock = ch
+	return ch
+}
+
 func (s *testAPIKeyStore) db() *neon.TestDB {
 	return &neon.TestDB{
 		QueryFunc: func(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -246,8 +353,17 @@ func (s *testAPIKeyStore) db() *neon.TestDB {
 			}
 
 			s.mu.Lock()
+			wait := s.nextQueryBlock
+			s.nextQueryBlock = nil
 			snapshot := append([]services.APIKeyRecord(nil), s.keys...)
 			s.mu.Unlock()
+			if wait != nil {
+				select {
+				case <-wait:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
 
 			sort.Slice(snapshot, func(i, j int) bool {
 				return snapshot[i].CreatedAt.After(snapshot[j].CreatedAt)
@@ -295,6 +411,68 @@ func (s *testAPIKeyStore) db() *neon.TestDB {
 			default:
 				return pgconn.CommandTag{}, fmt.Errorf("unexpected exec: %s", strings.TrimSpace(sql))
 			}
+		},
+	}
+}
+
+type testObservabilityStore struct {
+	keys []services.APIKeyRecord
+	logs []services.GatewayRequestListEntry
+}
+
+func newTestObservabilityStore(keys []services.APIKeyRecord, logs []services.GatewayRequestListEntry) *testObservabilityStore {
+	return &testObservabilityStore{
+		keys: append([]services.APIKeyRecord(nil), keys...),
+		logs: append([]services.GatewayRequestListEntry(nil), logs...),
+	}
+}
+
+func (s *testObservabilityStore) db() *neon.TestDB {
+	return &neon.TestDB{
+		QueryFunc: func(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+			switch {
+			case strings.Contains(sql, "FROM gateway_request_logs l"):
+				rows := make([][]any, 0, len(s.logs))
+				for _, item := range s.logs {
+					rows = append(rows, []any{
+						item.RequestID,
+						item.GatewayAPIKeyID,
+						item.GatewayAPIKeyName,
+						item.GatewayAPIKeyPref,
+						item.SessionID,
+						item.ChainID,
+						item.ParentRequestID,
+						item.EndpointKind,
+						item.Model,
+						item.KeySource,
+						item.AccessCredential,
+						item.StatusCode,
+						item.DurationMS,
+						item.ErrorSummary,
+						item.StartedAt,
+						item.CompletedAt,
+					})
+				}
+				return newTestRows(rows...), nil
+			case strings.Contains(sql, "FROM gateway_api_keys"):
+				rows := make([][]any, 0, len(s.keys))
+				for _, key := range s.keys {
+					rows = append(rows, []any{
+						key.ID,
+						key.Name,
+						key.TokenPrefix,
+						key.CreatedAt,
+						key.LastUsedAt,
+						key.RevokedAt,
+					})
+				}
+				return newTestRows(rows...), nil
+			default:
+				return nil, fmt.Errorf("unexpected query: %s", strings.TrimSpace(sql))
+			}
+		},
+		QueryRowFunc: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return &neon.ErrRow{Err: pgx.ErrNoRows}
 		},
 	}
 }

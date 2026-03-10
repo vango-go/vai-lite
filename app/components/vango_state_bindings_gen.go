@@ -7,31 +7,31 @@ package components
 import "github.com/vango-go/vango/pkg/runtime"
 
 func init() {
-	runtime.SetEmbeddedBindingsHash("7616827b193a644e")
+	runtime.SetEmbeddedBindingsHash("2631a657f92f72f0")
 	runtime.RegisterSetupCallsites(map[string][]runtime.SetupCallsite{
 		"github.com/vango-go/vai-lite/app/components.AccessPage": {
-			{Line: 109, SetupIndex: 0},
+			{Line: 110, SetupIndex: 0},
 		},
 		"github.com/vango-go/vai-lite/app/components.BillingPage": {
-			{Line: 484, SetupIndex: 0},
+			{Line: 571, SetupIndex: 0},
 		},
 		"github.com/vango-go/vai-lite/app/components.ChatPage": {
 			{Line: 60, SetupIndex: 0},
 		},
 		"github.com/vango-go/vai-lite/app/components.DevelopersPage": {
-			{Line: 146, SetupIndex: 0},
+			{Line: 147, SetupIndex: 0},
 		},
 		"github.com/vango-go/vai-lite/app/components.HomePage": {
 			{Line: 19, SetupIndex: 0},
 		},
 		"github.com/vango-go/vai-lite/app/components.KeysPage": {
-			{Line: 316, SetupIndex: 0},
+			{Line: 403, SetupIndex: 0},
 		},
 		"github.com/vango-go/vai-lite/app/components.ObservabilityPage": {
-			{Line: 745, SetupIndex: 0},
+			{Line: 832, SetupIndex: 0},
 		},
 		"github.com/vango-go/vai-lite/app/components.SettingsOverviewPage": {
-			{Line: 58, SetupIndex: 0},
+			{Line: 59, SetupIndex: 0},
 		},
 	})
 	runtime.RegisterBindings(map[string]runtime.BindingInfo{
@@ -178,7 +178,7 @@ func init() {
 		"github.com/vango-go/vai-lite/app/components.DevelopersPage#setup0.local.action@1": {
 			StableID:         "f49d5ddb",
 			DebugName:        "revokeKey",
-			CodecFingerprint: "fp:v1:d7d7e96309bd7c12dc347481a0351d84a6b18616037a2252686623c854502123",
+			CodecFingerprint: "fp:v1:155b953d3844c78c93beb37111823a728df841eb2d9e5ffe465fc28831de7587",
 			Kind:             "action",
 			Class:            "local",
 		},
@@ -207,6 +207,13 @@ func init() {
 			StableID:         "ea2f8264",
 			DebugName:        "createdKey",
 			CodecFingerprint: "fp:v1:21ffeba73e1a0b295f09ee478f019089666a9f8d2417e4fc030e0d6ccefc9519",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.DevelopersPage#setup0.local.signal@3": {
+			StableID:         "3d906b0f",
+			DebugName:        "lastKeys",
+			CodecFingerprint: "fp:v1:5b0ae8f64c15b1987f44a236a16a2c7e3184f404e42324344d3a1c37ac90ddbe",
 			Kind:             "signal",
 			Class:            "local",
 		},
@@ -306,6 +313,62 @@ func init() {
 			DebugName:        "data",
 			CodecFingerprint: "fp:v1:4bb35ebb94bcbbfbaa7b61551a25fdb5f25fe6efed3d2b71525839d430fb71cb",
 			Kind:             "resource",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@0": {
+			StableID:         "4dd0a25c",
+			DebugName:        "endpointKind",
+			CodecFingerprint: "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@1": {
+			StableID:         "86d17c8a",
+			DebugName:        "model",
+			CodecFingerprint: "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@2": {
+			StableID:         "f9f8e105",
+			DebugName:        "status",
+			CodecFingerprint: "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@3": {
+			StableID:         "0a8755fa",
+			DebugName:        "apiKeyID",
+			CodecFingerprint: "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@4": {
+			StableID:         "f67982d2",
+			DebugName:        "sessionID",
+			CodecFingerprint: "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@5": {
+			StableID:         "6b10d92b",
+			DebugName:        "chainID",
+			CodecFingerprint: "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@6": {
+			StableID:         "31001743",
+			DebugName:        "hours",
+			CodecFingerprint: "fp:v1:af876b295bffc33b0adb9c5c0331c91afc05d78f4af450ef298f686b3288b9f4",
+			Kind:             "signal",
+			Class:            "local",
+		},
+		"github.com/vango-go/vai-lite/app/components.ObservabilityPage#setup0.local.signal@7": {
+			StableID:         "0634dc04",
+			DebugName:        "requestID",
+			CodecFingerprint: "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
+			Kind:             "signal",
 			Class:            "local",
 		},
 		"github.com/vango-go/vai-lite/app/components.SettingsOverviewPage#setup0.local.resource@0": {

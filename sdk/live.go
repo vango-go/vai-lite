@@ -41,11 +41,17 @@ type LiveService struct {
 
 // LiveConnectRequest configures the initial /v1/live session request.
 type LiveConnectRequest struct {
-	Request          MessageRequest  `json:"request"`
-	Run              ServerRunConfig `json:"run,omitempty"`
-	ServerTools      []string        `json:"server_tools,omitempty"`
-	ServerToolConfig map[string]any  `json:"server_tool_config,omitempty"`
-	Builtins         []string        `json:"builtins,omitempty"`
+	ExternalSessionID  string          `json:"external_session_id,omitempty"`
+	ChainID            string          `json:"chain_id,omitempty"`
+	ResumeToken        string          `json:"resume_token,omitempty"`
+	AfterEventID       int64           `json:"after_event_id,omitempty"`
+	RequireExactReplay bool            `json:"require_exact_replay,omitempty"`
+	Takeover           bool            `json:"takeover,omitempty"`
+	Request            MessageRequest  `json:"request"`
+	Run                ServerRunConfig `json:"run,omitempty"`
+	ServerTools        []string        `json:"server_tools,omitempty"`
+	ServerToolConfig   map[string]any  `json:"server_tool_config,omitempty"`
+	Builtins           []string        `json:"builtins,omitempty"`
 }
 
 // LiveConnectOptions configures client-side live tool execution.
@@ -80,6 +86,11 @@ type LiveSession struct {
 
 	historyMu sync.RWMutex
 	history   []Message
+
+	metaMu      sync.RWMutex
+	chainID     string
+	sessionID   string
+	resumeToken string
 
 	errMu sync.RWMutex
 	err   error
@@ -129,8 +140,14 @@ func (s *LiveService) Connect(ctx context.Context, req *LiveConnectRequest, opts
 	}
 
 	startFrame := types.LiveStartFrame{
-		Type:       "start",
-		RunRequest: liveConnectRequestToRunRequest(preparedReq),
+		Type:               "start",
+		ExternalSessionID:  strings.TrimSpace(preparedReq.ExternalSessionID),
+		ChainID:            strings.TrimSpace(preparedReq.ChainID),
+		ResumeToken:        strings.TrimSpace(preparedReq.ResumeToken),
+		AfterEventID:       preparedReq.AfterEventID,
+		RequireExactReplay: preparedReq.RequireExactReplay,
+		Takeover:           preparedReq.Takeover,
+		RunRequest:         liveConnectRequestToRunRequest(preparedReq),
 	}
 	if err := conn.WriteJSON(startFrame); err != nil {
 		_ = conn.Close()
@@ -154,6 +171,9 @@ func (s *LiveService) Connect(ctx context.Context, req *LiveConnectRequest, opts
 		client:       s.client,
 		conn:         conn,
 		history:      cloneMessages(preparedReq.Request.Messages),
+		chainID:      strings.TrimSpace(started.ChainID),
+		sessionID:    strings.TrimSpace(started.SessionID),
+		resumeToken:  strings.TrimSpace(started.ResumeToken),
 		toolHandlers: handlers,
 		toolTimeout:  liveToolTimeout(preparedReq.Run),
 		events:       make(chan LiveEvent, 64),
@@ -171,6 +191,36 @@ func (s *LiveService) Connect(ctx context.Context, req *LiveConnectRequest, opts
 	go session.awaitTermination()
 
 	return session, nil
+}
+
+// ChainID returns the backing live chain identifier, when provided by the gateway.
+func (s *LiveSession) ChainID() string {
+	if s == nil {
+		return ""
+	}
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	return s.chainID
+}
+
+// SessionID returns the durable gateway session identifier for the live chain, when available.
+func (s *LiveSession) SessionID() string {
+	if s == nil {
+		return ""
+	}
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	return s.sessionID
+}
+
+// ResumeToken returns the latest live chain resume token issued by the gateway.
+func (s *LiveSession) ResumeToken() string {
+	if s == nil {
+		return ""
+	}
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	return s.resumeToken
 }
 
 // Events returns the typed live server event stream.

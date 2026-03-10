@@ -19,6 +19,7 @@ import (
 	"github.com/vango-go/vai-lite/pkg/core/voice"
 	"github.com/vango-go/vai-lite/pkg/core/voice/stt"
 	"github.com/vango-go/vai-lite/pkg/core/voice/tts"
+	assetsvc "github.com/vango-go/vai-lite/pkg/gateway/assets"
 	"github.com/vango-go/vai-lite/pkg/gateway/compat"
 	"github.com/vango-go/vai-lite/pkg/gateway/config"
 	"github.com/vango-go/vai-lite/pkg/gateway/lifecycle"
@@ -40,6 +41,7 @@ type MessagesHandler struct {
 	Logger     *slog.Logger
 	Limiter    *ratelimit.Limiter
 	Lifecycle  *lifecycle.Lifecycle
+	Assets     *assetsvc.Service
 }
 
 func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +137,12 @@ func (h MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	workingReq := *req
+	resolvedReq, err := resolveAssetBackedRequest(r.Context(), h.Assets, h.Config, r, &workingReq)
+	if err != nil {
+		h.writeErr(w, reqID, err, false)
+		return
+	}
+	workingReq = *resolvedReq
 	workingReq.Model = modelName
 
 	// Request-scoped timeout. Streaming requests use the SSE max duration.

@@ -31,10 +31,11 @@ func (t ImageBlock) BlockType() string { return "image" }
 
 // ImageSource contains the image data or reference.
 type ImageSource struct {
-	Type      string `json:"type"`                 // "base64" or "url"
+	Type      string `json:"type"`                 // "base64", "url", or "asset"
 	MediaType string `json:"media_type,omitempty"` // "image/png", etc.
 	Data      string `json:"data,omitempty"`       // base64 data
 	URL       string `json:"url,omitempty"`        // URL reference
+	AssetID   string `json:"asset_id,omitempty"`   // gateway-managed asset reference
 }
 
 // AudioBlock represents audio content.
@@ -57,9 +58,10 @@ func (t AudioSTTBlock) BlockType() string { return "audio_stt" }
 
 // AudioSource contains the audio data.
 type AudioSource struct {
-	Type      string `json:"type"`       // "base64"
-	MediaType string `json:"media_type"` // "audio/wav", "audio/mp3", etc.
-	Data      string `json:"data"`       // base64 data
+	Type      string `json:"type"`                 // "base64" or "asset"
+	MediaType string `json:"media_type,omitempty"` // "audio/wav", "audio/mp3", etc.
+	Data      string `json:"data,omitempty"`       // base64 data
+	AssetID   string `json:"asset_id,omitempty"`   // gateway-managed asset reference
 }
 
 // VideoBlock represents video content.
@@ -72,9 +74,10 @@ func (t VideoBlock) BlockType() string { return "video" }
 
 // VideoSource contains the video data.
 type VideoSource struct {
-	Type      string `json:"type"`       // "base64"
-	MediaType string `json:"media_type"` // "video/mp4"
-	Data      string `json:"data"`
+	Type      string `json:"type"`                 // "base64" or "asset"
+	MediaType string `json:"media_type,omitempty"` // "video/mp4"
+	Data      string `json:"data,omitempty"`
+	AssetID   string `json:"asset_id,omitempty"` // gateway-managed asset reference
 }
 
 // DocumentBlock represents document content (PDF, etc.).
@@ -88,9 +91,11 @@ func (t DocumentBlock) BlockType() string { return "document" }
 
 // DocumentSource contains the document data.
 type DocumentSource struct {
-	Type      string `json:"type"`       // "base64"
-	MediaType string `json:"media_type"` // "application/pdf"
-	Data      string `json:"data"`
+	Type      string `json:"type"`                 // "base64", "url", or "asset"
+	MediaType string `json:"media_type,omitempty"` // "application/pdf"
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+	AssetID   string `json:"asset_id,omitempty"` // gateway-managed asset reference
 }
 
 // ToolResultBlock represents the result of a tool call.

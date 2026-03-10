@@ -52,8 +52,14 @@ func (f LiveInputClearFrame) LiveClientFrameType() string { return "input_clear"
 
 // LiveStartFrame configures a live session.
 type LiveStartFrame struct {
-	Type       string     `json:"type"` // "start"
-	RunRequest RunRequest `json:"run_request"`
+	Type               string     `json:"type"` // "start"
+	ExternalSessionID  string     `json:"external_session_id,omitempty"`
+	ChainID            string     `json:"chain_id,omitempty"`
+	ResumeToken        string     `json:"resume_token,omitempty"`
+	AfterEventID       int64      `json:"after_event_id,omitempty"`
+	RequireExactReplay bool       `json:"require_exact_replay,omitempty"`
+	Takeover           bool       `json:"takeover,omitempty"`
+	RunRequest         RunRequest `json:"run_request"`
 }
 
 func (f LiveStartFrame) LiveClientFrameType() string { return "start" }
@@ -88,6 +94,9 @@ func (f LivePlaybackStateFrame) LiveClientFrameType() string { return "playback_
 // LiveSessionStartedEvent confirms session startup and fixed audio contracts.
 type LiveSessionStartedEvent struct {
 	Type               string `json:"type"` // "session_started"
+	ChainID            string `json:"chain_id,omitempty"`
+	SessionID          string `json:"session_id,omitempty"`
+	ResumeToken        string `json:"resume_token,omitempty"`
 	InputFormat        string `json:"input_format"`
 	InputSampleRateHz  int    `json:"input_sample_rate_hz"`
 	OutputFormat       string `json:"output_format"`

@@ -37,6 +37,17 @@ func ImageURL(url string) types.ContentBlock {
 	}
 }
 
+// ImageAsset creates an image content block backed by a gateway-managed asset.
+func ImageAsset(assetID string) types.ContentBlock {
+	return types.ImageBlock{
+		Type: "image",
+		Source: types.ImageSource{
+			Type:    types.AssetSourceType,
+			AssetID: assetID,
+		},
+	}
+}
+
 // Video creates a video content block.
 func Video(data []byte, mediaType string) types.ContentBlock {
 	return types.VideoBlock{
@@ -45,6 +56,17 @@ func Video(data []byte, mediaType string) types.ContentBlock {
 			Type:      "base64",
 			MediaType: mediaType,
 			Data:      base64.StdEncoding.EncodeToString(data),
+		},
+	}
+}
+
+// VideoAsset creates a video content block backed by a gateway-managed asset.
+func VideoAsset(assetID string) types.ContentBlock {
+	return types.VideoBlock{
+		Type: "video",
+		Source: types.VideoSource{
+			Type:    types.AssetSourceType,
+			AssetID: assetID,
 		},
 	}
 }
@@ -61,6 +83,17 @@ func Audio(data []byte, mediaType string) types.ContentBlock {
 	}
 }
 
+// AudioAsset creates an audio content block backed by a gateway-managed asset.
+func AudioAsset(assetID string) types.ContentBlock {
+	return types.AudioBlock{
+		Type: "audio",
+		Source: types.AudioSource{
+			Type:    types.AssetSourceType,
+			AssetID: assetID,
+		},
+	}
+}
+
 // AudioSTT creates an audio_stt content block for transcribe-before-LLM input.
 func AudioSTT(data []byte, mediaType string, opts ...AudioSTTOption) types.ContentBlock {
 	block := types.AudioSTTBlock{
@@ -69,6 +102,21 @@ func AudioSTT(data []byte, mediaType string, opts ...AudioSTTOption) types.Conte
 			Type:      "base64",
 			MediaType: mediaType,
 			Data:      base64.StdEncoding.EncodeToString(data),
+		},
+	}
+	for _, opt := range opts {
+		opt(&block)
+	}
+	return block
+}
+
+// AudioSTTAsset creates an audio_stt content block backed by a gateway-managed asset.
+func AudioSTTAsset(assetID string, opts ...AudioSTTOption) types.ContentBlock {
+	block := types.AudioSTTBlock{
+		Type: "audio_stt",
+		Source: types.AudioSource{
+			Type:    types.AssetSourceType,
+			AssetID: assetID,
 		},
 	}
 	for _, opt := range opts {
@@ -95,6 +143,18 @@ func Document(data []byte, mediaType, filename string) types.ContentBlock {
 			Type:      "base64",
 			MediaType: mediaType,
 			Data:      base64.StdEncoding.EncodeToString(data),
+		},
+		Filename: filename,
+	}
+}
+
+// DocumentAsset creates a document content block backed by a gateway-managed asset.
+func DocumentAsset(assetID, filename string) types.ContentBlock {
+	return types.DocumentBlock{
+		Type: "document",
+		Source: types.DocumentSource{
+			Type:    types.AssetSourceType,
+			AssetID: assetID,
 		},
 		Filename: filename,
 	}
