@@ -22,6 +22,14 @@ func TestResolveSTTModel_DefaultAndExplicit(t *testing.T) {
 	if got.Provider != "cartesia" || got.Model != "custom-stt" {
 		t.Fatalf("unexpected explicit resolution: %+v", got)
 	}
+
+	got, err = ResolveSTTModel("cartesia/custom/stt/v2")
+	if err != nil {
+		t.Fatalf("ResolveSTTModel nested err=%v", err)
+	}
+	if got.Provider != "cartesia" || got.Model != "custom/stt/v2" {
+		t.Fatalf("unexpected nested resolution: %+v", got)
+	}
 }
 
 func TestResolveTTSModel_RejectsUnsupportedProvider(t *testing.T) {

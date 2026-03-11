@@ -630,7 +630,7 @@ func validateProviderModelIDStrict(raw string, param string) error {
 		return nil
 	}
 
-	parts := strings.Split(raw, "/")
+	parts := strings.SplitN(raw, "/", 2)
 	if len(parts) != 2 {
 		return strictErr(param, param+" must be in provider/model format")
 	}

@@ -54,7 +54,7 @@ func parseVoiceModel(raw, defaultModel, param string) (ResolvedModel, error) {
 	if modelID == "" {
 		modelID = defaultModel
 	}
-	parts := strings.Split(modelID, "/")
+	parts := strings.SplitN(modelID, "/", 2)
 	if len(parts) != 2 {
 		return ResolvedModel{}, core.NewInvalidRequestErrorWithParam(param+" must be in provider/model format", param)
 	}

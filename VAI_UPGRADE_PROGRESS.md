@@ -343,3 +343,14 @@ Implement the upgraded VAI gateway design in a production-ready way across the g
   - OpenAI Responses then rejected simple requests with `Unknown parameter: 'input[0].output'`
   - corrected the adapter by making `inputItem.Output` a pointer so only actual `function_call_output` items include the field, while empty tool results still serialize `"output":""`
   - added a regression proving regular message items do not emit `output`
+- Follow-up after the OpenAI Responses adapter fix:
+  - investigated OpenRouter model-id rejection on chain start and confirmed the failure was happening in strict request decoding, not in provider routing
+  - root cause was `validateProviderModelIDStrict(...)` using `strings.Split(raw, "/")` and requiring exactly two segments, which incorrectly rejected valid IDs like `openrouter/anthropic/claude-haiku-4.5`
+  - fixed strict model-id validation to split on the first slash only, matching the gateway routing contract everywhere else
+  - also fixed voice-model parsing to use the same first-slash rule so `stt_model` / `tts_model` stay consistent with the rest of the API
+  - added regressions for:
+    - `ParseModelString("openrouter/anthropic/claude-haiku-4.5")`
+    - strict chain payload decoding with `defaults.model = openrouter/anthropic/claude-haiku-4.5`
+    - nested voice model names like `cartesia/custom/stt/v2`
+- Verification after the OpenRouter model-id fix:
+  - `go test ./pkg/core ./pkg/core/types ./pkg/core/voice ./pkg/gateway/chains ./pkg/gateway/handlers ./internal/chatruntime ./app/components ./sdk -count=1`
