@@ -227,6 +227,135 @@ func TestEventStream_BufferedArgsAndDeveloperFallback(t *testing.T) {
 	})
 }
 
+func TestEventStream_VertexPartialArgsOverridePlaceholderArgs(t *testing.T) {
+	t.Parallel()
+
+	provider := NewVertex("test-key")
+	more := true
+	resp1 := &genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{
+			{
+				Content: &genai.Content{
+					Parts: []*genai.Part{
+						{
+							FunctionCall: &genai.FunctionCall{
+								ID:           "fc_1",
+								Name:         "vai_web_search",
+								Args:         map[string]any{"query": "", "max_results": float64(8)},
+								WillContinue: &more,
+							},
+						},
+					},
+				},
+				FinishReason: genai.FinishReasonUnspecified,
+			},
+		},
+	}
+	resp2 := &genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{
+			{
+				Content: &genai.Content{
+					Parts: []*genai.Part{
+						{
+							FunctionCall: &genai.FunctionCall{
+								ID:   "fc_1",
+								Name: "vai_web_search",
+								PartialArgs: []*genai.PartialArg{
+									{JsonPath: "$.query", StringValue: "Iran "},
+									{JsonPath: "$.query", StringValue: "news"},
+								},
+							},
+							ThoughtSignature: []byte("opaque-sig"),
+						},
+					},
+				},
+				FinishReason: genai.FinishReasonStop,
+			},
+		},
+	}
+
+	stream := newEventStream(context.Background(), provider, "gemini-3-flash-preview", 43, seqResponses(resp1, resp2), &requestBuild{})
+	events := collectEvents(t, stream)
+
+	start, ok := findEvent[types.ContentBlockStartEvent](events)
+	if !ok {
+		t.Fatalf("missing content_block_start")
+	}
+	rawJSON := collectToolJSON(events, start.Index)
+	if !json.Valid([]byte(rawJSON)) {
+		t.Fatalf("tool JSON invalid: %q", rawJSON)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(rawJSON), &parsed); err != nil {
+		t.Fatalf("unmarshal tool json: %v", err)
+	}
+	if parsed["query"] != "Iran news" {
+		t.Fatalf("parsed query = %#v, want %q (raw=%q)", parsed["query"], "Iran news", rawJSON)
+	}
+	if parsed["max_results"] != float64(8) {
+		t.Fatalf("parsed max_results = %#v, want 8", parsed["max_results"])
+	}
+	if _, ok := parsed[thoughtSignatureKey]; !ok {
+		t.Fatalf("missing thought signature in merged args")
+	}
+}
+
+func TestEventStream_VertexPartialArgsDeepMergeNestedArgs(t *testing.T) {
+	t.Parallel()
+
+	provider := NewVertex("test-key")
+	resp := &genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{
+			{
+				Content: &genai.Content{
+					Parts: []*genai.Part{
+						{
+							FunctionCall: &genai.FunctionCall{
+								ID:   "fc_nested",
+								Name: "complex_tool",
+								Args: map[string]any{
+									"filters": map[string]any{
+										"provider": "exa",
+										"query":    "",
+									},
+								},
+								PartialArgs: []*genai.PartialArg{
+									{JsonPath: "$.filters.query", StringValue: "latest "},
+									{JsonPath: "$.filters.query", StringValue: "iran"},
+								},
+							},
+						},
+					},
+				},
+				FinishReason: genai.FinishReasonStop,
+			},
+		},
+	}
+
+	stream := newEventStream(context.Background(), provider, "gemini-3-flash-preview", 44, seqResponses(resp), &requestBuild{})
+	events := collectEvents(t, stream)
+
+	start, ok := findEvent[types.ContentBlockStartEvent](events)
+	if !ok {
+		t.Fatalf("missing content_block_start")
+	}
+	rawJSON := collectToolJSON(events, start.Index)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(rawJSON), &parsed); err != nil {
+		t.Fatalf("unmarshal tool json: %v", err)
+	}
+	filters, ok := parsed["filters"].(map[string]any)
+	if !ok {
+		t.Fatalf("filters = %#v, want object", parsed["filters"])
+	}
+	if filters["provider"] != "exa" {
+		t.Fatalf("filters.provider = %#v, want %q", filters["provider"], "exa")
+	}
+	if filters["query"] != "latest iran" {
+		t.Fatalf("filters.query = %#v, want %q", filters["query"], "latest iran")
+	}
+}
+
 func TestEventStream_IteratorErrorEmitsErrorEvent(t *testing.T) {
 	t.Parallel()
 

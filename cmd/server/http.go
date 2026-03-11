@@ -102,7 +102,7 @@ func (s *betaServer) handleNewConversation(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/chat/"+conv.ID, http.StatusSeeOther)
+	http.Redirect(w, r, "/demo/"+conv.ID, http.StatusSeeOther)
 }
 
 func (s *betaServer) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,6 @@ package components
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -57,52 +56,30 @@ func TestParseUSDCentsValueRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestHomePageTransitionsFromLoadingToEmptyState(t *testing.T) {
-	release := make(chan struct{})
-	store := &testConversationStore{release: release}
+func TestHomePageShowsWorkspaceHomeAndDemoCTA(t *testing.T) {
 	installTestAppRuntime(t, &services.AppServices{
-		DB:           store.db(),
 		DefaultModel: "oai-resp/gpt-5-mini",
 		Pricing:      services.DefaultPricingCatalog(),
 	})
 
 	h := vtest.New(t)
 	m := vtest.Mount(h, HomePage, HomePageProps{Actor: testActor()})
-
-	if html := h.HTML(m); !strings.Contains(html, "Opening your workspace...") {
-		t.Fatalf("expected loading state, got HTML:\n%s", html)
-	}
-
-	close(release)
-	h.AwaitResource(m, "conversations")
 
 	html := h.HTML(m)
 	if !strings.Contains(html, "Your workspace is ready") {
-		t.Fatalf("expected empty-state title, got HTML:\n%s", html)
+		t.Fatalf("expected workspace home title, got HTML:\n%s", html)
 	}
-	if !strings.Contains(html, "Start a chat") {
-		t.Fatalf("expected primary empty-state action, got HTML:\n%s", html)
+	if strings.Contains(html, "Opening your workspace...") {
+		t.Fatalf("expected lightweight home page without redirect loading state, got HTML:\n%s", html)
 	}
-}
-
-func TestHomePageShowsConversationLoadError(t *testing.T) {
-	store := &testConversationStore{queryErr: errors.New("db offline")}
-	installTestAppRuntime(t, &services.AppServices{
-		DB:           store.db(),
-		DefaultModel: "oai-resp/gpt-5-mini",
-		Pricing:      services.DefaultPricingCatalog(),
-	})
-
-	h := vtest.New(t)
-	m := vtest.Mount(h, HomePage, HomePageProps{Actor: testActor()})
-
-	h.AwaitResource(m, "conversations")
-	html := h.HTML(m)
-	if !strings.Contains(html, "Something failed") {
-		t.Fatalf("expected error panel, got HTML:\n%s", html)
+	if !strings.Contains(html, "Open demo") {
+		t.Fatalf("expected demo CTA, got HTML:\n%s", html)
 	}
-	if !strings.Contains(html, "db offline") {
-		t.Fatalf("expected underlying load error, got HTML:\n%s", html)
+	if !strings.Contains(html, `href="/demo"`) {
+		t.Fatalf("expected demo link, got HTML:\n%s", html)
+	}
+	if !strings.Contains(html, `data-vango-link=""`) {
+		t.Fatalf("expected Vango SPA navigation markers, got HTML:\n%s", html)
 	}
 }
 
@@ -291,32 +268,6 @@ func testActor() services.UserIdentity {
 		OrgID:  "org_123",
 		Email:  "tester@example.com",
 		Name:   "Test User",
-	}
-}
-
-type testConversationStore struct {
-	release  <-chan struct{}
-	queryErr error
-}
-
-func (s *testConversationStore) db() *neon.TestDB {
-	return &neon.TestDB{
-		QueryFunc: func(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-			if !strings.Contains(sql, "FROM vai_sessions") {
-				return nil, fmt.Errorf("unexpected query: %s", strings.TrimSpace(sql))
-			}
-			if s.release != nil {
-				select {
-				case <-s.release:
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
-			if s.queryErr != nil {
-				return nil, s.queryErr
-			}
-			return newTestRows(), nil
-		},
 	}
 }
 

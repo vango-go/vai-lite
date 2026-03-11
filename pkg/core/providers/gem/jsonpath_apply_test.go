@@ -28,6 +28,22 @@ func TestApplyPartialArgPath(t *testing.T) {
 	}
 }
 
+func TestApplyPartialArgPath_AppendsStringFragments(t *testing.T) {
+	t.Parallel()
+
+	root := map[string]any{}
+	if err := applyPartialArgPath(root, "$.query", "Iran "); err != nil {
+		t.Fatalf("applyPartialArgPath first fragment failed: %v", err)
+	}
+	if err := applyPartialArgPath(root, "$.query", "news"); err != nil {
+		t.Fatalf("applyPartialArgPath second fragment failed: %v", err)
+	}
+
+	if got := root["query"]; got != "Iran news" {
+		t.Fatalf("root[query]=%#v, want %q", got, "Iran news")
+	}
+}
+
 func TestApplyPartialArgPath_Unsupported(t *testing.T) {
 	t.Parallel()
 
@@ -36,4 +52,3 @@ func TestApplyPartialArgPath_Unsupported(t *testing.T) {
 		t.Fatalf("expected unsupported JSONPath error")
 	}
 }
-

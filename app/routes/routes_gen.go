@@ -5,6 +5,8 @@ package routes
 import (
 	chat "github.com/vango-go/vai-lite/app/routes/chat"
 	chat_id_ "github.com/vango-go/vai-lite/app/routes/chat/id_"
+	demo "github.com/vango-go/vai-lite/app/routes/demo"
+	demo_id_ "github.com/vango-go/vai-lite/app/routes/demo/id_"
 	settings "github.com/vango-go/vai-lite/app/routes/settings"
 	"github.com/vango-go/vango"
 )
@@ -18,6 +20,7 @@ func Register(app *vango.App) {
 
 	// Middleware
 	app.Middleware("/chat", chat.Middleware()...)
+	app.Middleware("/demo", demo.Middleware()...)
 	app.Middleware("/settings", settings.Middleware()...)
 
 	// Pages
@@ -27,6 +30,8 @@ func Register(app *vango.App) {
 	app.Page("/settings/keys", settings.KeysPage)
 	app.Page("/settings/observability", settings.ObservabilityPage)
 	app.Page("/chat/:id", chat_id_.ShowPage)
+	app.Page("/demo/:id", demo_id_.ShowPage)
+	app.Page("/demo", demo.IndexPage)
 	app.Page("/settings", settings.IndexPage)
 	app.Page("/", IndexPage)
 }
@@ -35,6 +40,8 @@ func Register(app *vango.App) {
 const (
 	RouteIndex = "/"
 	RouteChatID = "/chat/:id"
+	RouteDemo = "/demo"
+	RouteDemoID = "/demo/:id"
 	RouteSettings = "/settings"
 	RouteSettingsAccess = "/settings/access"
 	RouteSettingsBilling = "/settings/billing"

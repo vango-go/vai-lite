@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-// test commit
 type jsonPathSegment struct {
 	key   string
 	index int
@@ -60,6 +59,11 @@ func applyPartialArgPath(root map[string]any, jsonPath string, value any) error 
 
 func setAtPath(node any, segments []jsonPathSegment, value any) (any, error) {
 	if len(segments) == 0 {
+		if existing, ok := node.(string); ok {
+			if fragment, ok := value.(string); ok {
+				return existing + fragment, nil
+			}
+		}
 		return value, nil
 	}
 	seg := segments[0]

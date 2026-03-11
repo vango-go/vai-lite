@@ -41,7 +41,7 @@ func NotFoundPage() *vango.VNode {
 		Class("missing-page"),
 		H1(Text("Page not found")),
 		P(Text("The route you requested does not exist.")),
-		A(Href("/"), Text("Back to home")),
+		Link("/", Text("Back to home")),
 	)
 }
 
@@ -86,19 +86,20 @@ func AppShell(ctx vango.Ctx, actor services.UserIdentity, content any) *vango.VN
 			Class("app-header"),
 			Div(
 				Class("brand"),
-				A(Href("/"), Text("vai-lite gateway")),
+				Link("/", Text("vai-lite gateway")),
 				If(actor.Name != "",
 					Span(Class("brand-subtitle"), Text(actor.Name)),
 				),
 			),
 			Nav(
 				Class("top-nav"),
-				A(Href("/settings"), Text("Settings")),
-				A(Href("/settings/access"), Text("VAI credits")),
-				A(Href("/settings/developers"), Text("Developers")),
-				A(Href("/settings/keys"), Text("Keys")),
-				A(Href("/settings/billing"), Text("Billing")),
-				A(Href("/settings/observability"), Text("Observability")),
+				NavLinkPrefix(ctx, "/demo", Data("prefetch", ""), Text("Demo")),
+				NavLink(ctx, "/settings", Text("Settings")),
+				NavLink(ctx, "/settings/access", Text("VAI credits")),
+				NavLink(ctx, "/settings/developers", Text("Developers")),
+				NavLink(ctx, "/settings/keys", Text("Keys")),
+				NavLink(ctx, "/settings/billing", Text("Billing")),
+				NavLink(ctx, "/settings/observability", Text("Observability")),
 				If(appruntime.Get().Config.WorkOSEnabled,
 					Form(
 						Method("POST"),
@@ -113,23 +114,19 @@ func AppShell(ctx vango.Ctx, actor services.UserIdentity, content any) *vango.VN
 	)
 }
 
-func SettingsLayout(ctx vango.Ctx, actor services.UserIdentity, active string, children vango.Slot) *vango.VNode {
+func SettingsLayout(ctx vango.Ctx, actor services.UserIdentity, children vango.Slot) *vango.VNode {
 	return AppShell(ctx, actor,
 		Div(
 			Class("settings-grid"),
-			SettingsNav(active),
+			SettingsNav(ctx),
 			children,
 		),
 	)
 }
 
-func SettingsNav(active string) *vango.VNode {
+func SettingsNav(ctx vango.Ctx) *vango.VNode {
 	link := func(href, label string) *vango.VNode {
-		className := "settings-link"
-		if href == active {
-			className += " settings-link-active"
-		}
-		return A(Href(href), Class(className), Text(label))
+		return NavLink(ctx, href, Class("settings-link"), Text(label))
 	}
 	return Nav(
 		Class("settings-nav"),
@@ -142,32 +139,75 @@ func SettingsNav(active string) *vango.VNode {
 	)
 }
 
-func Sidebar(actor services.UserIdentity, conversations []services.Conversation, activeConversationID string, creating bool, onNewConversation func()) *vango.VNode {
+type SidebarOptions struct {
+	Conversations        []services.ManagedConversationSummary
+	ActiveConversationID string
+	Creating             bool
+	Loading              bool
+	Error                string
+	BasePath             string
+}
+
+func Sidebar(actor services.UserIdentity, options SidebarOptions, onNewConversation func()) *vango.VNode {
+	basePath := strings.TrimRight(strings.TrimSpace(options.BasePath), "/")
+	if basePath == "" {
+		basePath = "/demo"
+	}
+	renderList := func() *vango.VNode {
+		switch {
+		case len(options.Conversations) > 0:
+			return Div(
+				RangeKeyed(options.Conversations,
+					func(item services.ManagedConversationSummary) any { return item.ID },
+					func(item services.ManagedConversationSummary) *vango.VNode {
+						className := "conversation-link"
+						if item.ID == options.ActiveConversationID {
+							className += " conversation-link-active"
+						}
+						return LinkPrefetch(
+							basePath+"/"+item.ID,
+							Class(className),
+							Strong(Text(item.Title)),
+							Span(Text(item.Model)),
+						)
+					},
+				),
+			)
+		case options.Loading:
+			return Div(
+				Class("conversation-list-state"),
+				P(Text("Loading demo chats...")),
+			)
+		case strings.TrimSpace(options.Error) != "":
+			return Div(
+				Class("conversation-list-state conversation-list-state-error"),
+				P(Text("Unable to load demo chats.")),
+				Span(Text(options.Error)),
+			)
+		default:
+			return Div(
+				Class("conversation-list-state"),
+				P(Text("No demo chats yet.")),
+			)
+		}
+	}
 	return Aside(
 		Class("chat-sidebar"),
 		Button(
 			Type("button"),
 			Class("btn btn-primary sidebar-create"),
-			Disabled(creating),
+			Disabled(options.Creating),
 			OnClick(onNewConversation),
 			Text("New chat"),
 		),
 		Div(
 			Class("conversation-list"),
-			RangeKeyed(conversations,
-				func(item services.Conversation) any { return item.ID },
-				func(item services.Conversation) *vango.VNode {
-					className := "conversation-link"
-					if item.ID == activeConversationID {
-						className += " conversation-link-active"
-					}
-					return A(
-						Href("/chat/"+item.ID),
-						Class(className),
-						Strong(Text(item.Title)),
-						Span(Text(item.Model)),
-					)
-				},
+			renderList(),
+		),
+		If(strings.TrimSpace(options.Error) != "" && len(options.Conversations) > 0,
+			Div(
+				Class("conversation-list-note"),
+				Span(Text("Sidebar refresh failed.")),
 			),
 		),
 		Div(

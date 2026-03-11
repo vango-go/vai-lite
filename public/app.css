@@ -263,6 +263,11 @@ button,
   color: var(--text);
 }
 
+.top-nav a.active {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+
 .landing {
   display: grid;
   grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.95fr);
@@ -459,6 +464,33 @@ button,
 .conversation-link-active {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+.conversation-list-state,
+.conversation-list-note {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.95rem 1rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--text-soft);
+}
+
+.conversation-list-state p,
+.conversation-list-note span {
+  margin: 0;
+}
+
+.conversation-list-state span,
+.conversation-list-note {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.conversation-list-state-error {
+  border-color: rgba(255, 122, 122, 0.32);
+  color: #ffd0d0;
 }
 
 .sidebar-footer {
@@ -1005,7 +1037,8 @@ textarea::placeholder {
   color: var(--text);
 }
 
-.settings-link-active {
+.settings-link-active,
+.settings-link.active {
   border-color: var(--accent);
   background: var(--accent-soft);
   color: var(--text);

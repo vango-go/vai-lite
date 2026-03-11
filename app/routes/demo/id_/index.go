@@ -15,7 +15,7 @@ func ShowPage(ctx vango.Ctx, p Params) *vango.VNode {
 	if !ok {
 		return components.AuthRedirectPage()
 	}
-	return Fragment(components.DemoAliasPage(components.DemoAliasPageProps{
+	return Fragment(components.ChatPage(components.ChatPageProps{
 		Actor:          actor,
 		ConversationID: p.ID,
 	}))

@@ -10,8 +10,8 @@ import (
 	"github.com/vango-go/vai-lite/internal/appruntime"
 	"github.com/vango-go/vai-lite/internal/chatruntime"
 	"github.com/vango-go/vai-lite/internal/services"
-	"github.com/vango-go/vai-lite/sdk"
 	"github.com/vango-go/vai-lite/pkg/core/types"
+	"github.com/vango-go/vai-lite/sdk"
 	"github.com/vango-go/vango"
 	. "github.com/vango-go/vango/el"
 	"github.com/vango-go/vango/setup"
@@ -24,7 +24,9 @@ type ChatPageProps struct {
 
 type chatPageData struct {
 	Org             *services.Organization
-	Conversations   []services.Conversation
+	Conversations   []services.ManagedConversationSummary
+	SidebarLoading  bool
+	SidebarError    string
 	Detail          *services.ManagedConversationDetail
 	ProviderSecrets []services.ProviderSecretRecord
 	CurrentBalance  chatBalanceState
@@ -85,17 +87,17 @@ func ChatPage(p ChatPageProps) vango.Component {
 
 		conversations := setup.ResourceKeyed(&s,
 			func() string { return props.Get().Actor.OrgID },
-			func(ctx context.Context, orgID string) ([]services.Conversation, error) {
-				items, err := appruntime.Get().Services.ListManagedConversations(ctx, orgID)
+			func(ctx context.Context, orgID string) ([]services.ManagedConversationSummary, error) {
+				items, err := appruntime.Get().Services.ListManagedConversationSummaries(ctx, orgID)
 				if err != nil {
 					return nil, fmt.Errorf("load conversations: %w", err)
 				}
 				return items, nil
 			},
 		)
-		lastConversations := setup.Signal(&s, []services.Conversation(nil))
-		conversations.OnSuccess(func(items []services.Conversation) {
-			lastConversations.Set(append([]services.Conversation{}, items...))
+		lastConversations := setup.Signal(&s, []services.ManagedConversationSummary(nil))
+		conversations.OnSuccess(func(items []services.ManagedConversationSummary) {
+			lastConversations.Set(append([]services.ManagedConversationSummary{}, items...))
 		})
 
 		conversationData := setup.ResourceKeyed(&s,
@@ -146,7 +148,7 @@ func ChatPage(p ChatPageProps) vango.Component {
 			if conversationID := pendingConversationID.Get(); conversationID != "" {
 				if ctx := vango.UseCtx(); ctx != nil {
 					pendingConversationID.Set("")
-					ctx.Navigate("/chat/" + conversationID)
+					ctx.Navigate("/demo/" + conversationID)
 				}
 			}
 			return nil
@@ -342,15 +344,15 @@ func ChatPage(p ChatPageProps) vango.Component {
 					return struct{}{}, signErr
 				}
 				dispatchChatIsland(pageCtx, in.HID, chatServerMessage{
-						Type:      "upload_claim_ready",
-						RequestID: in.RequestID,
-						Attachment: &chatAttachmentPayload{
-							ID:          asset.ID,
-							Filename:    firstNonEmpty(in.Filename, asset.ID),
-							ContentType: firstNonEmpty(asset.MediaType, in.ContentType),
-							SizeBytes:   asset.SizeBytes,
-							URL:         signed.URL,
-						},
+					Type:      "upload_claim_ready",
+					RequestID: in.RequestID,
+					Attachment: &chatAttachmentPayload{
+						ID:          asset.ID,
+						Filename:    firstNonEmpty(in.Filename, asset.ID),
+						ContentType: firstNonEmpty(asset.MediaType, in.ContentType),
+						SizeBytes:   asset.SizeBytes,
+						URL:         signed.URL,
+					},
 				})
 				return struct{}{}, nil
 			},
@@ -742,29 +744,31 @@ func ChatPage(p ChatPageProps) vango.Component {
 				return AppShell(ctx, actor, LoadingPanel("Loading chat..."))
 			}
 
-			conversationList, loading, err := chatResolveConversationsData(
+			conversationList, conversationsLoading, conversationsError := chatResolveConversationsData(
 				conversations.State(),
 				conversations.Data(),
 				conversations.Error(),
 				lastConversations.Get(),
 			)
-			if err != nil {
-				return AppShell(ctx, actor, PageErrorPanel(err))
-			}
-			if loading {
-				return AppShell(ctx, actor, LoadingPanel("Loading chat..."))
-			}
-
 			data := chatBuildPageData(
 				staticSnapshot,
 				conversationList,
+				conversationsLoading,
+				conversationsError,
 				conversationSnapshot,
 				chatResolveBalanceData(balanceData.State(), balanceData.Data(), lastBalanceData.Get()),
 			)
 			return AppShell(ctx, actor,
 				Div(
 					Class("chat-page"),
-					Sidebar(actor, data.Conversations, data.Detail.Conversation.ID, false, func() {
+					Sidebar(actor, SidebarOptions{
+						Conversations:        data.Conversations,
+						ActiveConversationID: data.Detail.Conversation.ID,
+						Creating:             pendingConversationID.Get() != "",
+						Loading:              data.SidebarLoading,
+						Error:                data.SidebarError,
+						BasePath:             "/demo",
+					}, func() {
 						pendingConversationID.Set(newDraftConversationID())
 					}),
 					Main(
@@ -777,8 +781,8 @@ func ChatPage(p ChatPageProps) vango.Component {
 							),
 							Div(
 								Class("chat-header-actions"),
-								A(Href("/settings/keys"), Class("btn btn-secondary"), Text("Keys")),
-								A(Href("/settings/billing"), Class("btn btn-secondary"), Text("Billing")),
+								Link("/settings/keys", Class("btn btn-secondary"), Text("Keys")),
+								Link("/settings/billing", Class("btn btn-secondary"), Text("Billing")),
 							),
 						),
 						chatIslandBoundary(chatIslandProps(data, data.CurrentBalance), handleIslandMessage),
@@ -800,20 +804,20 @@ func chatResolveStaticData(state vango.ResourceState, current *chatStaticData, c
 	}
 }
 
-func chatResolveConversationsData(state vango.ResourceState, current []services.Conversation, currentErr error, last []services.Conversation) ([]services.Conversation, bool, error) {
+func chatResolveConversationsData(state vango.ResourceState, current []services.ManagedConversationSummary, currentErr error, last []services.ManagedConversationSummary) ([]services.ManagedConversationSummary, bool, string) {
 	switch state {
 	case vango.Ready:
-		return current, false, nil
+		return current, false, ""
 	case vango.Error:
 		if last != nil {
-			return last, false, nil
+			return last, false, errorString(currentErr)
 		}
-		return nil, false, currentErr
+		return nil, false, errorString(currentErr)
 	default:
 		if last != nil {
-			return last, false, nil
+			return last, false, ""
 		}
-		return nil, true, nil
+		return nil, true, ""
 	}
 }
 
@@ -848,15 +852,24 @@ func chatConversationSnapshotMatches(data *chatConversationData, conversationID 
 	return data != nil && data.Detail != nil && data.Detail.Conversation.ID == conversationID
 }
 
-func chatBuildPageData(staticData *chatStaticData, conversations []services.Conversation, conversationData *chatConversationData, balance chatBalanceState) *chatPageData {
+func chatBuildPageData(staticData *chatStaticData, conversations []services.ManagedConversationSummary, sidebarLoading bool, sidebarError string, conversationData *chatConversationData, balance chatBalanceState) *chatPageData {
 	return &chatPageData{
 		Org:             staticData.Org,
 		Conversations:   conversations,
+		SidebarLoading:  sidebarLoading,
+		SidebarError:    sidebarError,
 		Detail:          conversationData.Detail,
 		ProviderSecrets: staticData.ProviderSecrets,
 		CurrentBalance:  balance,
 		Messages:        conversationData.Messages,
 	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.TrimSpace(err.Error())
 }
 
 func chatIslandProps(data *chatPageData, balance chatBalanceState) map[string]any {

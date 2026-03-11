@@ -67,6 +67,9 @@ func chatMessagesViewManaged(ctx context.Context, orgID string, detail *services
 	assetCache := make(map[string]*services.ManagedAssetInfo)
 	out := make([]map[string]any, 0, len(detail.History))
 	for i, msg := range detail.History {
+		if !managedMessageIsTranscriptVisible(msg) {
+			continue
+		}
 		attachments, err := managedMessageAttachments(ctx, orgID, msg, assetCache)
 		if err != nil {
 			return nil, err
@@ -100,9 +103,7 @@ func managedMessageMetadata(detail *services.ManagedConversationDetail) map[int]
 	sortRunsDescending(runs)
 	historyIndex := len(detail.History) - 1
 	for _, run := range runs {
-		for historyIndex >= 0 && detail.History[historyIndex].Role != "assistant" {
-			historyIndex--
-		}
+		historyIndex = previousVisibleHistoryIndex(detail.History, historyIndex, "assistant")
 		if historyIndex < 0 {
 			break
 		}
@@ -117,9 +118,7 @@ func managedMessageMetadata(detail *services.ManagedConversationDetail) map[int]
 		}
 		result[historyIndex] = assistantMeta
 		historyIndex--
-		for historyIndex >= 0 && detail.History[historyIndex].Role != "user" {
-			historyIndex--
-		}
+		historyIndex = previousVisibleHistoryIndex(detail.History, historyIndex, "user")
 		if historyIndex < 0 {
 			break
 		}
@@ -166,6 +165,57 @@ func managedMessageText(msg types.Message) string {
 		}
 		return strings.TrimSpace(strings.Join(parts, "\n"))
 	}
+}
+
+func managedMessageIsTranscriptVisible(msg types.Message) bool {
+	role := strings.TrimSpace(strings.ToLower(msg.Role))
+	if role != "user" && role != "assistant" {
+		return false
+	}
+	if managedMessageText(msg) != "" {
+		return true
+	}
+	return managedMessageHasAttachments(msg)
+}
+
+func managedMessageHasAttachments(msg types.Message) bool {
+	for _, block := range msg.ContentBlocks() {
+		switch typed := block.(type) {
+		case types.ImageBlock, types.DocumentBlock, types.VideoBlock, types.AudioBlock:
+			return true
+		case *types.ImageBlock:
+			if typed != nil {
+				return true
+			}
+		case *types.DocumentBlock:
+			if typed != nil {
+				return true
+			}
+		case *types.VideoBlock:
+			if typed != nil {
+				return true
+			}
+		case *types.AudioBlock:
+			if typed != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func previousVisibleHistoryIndex(history []types.Message, start int, role string) int {
+	role = strings.TrimSpace(strings.ToLower(role))
+	for i := start; i >= 0; i-- {
+		candidateRole := strings.TrimSpace(strings.ToLower(history[i].Role))
+		if role != "" && candidateRole != role {
+			continue
+		}
+		if managedMessageIsTranscriptVisible(history[i]) {
+			return i
+		}
+	}
+	return -1
 }
 
 func managedMessageAttachments(ctx context.Context, orgID string, msg types.Message, cache map[string]*services.ManagedAssetInfo) ([]map[string]any, error) {
@@ -300,8 +350,8 @@ func buildManagedRunPlan(detail *services.ManagedConversationDetail, message str
 			return chatRunPlan{}, fmt.Errorf("message is not editable")
 		}
 		edited := detail.History[index]
-		if edited.Role != "user" {
-			return chatRunPlan{}, fmt.Errorf("only user messages can be edited")
+		if strings.TrimSpace(strings.ToLower(edited.Role)) != "user" || !managedMessageIsTranscriptVisible(edited) {
+			return chatRunPlan{}, fmt.Errorf("only visible user messages can be edited")
 		}
 		return chatRunPlan{
 			SeedHistory: cloneManagedHistory(detail.History[:index]),
@@ -377,12 +427,7 @@ func replaceEditedUserBlocks(original types.Message, message string, attachmentI
 }
 
 func lastUserHistoryIndex(history []types.Message) int {
-	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Role == "user" {
-			return i
-		}
-	}
-	return -1
+	return previousVisibleHistoryIndex(history, len(history)-1, "user")
 }
 
 func cloneManagedHistory(history []types.Message) []types.Message {

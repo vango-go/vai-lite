@@ -91,7 +91,7 @@
       "debugName": "uploadIntent",
       "source": {
         "file": "app/components/chat.go",
-        "line": 251,
+        "line": 253,
         "col": 19
       }
     },
@@ -104,7 +104,7 @@
       "debugName": "uploadClaim",
       "source": {
         "file": "app/components/chat.go",
-        "line": 298,
+        "line": 300,
         "col": 18
       }
     },
@@ -117,7 +117,7 @@
       "debugName": "submitChat",
       "source": {
         "file": "app/components/chat.go",
-        "line": 360,
+        "line": 362,
         "col": 17
       }
     },
@@ -130,7 +130,7 @@
       "debugName": "balanceData",
       "source": {
         "file": "app/components/chat.go",
-        "line": 145,
+        "line": 147,
         "col": 3
       }
     },
@@ -143,7 +143,7 @@
       "debugName": "currentTrackedChain",
       "source": {
         "file": "app/components/chat.go",
-        "line": 205,
+        "line": 207,
         "col": 3
       }
     },
@@ -156,7 +156,7 @@
       "debugName": "staticData",
       "source": {
         "file": "app/components/chat.go",
-        "line": 67,
+        "line": 69,
         "col": 17
       }
     },
@@ -164,12 +164,12 @@
       "stableID": "f616a621",
       "class": "local",
       "kind": "resource",
-      "codecFingerprint": "fp:v1:79d819bf69474082f843f088decf9582346231372055e29e617a3180aac6cf15",
+      "codecFingerprint": "fp:v1:658f0864e966d9264fa29e999b055791e03a3c0778eaaa1d832c755668b0235b",
       "persisted": false,
       "debugName": "conversations",
       "source": {
         "file": "app/components/chat.go",
-        "line": 86,
+        "line": 88,
         "col": 20
       }
     },
@@ -182,7 +182,7 @@
       "debugName": "conversationData",
       "source": {
         "file": "app/components/chat.go",
-        "line": 101,
+        "line": 103,
         "col": 23
       }
     },
@@ -195,7 +195,7 @@
       "debugName": "balanceData",
       "source": {
         "file": "app/components/chat.go",
-        "line": 127,
+        "line": 129,
         "col": 18
       }
     },
@@ -208,7 +208,7 @@
       "debugName": "pendingConversationID",
       "source": {
         "file": "app/components/chat.go",
-        "line": 65,
+        "line": 67,
         "col": 28
       }
     },
@@ -216,12 +216,12 @@
       "stableID": "e5dc2925",
       "class": "local",
       "kind": "signal",
-      "codecFingerprint": "fp:v1:3b3ba2889af04acc8df856308b5ea75b1bc532619c53840a9809bbc0fa75677b",
+      "codecFingerprint": "fp:v1:e3d38193942e269ba8e97eebf0e971d51fe51622ba9bc4425d85f40c4d29ebaf",
       "persisted": false,
       "debugName": "lastConversations",
       "source": {
         "file": "app/components/chat.go",
-        "line": 96,
+        "line": 98,
         "col": 24
       }
     },
@@ -234,7 +234,7 @@
       "debugName": "lastConversationData",
       "source": {
         "file": "app/components/chat.go",
-        "line": 122,
+        "line": 124,
         "col": 27
       }
     },
@@ -247,8 +247,59 @@
       "debugName": "lastBalanceData",
       "source": {
         "file": "app/components/chat.go",
-        "line": 140,
+        "line": 142,
         "col": 22
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.DemoAliasPage#setup0.local.onmount@0": {
+      "stableID": "3ecb3304",
+      "class": "local",
+      "kind": "onmount",
+      "codecFingerprint": "fp:v1:bb2c9bbd8e42d1c77679ba12b77cdd888a502ceddd40605a33803cabc6da2578",
+      "persisted": false,
+      "source": {
+        "file": "app/components/demo.go",
+        "line": 75,
+        "col": 3
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.DemoEntryPage#setup0.local.effect@0": {
+      "stableID": "a4e05e74",
+      "class": "local",
+      "kind": "effect",
+      "codecFingerprint": "fp:v1:bb2c9bbd8e42d1c77679ba12b77cdd888a502ceddd40605a33803cabc6da2578",
+      "persisted": false,
+      "debugName": "summaries",
+      "source": {
+        "file": "app/components/demo.go",
+        "line": 39,
+        "col": 3
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.DemoEntryPage#setup0.local.resource@0": {
+      "stableID": "9c06f158",
+      "class": "local",
+      "kind": "resource",
+      "codecFingerprint": "fp:v1:658f0864e966d9264fa29e999b055791e03a3c0778eaaa1d832c755668b0235b",
+      "persisted": false,
+      "debugName": "summaries",
+      "source": {
+        "file": "app/components/demo.go",
+        "line": 28,
+        "col": 16
+      }
+    },
+    "github.com/vango-go/vai-lite/app/components.DemoEntryPage#setup0.local.signal@0": {
+      "stableID": "b34bdd9b",
+      "class": "local",
+      "kind": "signal",
+      "codecFingerprint": "fp:v1:a0e185526259a5c89de3668f26ecdd3229878df677ad6713dd7b0a2027752c16",
+      "persisted": false,
+      "debugName": "navigated",
+      "source": {
+        "file": "app/components/demo.go",
+        "line": 27,
+        "col": 16
       }
     },
     "github.com/vango-go/vai-lite/app/components.DevelopersPage#setup0.local.action@0": {
@@ -340,71 +391,6 @@
         "file": "app/components/settings.go",
         "line": 160,
         "col": 15
-      }
-    },
-    "github.com/vango-go/vai-lite/app/components.HomePage#setup0.local.effect@0": {
-      "stableID": "c38ec1b5",
-      "class": "local",
-      "kind": "effect",
-      "codecFingerprint": "fp:v1:bb2c9bbd8e42d1c77679ba12b77cdd888a502ceddd40605a33803cabc6da2578",
-      "persisted": false,
-      "debugName": "conversations",
-      "source": {
-        "file": "app/components/home.go",
-        "line": 30,
-        "col": 3
-      }
-    },
-    "github.com/vango-go/vai-lite/app/components.HomePage#setup0.local.effect@1": {
-      "stableID": "4ac86a5f",
-      "class": "local",
-      "kind": "effect",
-      "codecFingerprint": "fp:v1:bb2c9bbd8e42d1c77679ba12b77cdd888a502ceddd40605a33803cabc6da2578",
-      "persisted": false,
-      "debugName": "conversations",
-      "source": {
-        "file": "app/components/home.go",
-        "line": 40,
-        "col": 3
-      }
-    },
-    "github.com/vango-go/vai-lite/app/components.HomePage#setup0.local.resource@0": {
-      "stableID": "923dd3e0",
-      "class": "local",
-      "kind": "resource",
-      "codecFingerprint": "fp:v1:79d819bf69474082f843f088decf9582346231372055e29e617a3180aac6cf15",
-      "persisted": false,
-      "debugName": "conversations",
-      "source": {
-        "file": "app/components/home.go",
-        "line": 23,
-        "col": 20
-      }
-    },
-    "github.com/vango-go/vai-lite/app/components.HomePage#setup0.local.signal@0": {
-      "stableID": "55ebd133",
-      "class": "local",
-      "kind": "signal",
-      "codecFingerprint": "fp:v1:a0e185526259a5c89de3668f26ecdd3229878df677ad6713dd7b0a2027752c16",
-      "persisted": false,
-      "debugName": "redirected",
-      "source": {
-        "file": "app/components/home.go",
-        "line": 21,
-        "col": 17
-      }
-    },
-    "github.com/vango-go/vai-lite/app/components.HomePage#setup0.local.signal@1": {
-      "stableID": "af162acc",
-      "class": "local",
-      "kind": "signal",
-      "codecFingerprint": "fp:v1:30a63eee6dca6c358b70d73211e051d443c38b6afee573489505c9b7d3b8dcbf",
-      "persisted": false,
-      "debugName": "pendingConversationID",
-      "source": {
-        "file": "app/components/home.go",
-        "line": 22,
-        "col": 28
       }
     },
     "github.com/vango-go/vai-lite/app/components.KeysPage#setup0.local.action@0": {

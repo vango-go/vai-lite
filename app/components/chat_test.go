@@ -110,10 +110,10 @@ func TestChatResolveConversationDataRejectsDifferentConversationSnapshot(t *test
 }
 
 func TestChatResolveConversationsDataKeepsLastReadyListDuringLoading(t *testing.T) {
-	last := []services.Conversation{{ID: "conv_123", Title: "Existing chat"}}
+	last := []services.ManagedConversationSummary{{ID: "conv_123", Title: "Existing chat"}}
 
 	got, loading, err := chatResolveConversationsData(vango.Loading, nil, nil, last)
-	if err != nil {
+	if err != "" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if loading {
@@ -121,6 +121,21 @@ func TestChatResolveConversationsDataKeepsLastReadyListDuringLoading(t *testing.
 	}
 	if len(got) != 1 || got[0].ID != "conv_123" {
 		t.Fatalf("unexpected conversations snapshot: %+v", got)
+	}
+}
+
+func TestChatResolveConversationsDataKeepsLastReadyListOnRefetchError(t *testing.T) {
+	last := []services.ManagedConversationSummary{{ID: "conv_123", Title: "Existing chat"}}
+
+	got, loading, err := chatResolveConversationsData(vango.Error, nil, errors.New("summary refresh failed"), last)
+	if loading {
+		t.Fatal("expected stale conversations list to keep sidebar ready during error")
+	}
+	if len(got) != 1 || got[0].ID != "conv_123" {
+		t.Fatalf("unexpected conversations snapshot: %+v", got)
+	}
+	if !strings.Contains(err, "summary refresh failed") {
+		t.Fatalf("expected surfaced sidebar error, got %q", err)
 	}
 }
 
@@ -143,6 +158,45 @@ func TestChatResolveBalanceDataFallsBackToLoadingWithoutReadySnapshot(t *testing
 	}
 	if got.CurrentBalanceCents != 0 {
 		t.Fatalf("expected zero cents while loading without snapshot, got %+v", got)
+	}
+}
+
+func TestChatPageRendersActiveConversationWhileSidebarSummariesLoad(t *testing.T) {
+	store := newTestChatPageStore(1250, nil)
+	release := store.blockNextSummaryQuery()
+	installTestAppRuntime(t, &services.AppServices{
+		DB:           store.db(),
+		DefaultModel: "oai-resp/gpt-5-mini",
+		Pricing:      services.DefaultPricingCatalog(),
+	})
+
+	h := vtest.New(t)
+	m := vtest.Mount(h, ChatPage, ChatPageProps{
+		Actor:          testActor(),
+		ConversationID: "conv_123",
+	})
+
+	h.AwaitResource(m, "staticData")
+	h.AwaitResource(m, "conversationData")
+	h.AwaitResource(m, "balanceData")
+
+	rendered := html.UnescapeString(h.HTML(m))
+	if strings.Contains(rendered, "Loading chat...") {
+		t.Fatalf("expected active chat to render without waiting for sidebar summaries, got HTML:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `"conversationTitle":"Hello"`) {
+		t.Fatalf("expected active conversation island props, got HTML:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "Loading demo chats...") {
+		t.Fatalf("expected sidebar loading placeholder, got HTML:\n%s", rendered)
+	}
+
+	close(release)
+	h.AwaitResource(m, "conversations")
+
+	rendered = html.UnescapeString(h.HTML(m))
+	if !strings.Contains(rendered, "Hello") {
+		t.Fatalf("expected conversation summary after release, got HTML:\n%s", rendered)
 	}
 }
 
@@ -221,17 +275,147 @@ func TestBuildManagedRunPlan_EditReusesNonTextBlocksAndAddsNewAttachments(t *tes
 	}
 }
 
+func TestChatMessagesViewManaged_HidesToolOnlyHistoryAndKeepsVisibleMetadata(t *testing.T) {
+	startedAt := time.Date(2026, time.March, 10, 20, 40, 0, 0, time.UTC)
+	completedAt := startedAt.Add(time.Minute)
+	detail := &services.ManagedConversationDetail{
+		History: []types.Message{
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.TextBlock{Type: "text", Text: "Can you tell me recent news for Iran?"},
+				},
+			},
+			{
+				Role: "assistant",
+				Content: []types.ContentBlock{
+					types.ToolUseBlock{
+						Type:  "tool_use",
+						ID:    "call_1",
+						Name:  "vai_web_search",
+						Input: map[string]any{"query": "Iran recent news"},
+					},
+				},
+			},
+			{
+				Role: "user",
+				Content: []types.ContentBlock{
+					types.ToolResultBlock{
+						Type:      "tool_result",
+						ToolUseID: "call_1",
+						Content: []types.ContentBlock{
+							types.TextBlock{Type: "text", Text: "search result body"},
+						},
+					},
+				},
+			},
+			{
+				Role: "assistant",
+				Content: []types.ContentBlock{
+					types.TextBlock{Type: "text", Text: "Here are the main recent developments about Iran."},
+				},
+			},
+		},
+		Runs: []types.ChainRunRecord{
+			{
+				StartedAt: startedAt,
+				CompletedAt: func() *time.Time {
+					v := completedAt
+					return &v
+				}(),
+				Metadata: map[string]any{
+					"observability": map[string]any{
+						"key_source": "platform_hosted",
+					},
+				},
+			},
+		},
+	}
+
+	messages, err := chatMessagesViewManaged(context.Background(), "org_123", detail)
+	if err != nil {
+		t.Fatalf("chatMessagesViewManaged() error = %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("len(messages)=%d, want 2", len(messages))
+	}
+	if messages[0]["id"] != managedChatMessageID(0) {
+		t.Fatalf("first visible id=%v, want %q", messages[0]["id"], managedChatMessageID(0))
+	}
+	if messages[1]["id"] != managedChatMessageID(3) {
+		t.Fatalf("second visible id=%v, want %q", messages[1]["id"], managedChatMessageID(3))
+	}
+	if messages[0]["role"] != "user" || messages[1]["role"] != "assistant" {
+		t.Fatalf("unexpected visible roles: %+v", messages)
+	}
+	if messages[0]["text"] != "Can you tell me recent news for Iran?" {
+		t.Fatalf("first visible text=%q", messages[0]["text"])
+	}
+	if messages[1]["text"] != "Here are the main recent developments about Iran." {
+		t.Fatalf("second visible text=%q", messages[1]["text"])
+	}
+	if messages[0]["keySource"] != string(services.KeySourcePlatformHosted) {
+		t.Fatalf("first visible keySource=%v", messages[0]["keySource"])
+	}
+	if messages[1]["keySource"] != string(services.KeySourcePlatformHosted) {
+		t.Fatalf("second visible keySource=%v", messages[1]["keySource"])
+	}
+	if messages[0]["createdAt"] != startedAt.Format(time.RFC3339) {
+		t.Fatalf("first visible createdAt=%v", messages[0]["createdAt"])
+	}
+	if messages[1]["createdAt"] != completedAt.Format(time.RFC3339) {
+		t.Fatalf("second visible createdAt=%v", messages[1]["createdAt"])
+	}
+}
+
+func TestBuildManagedRunPlan_RegenerateSkipsHiddenToolResultUserMessages(t *testing.T) {
+	detail := &services.ManagedConversationDetail{
+		History: []types.Message{
+			{Role: "user", Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: "Can you tell me recent news for Iran?"}}},
+			{Role: "assistant", Content: []types.ContentBlock{
+				types.ToolUseBlock{Type: "tool_use", ID: "call_1", Name: "vai_web_search", Input: map[string]any{"query": "Iran recent news"}},
+			}},
+			{Role: "user", Content: []types.ContentBlock{
+				types.ToolResultBlock{
+					Type:      "tool_result",
+					ToolUseID: "call_1",
+					Content:   []types.ContentBlock{types.TextBlock{Type: "text", Text: "search result body"}},
+				},
+			}},
+			{Role: "assistant", Content: []types.ContentBlock{types.TextBlock{Type: "text", Text: "Here are the main recent developments about Iran."}}},
+		},
+	}
+
+	plan, err := buildManagedRunPlan(detail, "", nil, true, "")
+	if err != nil {
+		t.Fatalf("buildManagedRunPlan() error = %v", err)
+	}
+	if !plan.Forked {
+		t.Fatal("expected regenerate plan to fork")
+	}
+	if len(plan.SeedHistory) != 0 {
+		t.Fatalf("len(seed_history)=%d, want 0", len(plan.SeedHistory))
+	}
+	if len(plan.Input) != 1 {
+		t.Fatalf("len(input)=%d, want 1", len(plan.Input))
+	}
+	text, ok := plan.Input[0].(types.TextBlock)
+	if !ok || text.Text != "Can you tell me recent news for Iran?" {
+		t.Fatalf("regenerate input[0]=%#v", plan.Input[0])
+	}
+}
+
 func awaitChatPageResources(h *vtest.Harness, m *vtest.Mounted) {
 	h.AwaitResource(m, "staticData")
-	h.AwaitResource(m, "conversations")
 	h.AwaitResource(m, "conversationData")
 	h.AwaitResource(m, "balanceData")
 }
 
 type testChatPageStore struct {
-	balance    int64
-	balanceErr error
-	now        time.Time
+	balance          int64
+	balanceErr       error
+	now              time.Time
+	nextSummaryBlock chan struct{}
 }
 
 func newTestChatPageStore(balance int64, balanceErr error) *testChatPageStore {
@@ -240,6 +424,12 @@ func newTestChatPageStore(balance int64, balanceErr error) *testChatPageStore {
 		balanceErr: balanceErr,
 		now:        time.Date(2026, time.March, 7, 12, 0, 0, 0, time.UTC),
 	}
+}
+
+func (s *testChatPageStore) blockNextSummaryQuery() chan struct{} {
+	ch := make(chan struct{})
+	s.nextSummaryBlock = ch
+	return ch
 }
 
 func (s *testChatPageStore) db() *neon.TestDB {
@@ -290,8 +480,30 @@ func (s *testChatPageStore) db() *neon.TestDB {
 				return &neon.ErrRow{Err: fmt.Errorf("unexpected query row: %s", strings.TrimSpace(sql))}
 			}
 		},
-		QueryFunc: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+		QueryFunc: func(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			switch {
+			case strings.Contains(sql, "COALESCE(first_user.content_json"):
+				wait := s.nextSummaryBlock
+				s.nextSummaryBlock = nil
+				if wait != nil {
+					select {
+					case <-wait:
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				completedAt := s.now
+				return newTestRows([]any{
+					"conv_123",
+					s.now,
+					`{"model":"oai-resp/gpt-5-mini"}`,
+					&s.now,
+					`[{"type":"text","text":"Hello"}]`,
+					"oai-resp/gpt-5-mini",
+					`{"observability":{"key_source":"platform_hosted","transport":"sse"}}`,
+					&s.now,
+					&completedAt,
+				}), nil
 			case strings.Contains(sql, "FROM vai_sessions") && strings.Contains(sql, "ORDER BY updated_at DESC"):
 				return newTestRows([]any{
 					"sess_123",

@@ -30,6 +30,7 @@ type streamToolState struct {
 	argsObject   map[string]any
 	latestArgs   map[string]any
 	thoughtSig   []byte
+	hadPartial   bool
 	incomplete   bool
 	warningCount int
 }
@@ -378,10 +379,11 @@ func (s *eventStream) handleFunctionCall(partIdx int, part *genai.Part) {
 	}
 
 	if s.provider.mode == backendModeVertex && len(call.PartialArgs) > 0 {
+		state.hadPartial = true
 		for _, pa := range call.PartialArgs {
 			s.handleVertexPartialArg(state, pa)
 		}
-	} else if call.Args != nil && !state.emitted {
+	} else if s.provider.mode != backendModeVertex && call.Args != nil && !state.emitted {
 		s.emitToolArgsDelta(state, attachThoughtSignature(call.Args, state.thoughtSig))
 		state.emitted = true
 	}
@@ -494,9 +496,12 @@ func (s *eventStream) emitToolArgsDelta(state *streamToolState, args map[string]
 func (s *streamToolState) finalArgs() map[string]any {
 	out := map[string]any{}
 	if len(s.latestArgs) > 0 {
-		out = copyMap(s.latestArgs)
-	} else if len(s.argsObject) > 0 {
-		out = copyMap(s.argsObject)
+		out = cloneJSONMap(s.latestArgs)
+	}
+	if len(s.argsObject) > 0 {
+		if s.hadPartial || len(out) == 0 {
+			out = deepMergeJSONMap(out, s.argsObject)
+		}
 	}
 	if out == nil {
 		out = map[string]any{}
@@ -508,6 +513,93 @@ func (s *streamToolState) finalArgs() map[string]any {
 		out = map[string]any{}
 	}
 	return out
+}
+
+func deepMergeJSONMap(base, override map[string]any) map[string]any {
+	if len(base) == 0 && len(override) == 0 {
+		return map[string]any{}
+	}
+	out := cloneJSONMap(base)
+	if out == nil {
+		out = map[string]any{}
+	}
+	for key, value := range override {
+		if existing, ok := out[key]; ok {
+			out[key] = deepMergeJSONValue(existing, value)
+			continue
+		}
+		out[key] = cloneJSONValue(value)
+	}
+	return out
+}
+
+func deepMergeJSONValue(base, override any) any {
+	switch typed := override.(type) {
+	case map[string]any:
+		baseMap, _ := base.(map[string]any)
+		return deepMergeJSONMap(baseMap, typed)
+	case []any:
+		return deepMergeJSONArray(base, typed)
+	default:
+		return cloneJSONValue(override)
+	}
+}
+
+func deepMergeJSONArray(base any, override []any) []any {
+	baseSlice, _ := base.([]any)
+	if len(baseSlice) == 0 && len(override) == 0 {
+		return []any{}
+	}
+	out := cloneJSONArray(baseSlice)
+	if len(out) < len(override) {
+		extended := make([]any, len(override))
+		copy(extended, out)
+		out = extended
+	}
+	for i, value := range override {
+		if value == nil {
+			continue
+		}
+		if i < len(out) {
+			out[i] = deepMergeJSONValue(out[i], value)
+			continue
+		}
+		out = append(out, cloneJSONValue(value))
+	}
+	return out
+}
+
+func cloneJSONMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = cloneJSONValue(value)
+	}
+	return out
+}
+
+func cloneJSONArray(in []any) []any {
+	if len(in) == 0 {
+		return []any{}
+	}
+	out := make([]any, len(in))
+	for i, value := range in {
+		out[i] = cloneJSONValue(value)
+	}
+	return out
+}
+
+func cloneJSONValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneJSONMap(typed)
+	case []any:
+		return cloneJSONArray(typed)
+	default:
+		return value
+	}
 }
 
 func partialArgValue(pa *genai.PartialArg) (any, bool) {

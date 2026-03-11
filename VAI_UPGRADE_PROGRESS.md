@@ -91,6 +91,15 @@ Implement the upgraded VAI gateway design in a production-ready way across the g
 - [completed] Add a demo-chat transport toggle for stateful HTTP/SSE versus chain WebSocket mode.
 - [pending] Verify that both chat modes feed the same managed observability model.
 
+### 14. Demo route and Vango-native navigation follow-up
+
+- [completed] Add canonical `/demo` and `/demo/:id` routes and keep `/chat/:id` as a compatibility redirect.
+- [completed] Replace internal raw anchors with Vango `Link` / `NavLink` helpers for shell, settings, and sidebar navigation.
+- [completed] Replace the managed chat sidebar N+1 list path with a lightweight managed-conversation summary query.
+- [completed] Make the demo chat page render the active conversation before sidebar summaries finish loading.
+- [completed] Regenerate Vango routes/bindings/state artifacts and re-run focused navigation/chat verification.
+- [completed] Fix `/demo` SPA entry so route-driven demo redirects use proper Setup lifecycle navigation instead of page-handler `ctx.Navigate(...)`.
+
 ## Progress Log
 
 ### 2026-03-10
@@ -209,7 +218,65 @@ Implement the upgraded VAI gateway design in a production-ready way across the g
   - live missing/wrong actor attach rejection
   - HTTP patch wrong-org rejection without default leakage
   - HTTP patch owner success on idle chains
+- Investigated a managed-demo-history transcript bug surfaced in prior chats:
+  - canonical chain history was correctly storing assistant tool-call messages plus user tool-result messages
+  - the demo chat transcript projection was rendering those raw tool-only history rows as normal user/assistant bubbles, which produced blank `(no text content)` messages on reload
+  - `regenerate` was also targeting the last raw `user` history entry, which could be a hidden `tool_result` row after a tool-using run
+- Fixed the managed chat projection in `app/components/chat_managed.go`:
+  - transcript rendering now skips non-conversational/tool-only history rows while preserving raw history indexes in message IDs for edit/fork semantics
+  - run metadata now maps onto the visible user/assistant turns instead of hidden tool rows
+  - regenerate now selects the last visible user prompt rather than the last raw `user` row
+- Added focused regression coverage in `app/components/chat_test.go` for:
+  - hidden tool-only history rows not rendering as blank transcript messages
+  - visible user/assistant rows retaining the correct key-source and timestamp metadata
+  - regenerate after a tool run reusing the actual user prompt instead of the hidden tool-result row
   - HTTP patch attach-conflict behavior while a writer lease is active
+- Investigated a `gem-vert` SSE tool-calling regression surfaced in the demo:
+  - `gem-dev` succeeded while `gem-vert` emitted tool calls with `query: ""`
+  - root cause was in the Vertex `PartialArgs` stream translator under `pkg/core/providers/gem/stream.go`
+  - streamed partial args were reconstructed into `argsObject`, but finalization incorrectly preferred placeholder `call.Args`, overwriting reconstructed fields like `query`
+  - buffered JSONPath partials also overwrote repeated string fragments instead of concatenating them for non-root paths such as `$.query`
+- Fixed the Gemini Vertex stream translation path:
+  - Vertex tool finalization now treats partial args as authoritative and deep-merges them over fallback `Args`
+  - repeated partial string fragments now concatenate in `applyPartialArgPath(...)`
+  - thought signatures remain attached after the merge
+- Added focused Gemini provider regressions for:
+  - placeholder Vertex `Args` overridden by later `PartialArgs`
+  - nested partial-arg deep merges preserving untouched sibling fields
+  - repeated string fragments on the same JSONPath concatenating into the final argument value
+- Verification refresh for the Vertex Gemini fix:
+  - `go test ./pkg/core/providers/gem -count=1`
+  - `go test ./pkg/gateway/chains ./pkg/gateway/handlers ./internal/chatruntime ./app/components ./sdk -count=1`
+  - `go test ./... -count=1`
+  - live in-process gateway smoke against `gem-vert/gemini-3-flash-preview` over `/v1/chains/{id}/runs:stream` with `vai_web_search` + Tavily:
+    - observed non-empty streamed tool queries
+    - observed successful tool results
+    - observed completed final assistant output without empty-query validation failures
+- Investigated the `/demo` navigation hang reported during manual platform testing.
+- Confirmed the root cause is route-level misuse of `ctx.Navigate(...)`:
+  - `/demo` and `/chat/:id` were calling `ctx.Navigate(...)` directly in page handlers
+  - that worked on hard refresh because SSR `ctx.Navigate(...)` becomes an HTTP redirect
+  - it failed on SPA navigation because page handlers run as render closures, so the pending navigation was queued too late for the route navigator to drain it
+- Re-read the Vango navigation/session tests and the guide to align the fix with the intended contract:
+  - keep `app/routes` handlers thin
+  - move data-driven route entry into Setup `Resource` + `Effect` / `OnMount`
+  - preserve SSR redirect semantics with explicit `ctx.Redirect(...)`
+- Fixed the demo-entry bug with a component-driven redirect flow:
+  - added `DemoEntryPage` in `app/components/demo.go` so `/demo` loads summaries through `setup.ResourceKeyed`
+  - session-backed navigation now happens from `Effect(...)` with `ctx.Navigate(..., vango.WithReplace())`
+  - direct HTTP requests now redirect from the render path with `ctx.Redirect(..., http.StatusSeeOther)` after SSR resource preload resolves
+  - `/chat/:id` now uses a matching `DemoAliasPage` with `OnMount(...)` navigation instead of route-level `ctx.Navigate(...)`
+- Slimmed the route handlers back down so `app/routes/demo/index.go` and `app/routes/chat/id_/index.go` only select the page component and never perform blocking reads or imperative navigation directly.
+- Replaced the old misleading route tests with stronger regressions:
+  - direct route-call tests now assert the handlers stay thin and do not mutate navigation state
+  - SSR tests now exercise real `vango.App` rendering and verify the resulting redirect locations for `/demo` and `/chat/:id`
+- Ran the required Vango artifact refresh after adding the new Setup components:
+  - `vango state apply`
+  - `vango gen bindings`
+- Verification for the demo-entry fix:
+  - `go test ./app/routes -count=1`
+  - `go test ./app/components ./app/routes -count=1`
+  - `go test ./... -count=1`
   - wrong-org stateful `run.start` rejection with `auth.chain_access_denied`
 - Verification after the security pass:
   - `go test ./pkg/gateway/handlers -count=1`
@@ -354,3 +421,43 @@ Implement the upgraded VAI gateway design in a production-ready way across the g
     - nested voice model names like `cartesia/custom/stt/v2`
 - Verification after the OpenRouter model-id fix:
   - `go test ./pkg/core ./pkg/core/types ./pkg/core/voice ./pkg/gateway/chains ./pkg/gateway/handlers ./internal/chatruntime ./app/components ./sdk -count=1`
+- Started the demo-route and Vango-native navigation pass:
+  - re-read the Vango navigation guidance and confirmed the blessed path is `Link(...)`, `LinkPrefetch(...)`, `NavLink(...)`, `NavLinkPrefix(...)`, and `ctx.Navigate(...)`
+  - confirmed the current lag was a stack of issues rather than one slow query:
+    - the header brand link is a plain anchor
+    - `/` was still a hidden chat entrypoint that loaded conversations before redirecting
+    - `ChatPage` loaded the sidebar conversation list again and blocked the whole page on it
+    - `ListManagedConversations(...)` still did per-session full hydration through `ManagedConversation(...)`
+  - locked the product shape to:
+    - `/` as a lightweight signed-in workspace home
+    - `/demo` as the fast demo entrypoint
+    - `/demo/:id` as the canonical demo-chat route
+    - `/chat/:id` as a compatibility redirect only
+  - confirmed the clean implementation seam is:
+    - use Vango SPA link helpers for all internal shell/settings/sidebar navigation
+    - add a lightweight managed-conversation summary query instead of looping through full managed conversation hydration
+    - decouple chat-page readiness from sidebar summary readiness so the active chat can render first
+- Finished the demo-route and fast-entry pass:
+  - added canonical authenticated demo routes:
+    - `/demo` as the fast entrypoint that redirects to the latest managed conversation or a fresh draft external session id
+    - `/demo/:id` as the canonical demo-chat route
+    - `/chat/:id` now redirects to `/demo/:id` as a compatibility alias
+  - converted shell/settings/sidebar/home/chat internal navigation to Vango SPA links:
+    - header brand uses `Link("/")`
+    - top nav uses `NavLink` / `NavLinkPrefix`
+    - settings nav uses `NavLink`
+    - sidebar conversation links use `LinkPrefetch("/demo/"+id, ...)`
+    - home CTA now links straight to `/demo`
+  - removed the old signed-in `/` behavior that loaded conversations and auto-redirected into chat; `/` is now a lightweight workspace home again
+  - added `ListManagedConversationSummaries(...)` so the sidebar and `/demo` entry path use one summary query instead of per-session full managed-conversation hydration
+  - changed `ChatPage` so the active conversation no longer waits on sidebar summaries:
+    - static org/provider data + active conversation still gate page readiness
+    - sidebar summaries now load independently with loading/error states and stale-snapshot retention
+  - updated legacy HTTP new-chat redirect handling to point at `/demo/...` so the platform stays on the canonical route family
+  - regenerated Vango artifacts after the route/state changes:
+    - `vango gen routes`
+    - `vango state apply`
+    - `vango gen bindings`
+  - verification for the demo-route/navigation pass:
+    - `go test ./app/components ./app/routes ./internal/services -count=1`
+    - `go test ./... -count=1`
